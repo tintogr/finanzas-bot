@@ -255,3 +255,26 @@ async def webhook(request: Request):
 @app.get("/")
 async def health():
     return {"status": "ok", "bot": "finanzas-bot"}
+
+@app.get("/test-notion")
+async def test_notion():
+    results = {}
+    ids_to_test = [
+        "fb6b174a-301f-43e5-81b0-64d0ba53e234",
+        "b0ddcc0892f3416eab72b9599dc6c4bf",
+    ]
+    async with httpx.AsyncClient() as http:
+        me = await http.get(
+            "https://api.notion.com/v1/users/me",
+            headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28"}
+        )
+        results["token_valid"] = me.status_code == 200
+
+        for db_id in ids_to_test:
+            r = await http.get(
+                f"https://api.notion.com/v1/databases/{db_id}",
+                headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28"}
+            )
+            results[f"db_{db_id[:8]}"] = {"status": r.status_code, "body": r.text[:300]}
+
+    return results
