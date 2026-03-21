@@ -123,7 +123,7 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
         "Value (ars)": {"number": float(data["value_ars"])},
         "EXCHANGE": {"number": exchange_rate},
         "Type": {"select": {"name": data.get("type", "Payment")}},
-        "Status": {"status": {"name": "Done"}},
+        "Status": {"status": {"name": "Listo"}},
     }
 
     if data.get("tipo"):
