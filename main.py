@@ -52,7 +52,11 @@ Categorias disponibles (podes poner mas de una si tiene sentido, ej: Salida + Bi
 Supermercado, Sueldo, Servicios, Transporte, Vianda, Salud, Salud Mental,
 Salida, Birra, Ocio, Compras, Depto, Plantas, Viajes
 
-Metodo: Payment o Suscription
+Distincion importante entre Servicios y Depto:
+- Servicios: alquiler, expensas, luz, gas, agua, internet, telefono — pagos recurrentes de servicios
+- Depto: maderas, pintura, muebles, herramientas, cortinas — compras fisicas para el departamento
+
+Metodo: usa "Suscription" para gastos recurrentes mensuales (alquiler, expensas, luz, gas, agua, internet, telefono, streaming, gimnasio, psicologo, monotributo, seguros, cualquier servicio que se paga todos los meses). Para todo lo demas usa "Payment".
 in_out: exactamente "\u2192INGRESO\u2190" o "\u2190 EGRESO \u2192"
 
 Clientes: LBL, OPERA, ALPATACO, Juan Martin, Depto, Work, Santi Vales,
