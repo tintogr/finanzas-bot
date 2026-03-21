@@ -248,7 +248,7 @@ async def webhook(request: Request):
             return {"ok": True}
 
         message = messages[0]
-        from_number = message["from"]
+        from_number = "54298154894334"
         msg_type = message["type"]
 
         text = ""
