@@ -3,7 +3,7 @@ import json
 import base64
 import httpx
 from datetime import date, datetime, timedelta, timezone
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from anthropic import Anthropic
 
 app = FastAPI()
@@ -462,7 +462,7 @@ async def verify_webhook(request: Request):
     return {"error": "Verification failed"}
 
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
 
     try:
@@ -473,7 +473,19 @@ async def webhook(request: Request):
             return {"ok": True}
 
         message = messages[0]
-        from_number = "54298154894334"  # fallback que funciona
+        # Responder a Meta inmediatamente para evitar duplicados
+        background_tasks.add_task(process_message, message)
+
+    except Exception:
+        pass
+
+    return {"ok": True}
+
+async def process_message(message: dict):
+    """Procesa el mensaje en background para responder a Meta rápido."""
+    from_number = "54298154894334"  # fallback
+    try:
+        from_number = "54298154894334"
         msg_type = message["type"]
 
         text = ""
@@ -556,8 +568,6 @@ async def webhook(request: Request):
             await send_message(from_number, f"\u274c Error: {str(e)[:200]}")
         except Exception:
             pass
-
-    return {"ok": True}
 
 @app.get("/")
 async def health():
