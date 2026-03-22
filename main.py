@@ -2,7 +2,7 @@ import os
 import json
 import base64
 import httpx
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from fastapi import FastAPI, Request
 from anthropic import Anthropic
 
@@ -15,6 +15,10 @@ PLANTS_DB_ID   = os.environ.get("NOTION_PLANTS_DB_ID", "39d22615-0106-43f8-9f01-
 WA_TOKEN       = os.environ["WHATSAPP_TOKEN"]
 WA_PHONE_ID    = os.environ["WHATSAPP_PHONE_ID"]
 WA_API         = f"https://graph.facebook.com/v22.0/{WA_PHONE_ID}/messages"
+
+def now_argentina() -> datetime:
+    """Hora actual en Argentina (UTC-3)."""
+    return datetime.now(timezone.utc) - timedelta(hours=3)
 
 # ── WhatsApp helpers ── EXACTAMENTE IGUAL AL CODIGO QUE FUNCIONA ──────────────
 async def send_message(to: str, text: str):
@@ -98,11 +102,20 @@ Ejemplos de criterio:
 - Si no es claro -> \U0001f4b8"""
 
 def build_user_prompt(text: str, exchange_rate: float) -> str:
-    today = date.today().isoformat()
+    now = now_argentina()
+    today = now.strftime("%Y-%m-%d")
+    hora_actual = now.strftime("%H:%M")
     ingreso = "\u2192INGRESO\u2190"
     egreso = "\u2190 EGRESO \u2192"
     return f"""Tasa de cambio dolar blue hoy: ${exchange_rate:,.0f} ARS por USD.
-Fecha de hoy: {today}
+Fecha y hora actual en Argentina: {today} {hora_actual}
+
+Reglas para el campo "datetime":
+- Si el mensaje incluye una hora especifica, usala.
+- Si dice "anoche", "esta noche" -> hora nocturna (22:00-23:00)
+- Si dice "esta manana", "hoy a la manana" -> hora matutina (09:00-10:00)
+- Si dice "al mediodia" -> 12:00
+- Si no hay referencia de hora -> usa la hora actual ({hora_actual})
 
 Extrae la informacion y responde con este JSON:
 {{
@@ -112,6 +125,7 @@ Extrae la informacion y responde con este JSON:
   "categoria": ["categoria1"] o ["categoria1", "categoria2"],
   "metodo": "Payment",
   "date": "YYYY-MM-DD",
+  "time": "HH:MM",
   "litros": numero o null,
   "consumo_kwh": numero o null,
   "notas": "info extra" o null,
@@ -148,7 +162,10 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
     if data.get("categoria"):
         props["Categor\u00eda"] = {"multi_select": [{"name": c} for c in data["categoria"]]}
     if data.get("date"):
-        props["Date"] = {"date": {"start": data["date"]}}
+        if data.get("time"):
+            props["Date"] = {"date": {"start": f"{data['date']}T{data['time']}:00", "time_zone": "America/Argentina/Buenos_Aires"}}
+        else:
+            props["Date"] = {"date": {"start": data["date"]}}
     if data.get("client"):
         props["Client"] = {"multi_select": [{"name": c} for c in data["client"]]}
     if data.get("litros") is not None:
@@ -201,7 +218,7 @@ async def parse_planta(text: str, exchange_rate: float) -> dict:
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=600,
         system=PLANTA_SYSTEM,
-        messages=[{"role": "user", "content": f"""Hoy: {date.today().isoformat()}. Dolar: ${exchange_rate:,.0f}
+        messages=[{"role": "user", "content": f"""Hoy: {now_argentina().strftime("%Y-%m-%d")}. Dolar: ${exchange_rate:,.0f}
 Mensaje: {text}
 Respondé:
 {{"name":"nombre comun","especie":"nombre cientifico o null","fecha_compra":"YYYY-MM-DD","precio":numero o null,"luz":"Indirecta","riego":"Semanal","ubicacion":"Interior","estado":"Bien","emoji":"emoji planta","notas":"2-3 consejos concisos de cuidado"}}"""}]
@@ -253,12 +270,13 @@ def format_planta(data: dict) -> str:
 
 # ── MÓDULO EVENTOS (NUEVO) ────────────────────────────────────────────────────
 async def parse_evento(text: str) -> dict:
-    today = date.today().isoformat()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = now_argentina()
+    today = now.strftime("%Y-%m-%d")
+    hora_actual = now.strftime("%H:%M")
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=300,
-        system="Extraé info de un evento. Responde SOLO JSON válido sin markdown.",
-        messages=[{"role": "user", "content": f"""Hoy: {today}, ahora: {now}
+        system="Extraé info de un evento. Responde SOLO JSON válido sin markdown. Usa zona horaria Argentina (UTC-3).",
+        messages=[{"role": "user", "content": f"""Hoy es {today}, hora actual en Argentina: {hora_actual}
 Mensaje: {text}
 Respondé:
 {{"summary":"titulo","date":"YYYY-MM-DD","time":"HH:MM o null","duration_minutes":60,"description":"desc o null","emoji":"emoji"}}"""}]
@@ -268,14 +286,32 @@ Respondé:
         raw = raw.strip("`").lstrip("json").strip()
     return json.loads(raw)
 
+async def get_gcal_access_token() -> str | None:
+    """Obtiene un access token fresco usando el refresh token."""
+    refresh_token = os.environ.get("GCAL_REFRESH_TOKEN")
+    client_id     = os.environ.get("GCAL_CLIENT_ID")
+    client_secret = os.environ.get("GCAL_CLIENT_SECRET")
+    if not all([refresh_token, client_id, client_secret]):
+        return None
+    async with httpx.AsyncClient() as http:
+        r = await http.post("https://oauth2.googleapis.com/token", data={
+            "grant_type":    "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id":     client_id,
+            "client_secret": client_secret,
+        })
+        if r.status_code == 200:
+            return r.json().get("access_token")
+    return None
+
 async def create_evento_gcal(data: dict) -> bool:
-    gcal_token = os.environ.get("GCAL_TOKEN")
-    if not gcal_token:
+    access_token = await get_gcal_access_token()
+    if not access_token:
         return False
     if data.get("time"):
-        start = {"dateTime": f"{data['date']}T{data['time']}:00", "timeZone": "America/Argentina/Neuquen"}
+        start = {"dateTime": f"{data['date']}T{data['time']}:00", "timeZone": "America/Argentina/Buenos_Aires"}
         end_dt = datetime.strptime(f"{data['date']}T{data['time']}", "%Y-%m-%dT%H:%M") + timedelta(minutes=data.get("duration_minutes", 60))
-        end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "America/Argentina/Neuquen"}
+        end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "America/Argentina/Buenos_Aires"}
     else:
         start = {"date": data["date"]}
         end = {"date": data["date"]}
@@ -285,7 +321,7 @@ async def create_evento_gcal(data: dict) -> bool:
     async with httpx.AsyncClient() as http:
         r = await http.post(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-            headers={"Authorization": f"Bearer {gcal_token}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
             json=event
         )
         return r.status_code in [200, 201]
