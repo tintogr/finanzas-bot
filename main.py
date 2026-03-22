@@ -279,7 +279,7 @@ async def parse_evento(text: str) -> dict:
         messages=[{"role": "user", "content": f"""Hoy es {today}, hora actual en Argentina: {hora_actual}
 Mensaje: {text}
 Respondé:
-{{"summary":"titulo","date":"YYYY-MM-DD","time":"HH:MM o null","duration_minutes":60,"description":"desc o null","emoji":"emoji"}}"""}]
+{{"summary":"titulo","date":"YYYY-MM-DD","time":"HH:MM o null","duration_minutes":60,"location":"lugar o null","description":"desc o null","emoji":"emoji"}}"""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -318,6 +318,8 @@ async def create_evento_gcal(data: dict) -> bool:
     event = {"summary": data.get("summary", "Evento"), "start": start, "end": end}
     if data.get("description"):
         event["description"] = data["description"]
+    if data.get("location"):
+        event["location"] = data["location"]
     async with httpx.AsyncClient() as http:
         r = await http.post(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
@@ -330,6 +332,8 @@ def format_evento(data: dict, guardado: bool) -> str:
     emoji = data.get("emoji", "\U0001f4c5")
     hora = f" a las {data['time']}" if data.get("time") else ""
     lines = [f"{emoji} *{data['summary']}*", f"Fecha: {data['date']}{hora}"]
+    if data.get("location"):
+        lines.append(f"\U0001f4cd {data['location']}")
     if data.get("description"):
         lines.append(f"Nota: {data['description']}")
     lines.append("\n\u2705 Agregado a Google Calendar" if guardado else "\n\u26a0\ufe0f Anota esto manualmente \u2014 Calendar no configurado aun")
