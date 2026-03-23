@@ -101,6 +101,7 @@ def wind_description(kmh: float) -> str:
     return "Temporal"
 
 async def get_weather() -> dict | None:
+    """Obtiene clima actual + pronóstico de mañana desde Open-Meteo."""
     try:
         async with httpx.AsyncClient(timeout=5) as http:
             r = await http.get(
@@ -108,36 +109,81 @@ async def get_weather() -> dict | None:
                 params={
                     "latitude": USER_LAT, "longitude": USER_LON,
                     "current": "temperature_2m,apparent_temperature,precipitation,windspeed_10m,weathercode",
+                    "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max,weathercode",
                     "timezone": "America/Argentina/Buenos_Aires",
-                    "forecast_days": 1
+                    "forecast_days": 2
                 }
             )
             if r.status_code != 200:
                 return None
-            c = r.json()["current"]
+            data = r.json()
+            c = data["current"]
+            d = data["daily"]
+
             desc, emoji = WMO_CODES.get(c["weathercode"], ("Variable", "🌡️"))
             viento = round(c["windspeed_10m"])
+
+            # Pronóstico mañana (índice 1 del daily)
+            desc_manana, emoji_manana = WMO_CODES.get(d["weathercode"][1], ("Variable", "🌡️"))
+            viento_manana = round(d["windspeed_10m_max"][1])
+
             return {
-                "temp":      round(c["temperature_2m"]),
-                "sensacion": round(c["apparent_temperature"]),
-                "lluvia":    c["precipitation"],
-                "viento":    viento,
-                "desc":      desc,
-                "emoji":     emoji,
-                "wind_desc": wind_description(viento)
+                "temp":           round(c["temperature_2m"]),
+                "sensacion":      round(c["apparent_temperature"]),
+                "lluvia":         c["precipitation"],
+                "viento":         viento,
+                "desc":           desc,
+                "emoji":          emoji,
+                "wind_desc":      wind_description(viento),
+                "manana_max":     round(d["temperature_2m_max"][1]),
+                "manana_min":     round(d["temperature_2m_min"][1]),
+                "manana_lluvia":  d["precipitation_sum"][1],
+                "manana_viento":  viento_manana,
+                "manana_desc":    desc_manana,
+                "manana_emoji":   emoji_manana,
+                "manana_wind_desc": wind_description(viento_manana),
             }
     except Exception:
         return None
 
 def format_weather_lines(w: dict) -> list[str]:
+    """Formato para el resumen matutino: hoy + mañana."""
     lines = [
+        "*Hoy:*",
         f"🌡️ {w['temp']}°C (sensación {w['sensacion']}°C)",
         f"{w['emoji']} {w['desc']}",
     ]
     if w["lluvia"] > 0:
         lines.append(f"🌧️ Lluvia: {w['lluvia']}mm")
     lines.append(f"💨 {w['wind_desc']} ({w['viento']} km/h)")
+    lines.append("")
+    lines.append("*Mañana:*")
+    lines.append(f"🌡️ {w['manana_min']}°C — {w['manana_max']}°C")
+    lines.append(f"{w['manana_emoji']} {w['manana_desc']}")
+    if w["manana_lluvia"] > 0:
+        lines.append(f"🌧️ Lluvia: {w['manana_lluvia']}mm")
+    lines.append(f"💨 {w['manana_wind_desc']} ({w['manana_viento']} km/h)")
     return lines
+
+def format_weather_chat(w: dict, include_tomorrow: bool = False) -> str:
+    """Formato para respuestas de chat."""
+    lines = [
+        "*Hoy:*",
+        f"🌡️ {w['temp']}°C (sensación {w['sensacion']}°C)",
+        f"{w['emoji']} {w['desc']}",
+    ]
+    if w["lluvia"] > 0:
+        lines.append(f"🌧️ Lluvia: {w['lluvia']}mm")
+    lines.append(f"💨 {w['wind_desc']} ({w['viento']} km/h)")
+    if include_tomorrow:
+        lines.append("")
+        lines.append("*Mañana:*")
+        lines.append(f"🌡️ {w['manana_min']}°C — {w['manana_max']}°C")
+        lines.append(f"{w['manana_emoji']} {w['manana_desc']}")
+        if w["manana_lluvia"] > 0:
+            lines.append(f"🌧️ Lluvia: {w['manana_lluvia']}mm")
+        lines.append(f"💨 {w['manana_wind_desc']} ({w['manana_viento']} km/h)")
+    return "\n".join(lines)
 
 # ── Tasa de cambio ────────────────────────────────────────────────────────────
 async def get_exchange_rate() -> float:
@@ -358,6 +404,49 @@ Respondé:
         if intent.get("new_name"):
             changes.append(f"Nombre → _{intent['new_name']}_")
         return True, f"✏️ *{old_name}* corregido\n" + "\n".join(changes) + "\n\n✅ Actualizado en Notion"
+
+async def eliminar_gasto(text: str) -> tuple[bool, str]:
+    """Busca la entrada más reciente en Notion que coincida y la archiva."""
+    now = now_argentina()
+    response = anthropic.messages.create(
+        model="claude-sonnet-4-20250514", max_tokens=100,
+        system="Extraé el nombre de la entrada de Notion a eliminar. Responde SOLO JSON.",
+        messages=[{"role": "user", "content": f'Mensaje: {text}\nRespondé: {{"search_term": "nombre de la entrada a eliminar"}}'}]
+    )
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`").lstrip("json").strip()
+    search_term = json.loads(raw).get("search_term", "")
+    if not search_term:
+        return False, "No entendí qué entrada querés eliminar"
+
+    async with httpx.AsyncClient() as http:
+        r = await http.post(
+            f"https://api.notion.com/v1/databases/{NOTION_DB_ID.replace('-','')}/query",
+            headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
+            json={
+                "filter": {"property": "Name", "title": {"contains": search_term[:30]}},
+                "sorts": [{"property": "Date", "direction": "descending"}],
+                "page_size": 1
+            }
+        )
+        if r.status_code != 200 or not r.json().get("results"):
+            return False, f"No encontré ninguna entrada llamada _{search_term}_"
+
+        page = r.json()["results"][0]
+        page_id = page["id"]
+        old_name = page["properties"]["Name"]["title"][0]["plain_text"] if page["properties"]["Name"]["title"] else "?"
+
+        # Archivar la página (equivalente a mover a papelera en Notion)
+        del_r = await http.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
+            json={"archived": True}
+        )
+        if del_r.status_code == 200:
+            return True, f"🗑️ *{old_name}* eliminado de Notion"
+        else:
+            return False, f"Error eliminando la entrada: {del_r.text[:100]}"
 
 def format_reply(data: dict, exchange_rate: float) -> str:
     is_expense = "EGRESO" in data["in_out"]
@@ -651,6 +740,7 @@ async def classify(text: str, has_image: bool) -> str:
 
 GASTO: registrar un pago, compra o ingreso concreto con monto.
 CORREGIR_GASTO: corregir un gasto ya registrado. Ej: "me equivoqué, era 7000 no 7500", "cambiá el monto de la verdulería".
+ELIMINAR_GASTO: eliminar o borrar una entrada de Notion. Ej: "borrá ese gasto", "eliminá la entrada que se llama X", "sacá ese registro de Notion".
 PLANTA: adquirir o mencionar una planta.
 EDITAR_EVENTO: modificar un evento existente en el calendario.
 ELIMINAR_EVENTO: eliminar o borrar un evento del calendario.
@@ -665,6 +755,7 @@ REGLA: si el mensaje PREGUNTA algo → siempre CHAT, nunca GASTO.""",
     r = response.content[0].text.strip().upper()
     if "ELIMINAR_EVENTO" in r:  return "ELIMINAR_EVENTO"
     if "EDITAR_EVENTO" in r:    return "EDITAR_EVENTO"
+    if "ELIMINAR_GASTO" in r:   return "ELIMINAR_GASTO"
     if "CORREGIR_GASTO" in r:   return "CORREGIR_GASTO"
     if "SHOPPING" in r:         return "SHOPPING"
     if "RECORDATORIO" in r:     return "RECORDATORIO"
@@ -774,14 +865,18 @@ async def handle_chat(phone: str, text: str) -> str:
     if any(k in text_lower for k in ["clima","lluvia","frío","frio","calor","temperatura","viento","tiempo","paraguas","abrigo","nublado","sol","llueve"]):
         w = await get_weather()
         if w:
-            weather_lines = format_weather_lines(w)
-            weather_context = f"\n\nCLIMA ACTUAL (Open-Meteo, modelos ECMWF/GFS):\n" + "\n".join(weather_lines)
+            include_tomorrow = any(k in text_lower for k in ["mañana","manana","semana","pronóstico","pronostico"])
+            weather_context = f"\n\nCLIMA:\n{format_weather_chat(w, include_tomorrow=include_tomorrow)}"
+
+    # Solo mencionar la fuente si la piden explícitamente
+    source_note = ""
+    if any(k in text_lower for k in ["de dónde","de donde","fuente","qué app","que app","cómo sabés","como sabes","qué modelo","que modelo"]):
+        source_note = "\n\nSi te preguntan: los datos vienen de Open-Meteo, usando modelos meteorológicos ECMWF y GFS."
 
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=800,
         system=f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural.
-Usás español rioplatense. Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
-Si te preguntan sobre el clima, podés mencionar que los datos vienen de Open-Meteo (modelos ECMWF y GFS).{finance_context}{calendar_context}{weather_context}""",
+Usás español rioplatense. Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.{finance_context}{calendar_context}{weather_context}{source_note}""",
         messages=history + [{"role": "user", "content": text}]
     )
     reply = response.content[0].text.strip()
@@ -868,6 +963,10 @@ async def process_message(message: dict):
                 await send_message(from_number, "❌ No entendi el monto. Ejemplo: _\"Verduleria 3500\"_")
             else:
                 await send_message(from_number, f"❌ Error Notion:\n{error[:200]}")
+
+        elif tipo == "ELIMINAR_GASTO":
+            success, msg = await eliminar_gasto(text)
+            await send_message(from_number, msg if success else f"⚠️ {msg}")
 
         elif tipo == "CORREGIR_GASTO":
             success, msg = await corregir_gasto(text)
@@ -1065,15 +1164,23 @@ def notion_headers():
 
 async def parse_shopping_intent(text: str) -> dict:
     response = anthropic.messages.create(
-        model="claude-sonnet-4-20250514", max_tokens=300,
+        model="claude-sonnet-4-20250514", max_tokens=400,
         system="Analizá mensajes sobre lista de compras. Responde SOLO JSON válido sin markdown.",
         messages=[{"role": "user", "content": f"""Mensaje: {text}
+
 Respondé:
-{{"action": "out_of_stock"|"in_stock"|"add"|"list", "items": ["item1"], "frequency": null, "store": null}}
-- out_of_stock: "me quedé sin X", "no tengo X"
-- in_stock: "compré X", "ya tengo X"
-- add: "agregá X", "necesito comprar X"
-- list: "qué me falta", "mostrame la lista\""""}]
+{{"action": "out_of_stock"|"in_stock"|"add"|"list", "items": ["item1", "item2", ...]}}
+
+Reglas:
+- "out_of_stock": "me quedé sin X", "no tengo X" → destildar
+- "in_stock": "compré X", "ya tengo X" → tildar
+- "add": "agregá X", "necesito X", o si pide ingredientes/items para algo → inferí todos los ingredientes/items necesarios
+- "list": "qué me falta", "mostrame la lista"
+
+Ejemplos de inferencia:
+- "ingredientes para crema chantilly" → items: ["crema de leche", "azúcar", "esencia de vainilla"]
+- "ingredientes para una pizza" → items: ["harina", "levadura", "queso mozzarella", "salsa de tomate"]
+- "cosas para el desayuno" → items: ["leche", "café", "pan", "manteca"]"""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -1130,11 +1237,15 @@ async def handle_shopping(text: str) -> str:
                 results_text.append(f"📋 _{item_name}_ ya estaba en la lista, aparece como faltante")
             else:
                 async with httpx.AsyncClient() as http:
-                    r = await http.post("https://api.notion.com/v1/pages", headers=notion_headers(),
+                    r = await http.post("https://api.notion.com/v1/pages",
+                                        headers=notion_headers(),
                                         json={"parent": {"database_id": SHOPPING_DB_ID},
-                                              "properties": {"Name": {"title": [{"text": {"content": item_name}}]},
-                                                             "en stock": {"checkbox": False}}})
-                results_text.append(f"✅ _{item_name}_ agregado" if r.status_code == 200 else f"❌ Error agregando _{item_name}_")
+                                              "properties": {
+                                                  "Name": {"title": [{"text": {"content": item_name}}]},
+                                                  "en stock": {"checkbox": False}
+                                              }})
+                    ok = r.status_code == 200
+                results_text.append(f"✅ _{item_name}_ agregado" if ok else f"❌ Error agregando _{item_name}_")
 
         elif action in ["out_of_stock", "in_stock"]:
             in_stock = action == "in_stock"
@@ -1148,11 +1259,15 @@ async def handle_shopping(text: str) -> str:
             else:
                 if not in_stock:
                     async with httpx.AsyncClient() as http:
-                        r = await http.post("https://api.notion.com/v1/pages", headers=notion_headers(),
+                        r = await http.post("https://api.notion.com/v1/pages",
+                                            headers=notion_headers(),
                                             json={"parent": {"database_id": SHOPPING_DB_ID},
-                                                  "properties": {"Name": {"title": [{"text": {"content": item_name}}]},
-                                                                 "en stock": {"checkbox": False}}})
-                    results_text.append(f"🛒 _{item_name}_ agregado como faltante" if r.status_code == 200 else f"❌ Error")
+                                                  "properties": {
+                                                      "Name": {"title": [{"text": {"content": item_name}}]},
+                                                      "en stock": {"checkbox": False}
+                                                  }})
+                        ok = r.status_code == 200
+                    results_text.append(f"🛒 _{item_name}_ agregado como faltante" if ok else f"❌ Error agregando _{item_name}_")
                 else:
                     results_text.append(f"❓ _{item_name}_ no está en la lista")
 
