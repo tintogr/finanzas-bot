@@ -959,7 +959,8 @@ async def handle_chat(phone: str, text: str) -> str:
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=800,
         system=f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural.
-Usás español rioplatense. Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.{finance_context}{calendar_context}{weather_context}{source_note}""",
+Usás español rioplatense. Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
+IMPORTANTE: Si no tenés datos concretos para responder, decilo directamente. No inventes información que no tenés.{finance_context}{calendar_context}{weather_context}{source_note}""",
         messages=history + [{"role": "user", "content": text}]
     )
     reply = response.content[0].text.strip()
@@ -1337,19 +1338,32 @@ async def search_recipe_in_notion(recipe_name: str) -> list[str] | None:
     except Exception:
         return None
 
-async def save_recipe_to_notion(recipe_name: str, source: str = "Matrics"):
+async def save_recipe_to_notion(recipe_name: str, source: str = "Matrics", ingredient_names: list[str] = None):
+    """Guarda una receta en Notion. Si se pasan ingredient_names, vincula los ítems de Shopping."""
     try:
+        # Buscar los page IDs de los ingredientes en Shopping para la relation
+        relation_ids = []
+        if ingredient_names:
+            for ing in ingredient_names:
+                results = await search_shopping_item(ing)
+                if results:
+                    relation_ids.append({"id": results[0]["id"]})
+
+        props = {
+            "Name": {"title": [{"text": {"content": recipe_name.capitalize()}}]},
+            "Fuente": {"select": {"name": source}},
+        }
+        if relation_ids:
+            props["Ingredientess"] = {"relation": relation_ids}
+
         async with httpx.AsyncClient() as http:
             await http.post(
                 "https://api.notion.com/v1/pages",
                 headers=notion_headers(),
                 json={
-                    "parent": {"database_id": RECIPES_DB_ID.replace("-", "")},
+                    "parent": {"database_id": RECIPES_DB_ID},
                     "icon": {"type": "emoji", "emoji": "🍽️"},
-                    "properties": {
-                        "Name": {"title": [{"text": {"content": recipe_name.capitalize()}}]},
-                        "Fuente": {"select": {"name": source}},
-                    }
+                    "properties": props
                 }
             )
     except Exception:
@@ -1451,8 +1465,9 @@ async def handle_shopping(text: str) -> str:
             except Exception:
                 enriched_direct, ok = [], False
             if ok and enriched_direct:
-                await save_recipe_to_notion(recipe_name, source="Matrics")
-                recipe_note = f"🍽️ No tenía esa receta — la agregué a Recetas\n"
+                ingredient_names = [i.get("name","") for i in enriched_direct]
+                await save_recipe_to_notion(recipe_name, source="Matrics", ingredient_names=ingredient_names)
+                recipe_note = f"🍽️ *{recipe_name.capitalize()}* no estaba en tus recetas — la agregué a tu base de datos 🍗 Recipes en Notion\n"
                 results_text = []
                 for item in enriched_direct:
                     item_name = item.get("name", "")
