@@ -20,12 +20,14 @@ WA_API         = f"https://graph.facebook.com/v22.0/{WA_PHONE_ID}/messages"
 MY_NUMBER      = os.environ.get("MY_WA_NUMBER", "54298154894334")
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "8"))
 
+# Coordenadas del usuario (default: Neuquén)
+USER_LAT = float(os.environ.get("USER_LAT", "-38.95"))
+USER_LON = float(os.environ.get("USER_LON", "-68.06"))
+
 def now_argentina() -> datetime:
-    """Hora actual en Argentina (UTC-3)."""
     return datetime.now(timezone.utc) - timedelta(hours=3)
 
-# ── Memoria de categorías (se auto-puebla desde Notion) ───────────────────────
-# keyword (lowercase) → categorías corregidas por el usuario
+# ── Memoria de categorías ──────────────────────────────────────────────────────
 category_overrides: dict[str, list[str]] = {}
 
 # ── WhatsApp helpers ───────────────────────────────────────────────────────────
@@ -52,14 +54,12 @@ async def get_media_base64(media_id: str) -> tuple[str, str]:
         img_r = await http.get(media_url, headers={"Authorization": f"Bearer {WA_TOKEN}"})
         return base64.b64encode(img_r.content).decode(), mime_type
 
-# ── NUEVO: Transcripción de audio con Groq Whisper ────────────────────────────
+# ── Transcripción de audio con Groq Whisper ───────────────────────────────────
 async def transcribe_audio(media_id: str) -> str | None:
-    """Descarga audio de WhatsApp y transcribe con Groq Whisper (gratis)."""
     groq_key = os.environ.get("GROQ_API_KEY")
     if not groq_key:
         return None
     async with httpx.AsyncClient(timeout=30) as http:
-        # 1. Obtener URL del audio desde Meta
         r = await http.get(
             f"https://graph.facebook.com/v22.0/{media_id}",
             headers={"Authorization": f"Bearer {WA_TOKEN}"}
@@ -67,21 +67,77 @@ async def transcribe_audio(media_id: str) -> str | None:
         if r.status_code != 200:
             return None
         media_url = r.json()["url"]
-        # 2. Descargar el archivo de audio
         audio_r = await http.get(media_url, headers={"Authorization": f"Bearer {WA_TOKEN}"})
         if audio_r.status_code != 200:
             return None
-        audio_bytes = audio_r.content
-        # 3. Mandar a Groq Whisper para transcribir
         resp = await http.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
             headers={"Authorization": f"Bearer {groq_key}"},
-            files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
+            files={"file": ("audio.ogg", audio_r.content, "audio/ogg")},
             data={"model": "whisper-large-v3", "language": "es"},
         )
         if resp.status_code == 200:
             return resp.json().get("text", "").strip()
     return None
+
+# ── Clima (Open-Meteo, sin API key) ───────────────────────────────────────────
+WMO_CODES = {
+    0:  ("Despejado", "☀️"),   1:  ("Mayormente despejado", "🌤️"),
+    2:  ("Parcialmente nublado", "⛅"), 3:  ("Nublado", "☁️"),
+    45: ("Neblina", "🌫️"),    48: ("Neblina helada", "🌫️"),
+    51: ("Llovizna", "🌦️"),   53: ("Llovizna", "🌦️"),   55: ("Llovizna intensa", "🌧️"),
+    61: ("Lluvia leve", "🌧️"), 63: ("Lluvia", "🌧️"),     65: ("Lluvia intensa", "🌧️"),
+    71: ("Nieve leve", "🌨️"), 73: ("Nieve", "🌨️"),      75: ("Nieve intensa", "🌨️"),
+    80: ("Chubascos", "🌦️"),  81: ("Chubascos", "🌦️"),  82: ("Chubascos fuertes", "⛈️"),
+    95: ("Tormenta", "⛈️"),   96: ("Tormenta con granizo", "⛈️"), 99: ("Tormenta con granizo", "⛈️"),
+}
+
+def wind_description(kmh: float) -> str:
+    if kmh < 6:   return "Calma"
+    if kmh < 20:  return "Brisa suave"
+    if kmh < 39:  return "Brisa moderada"
+    if kmh < 62:  return "Viento fuerte"
+    if kmh < 89:  return "Viento muy fuerte"
+    return "Temporal"
+
+async def get_weather() -> dict | None:
+    try:
+        async with httpx.AsyncClient(timeout=5) as http:
+            r = await http.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": USER_LAT, "longitude": USER_LON,
+                    "current": "temperature_2m,apparent_temperature,precipitation,windspeed_10m,weathercode",
+                    "timezone": "America/Argentina/Buenos_Aires",
+                    "forecast_days": 1
+                }
+            )
+            if r.status_code != 200:
+                return None
+            c = r.json()["current"]
+            desc, emoji = WMO_CODES.get(c["weathercode"], ("Variable", "🌡️"))
+            viento = round(c["windspeed_10m"])
+            return {
+                "temp":      round(c["temperature_2m"]),
+                "sensacion": round(c["apparent_temperature"]),
+                "lluvia":    c["precipitation"],
+                "viento":    viento,
+                "desc":      desc,
+                "emoji":     emoji,
+                "wind_desc": wind_description(viento)
+            }
+    except Exception:
+        return None
+
+def format_weather_lines(w: dict) -> list[str]:
+    lines = [
+        f"🌡️ {w['temp']}°C (sensación {w['sensacion']}°C)",
+        f"{w['emoji']} {w['desc']}",
+    ]
+    if w["lluvia"] > 0:
+        lines.append(f"🌧️ Lluvia: {w['lluvia']}mm")
+    lines.append(f"💨 {w['wind_desc']} ({w['viento']} km/h)")
+    return lines
 
 # ── Tasa de cambio ────────────────────────────────────────────────────────────
 async def get_exchange_rate() -> float:
@@ -111,7 +167,7 @@ Distincion importante entre Servicios y Depto:
 - Servicios: alquiler, expensas, luz, gas, agua, internet, telefono — pagos recurrentes de servicios
 - Depto: maderas, pintura, muebles, herramientas, cortinas — compras fisicas para el departamento
 
-Metodo: usa "Suscription" para gastos recurrentes mensuales (alquiler, expensas, luz, gas, agua, internet, telefono, streaming, gimnasio, psicologo, monotributo, seguros, cualquier servicio que se paga todos los meses). Para todo lo demas usa "Payment".
+Metodo: usa "Suscription" para gastos recurrentes mensuales (alquiler, expensas, luz, gas, agua, internet, telefono, streaming, gimnasio, psicologo, monotributo, seguros). Para todo lo demas usa "Payment".
 
 in_out: exactamente "\u2192INGRESO\u2190" o "\u2190 EGRESO \u2192"
 
@@ -119,49 +175,39 @@ Clientes: LBL, OPERA, ALPATACO, Juan Martin, Depto, Work, Santi Vales,
 Jorge, Barbara, Vanguardia, Alejo, Dinamo, Paula Diaz, Labti, PlanA, JGA, ATE
 
 Para el campo "emoji": elegir el emoji MAS especifico segun el contexto real del gasto.
-Ejemplos de criterio:
 - Verdura/fruta/feria/verduleria -> \U0001f96c
 - Supermercado general/almacen -> \U0001f6d2
-- Nafta/combustible/YPF/Shell -> \u26fd
-- Repuesto/mecanico/taller/auto -> \U0001f527
+- Nafta/combustible -> \u26fd
+- Repuesto/mecanico/auto -> \U0001f527
 - Birra/cerveza -> \U0001f37a
-- Salir a comer/restaurant/pizza/sushi -> \U0001f37d
-- Farmacia/medicamento/salud -> \U0001f48a
+- Salir a comer/restaurant -> \U0001f37d
+- Farmacia/medicamento -> \U0001f48a
 - Psicologo/salud mental -> \U0001f9e0
 - Colectivo/uber/taxi -> \U0001f697
-- Ropa/zapatillas/compras -> \U0001f6cd
-- Planta/maceta/tierra -> \U0001f33f
+- Ropa/zapatillas -> \U0001f6cd
+- Planta/maceta -> \U0001f33f
 - Viaje/avion/hotel -> \u2708
-- Luz/gas/agua/internet/servicio -> \U0001f4c4
+- Luz/gas/agua/internet -> \U0001f4c4
 - Alquiler/expensas -> \U0001f3e0
-- Sueldo/ingreso laboral -> \U0001f4b0
-- Salida nocturna/boliche -> \U0001f389
-- Streaming/juego/ocio -> \U0001f3ae
-- Vianda/tupper/comida llevada -> \U0001f961
+- Sueldo/ingreso -> \U0001f4b0
+- Salida nocturna -> \U0001f389
+- Streaming/ocio -> \U0001f3ae
+- Vianda/tupper -> \U0001f961
 - Si no es claro -> \U0001f4b8"""
 
 def build_user_prompt(text: str, exchange_rate: float) -> str:
     now = now_argentina()
-    today = now.strftime("%Y-%m-%d")
-    hora_actual = now.strftime("%H:%M")
     ingreso = "\u2192INGRESO\u2190"
     egreso = "\u2190 EGRESO \u2192"
-    return f"""Tasa de cambio dolar blue hoy: ${exchange_rate:,.0f} ARS por USD.
-Fecha y hora actual en Argentina: {today} {hora_actual}
-
-Reglas para el campo "datetime":
-- Si el mensaje incluye una hora especifica, usala.
-- Si dice "anoche", "esta noche" -> hora nocturna (22:00-23:00)
-- Si dice "esta manana", "hoy a la manana" -> hora matutina (09:00-10:00)
-- Si dice "al mediodia" -> 12:00
-- Si no hay referencia de hora -> usa la hora actual ({hora_actual})
+    return f"""Tasa dolar blue: ${exchange_rate:,.0f} ARS/USD.
+Fecha y hora actual: {now.strftime("%Y-%m-%d")} {now.strftime("%H:%M")}
 
 Extrae la informacion y responde con este JSON:
 {{
-  "name": "descripcion corta del movimiento",
+  "name": "descripcion corta",
   "in_out": "{ingreso}" o "{egreso}",
   "value_ars": numero,
-  "categoria": ["categoria1"] o ["categoria1", "categoria2"],
+  "categoria": ["categoria1"] o ["cat1", "cat2"],
   "metodo": "Payment",
   "date": "YYYY-MM-DD",
   "time": "HH:MM",
@@ -169,7 +215,7 @@ Extrae la informacion y responde con este JSON:
   "consumo_kwh": numero o null,
   "notas": "info extra" o null,
   "client": ["nombre"] o [],
-  "emoji": "un solo emoji que represente especificamente este gasto"
+  "emoji": "emoji especifico"
 }}
 
 Mensaje: {text or "(ver imagen adjunta)"}"""
@@ -223,23 +269,13 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
         return (True, "") if r.status_code == 200 else (False, r.text)
 
 async def check_and_apply_category(name: str, predicted_cats: list[str]) -> tuple[list[str], str | None]:
-    """
-    Busca en Notion si hay entradas similares con categoría distinta a la predicha.
-    Si encuentra una corrección previa del usuario, la aplica automáticamente.
-    También guarda en memory para no tener que consultar Notion la próxima vez.
-    """
     name_lower = name.lower()
-
-    # 1. Revisar memoria in-process primero (más rápido)
     for keyword, saved_cats in category_overrides.items():
         if keyword in name_lower:
             if saved_cats != predicted_cats:
                 return saved_cats, f"📚 Categoría: _{', '.join(saved_cats)}_ (según tu corrección anterior)"
             return saved_cats, None
-
-    # 2. Consultar Notion por entradas con nombre similar
     try:
-        # Usar las primeras 3 palabras como keyword de búsqueda
         search_key = " ".join(name.split()[:3])
         async with httpx.AsyncClient() as http:
             r = await http.post(
@@ -256,19 +292,14 @@ async def check_and_apply_category(name: str, predicted_cats: list[str]) -> tupl
                 if results:
                     notion_cats = [c["name"] for c in results[0]["properties"].get("Categor\u00eda", {}).get("multi_select", [])]
                     if notion_cats and notion_cats != predicted_cats:
-                        # Guardar en memoria para futuros usos
                         category_overrides[search_key.lower()] = notion_cats
                         return notion_cats, f"📚 Categoría: _{', '.join(notion_cats)}_ (como en cargas anteriores)"
     except Exception:
         pass
-
     return predicted_cats, None
 
 async def corregir_gasto(text: str) -> tuple[bool, str]:
-    """Busca el último gasto similar en Notion y actualiza su valor/categoría."""
     now = now_argentina()
-
-    # Claude extrae qué corregir
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=200,
         system="Extraé qué gasto corregir y qué cambiar. Responde SOLO JSON.",
@@ -276,20 +307,17 @@ async def corregir_gasto(text: str) -> tuple[bool, str]:
 Mensaje: {text}
 Respondé:
 {{"search_term": "nombre o descripción del gasto a corregir",
-  "new_value_ars": nuevo monto en ARS o null si no cambia,
-  "new_categoria": ["categoria"] o null si no cambia,
-  "new_name": "nuevo nombre" o null si no cambia}}"""}]
+  "new_value_ars": nuevo monto en ARS o null,
+  "new_categoria": ["categoria"] o null,
+  "new_name": "nuevo nombre" o null}}"""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.strip("`").lstrip("json").strip()
     intent = json.loads(raw)
-
     search_term = intent.get("search_term", "")
     if not search_term:
         return False, "No entendí qué gasto querés corregir"
-
-    # Buscar en Notion la última entrada que coincida
     async with httpx.AsyncClient() as http:
         r = await http.post(
             f"https://api.notion.com/v1/databases/{NOTION_DB_ID.replace('-','')}/query",
@@ -302,25 +330,19 @@ Respondé:
         )
         if r.status_code != 200 or not r.json().get("results"):
             return False, f"No encontré ningún gasto llamado _{search_term}_"
-
         page = r.json()["results"][0]
         page_id = page["id"]
         old_name = page["properties"]["Name"]["title"][0]["plain_text"] if page["properties"]["Name"]["title"] else "?"
         old_value = page["properties"].get("Value (ars)", {}).get("number", 0)
-
-        # Armar los campos a actualizar
         props = {}
         if intent.get("new_value_ars"):
             props["Value (ars)"] = {"number": float(intent["new_value_ars"])}
         if intent.get("new_categoria"):
-            props["Categoría"] = {"multi_select": [{"name": c} for c in intent["new_categoria"]]}
+            props["Categor\u00eda"] = {"multi_select": [{"name": c} for c in intent["new_categoria"]]}
         if intent.get("new_name"):
             props["Name"] = {"title": [{"text": {"content": intent["new_name"]}}]}
-
         if not props:
             return False, "No entendí qué campo querés cambiar"
-
-        # Actualizar la página en Notion
         upd = await http.patch(
             f"https://api.notion.com/v1/pages/{page_id}",
             headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
@@ -328,8 +350,6 @@ Respondé:
         )
         if upd.status_code != 200:
             return False, f"Error actualizando en Notion: {upd.text[:100]}"
-
-        # Armar mensaje de confirmación
         changes = []
         if intent.get("new_value_ars"):
             changes.append(f"${old_value:,.0f} → *${float(intent['new_value_ars']):,.0f} ARS*")
@@ -337,10 +357,9 @@ Respondé:
             changes.append(f"Categoría → _{', '.join(intent['new_categoria'])}_")
         if intent.get("new_name"):
             changes.append(f"Nombre → _{intent['new_name']}_")
-
         return True, f"✏️ *{old_name}* corregido\n" + "\n".join(changes) + "\n\n✅ Actualizado en Notion"
 
-
+def format_reply(data: dict, exchange_rate: float) -> str:
     is_expense = "EGRESO" in data["in_out"]
     entry_emoji = data.get("emoji", "\U0001f4b8")
     direction = "Egreso" if is_expense else "Ingreso"
@@ -359,7 +378,7 @@ Respondé:
     if data.get("consumo_kwh"):
         extras.append(f"\u26a1 {data['consumo_kwh']} kWh")
     if extras:
-        lines.append(" \u00b7 ".join(extras))
+        lines.append(" · ".join(extras))
     lines.append("\n\u2705 Guardado en Notion")
     return "\n".join(lines)
 
@@ -416,35 +435,33 @@ def format_planta(data: dict) -> str:
     lines = [
         f"{emoji} *{data['name']}*",
         f"Especie: _{data.get('especie') or 'desconocida'}_",
-        f"\u2600\ufe0f Luz: {data.get('luz', '-')}",
-        f"\U0001f4a7 Riego: {data.get('riego', '-')}",
-        f"\U0001f3e0 Ubicaci\u00f3n: {data.get('ubicacion', '-')}",
+        f"☀️ Luz: {data.get('luz', '-')}",
+        f"💧 Riego: {data.get('riego', '-')}",
+        f"🏠 Ubicación: {data.get('ubicacion', '-')}",
     ]
     if data.get("notas"):
-        lines.append(f"\n\U0001f4dd {data['notas']}")
-    lines.append("\n\u2705 Guardada en Notion")
+        lines.append(f"\n📝 {data['notas']}")
+    lines.append("\n✅ Guardada en Notion")
     return "\n".join(lines)
 
 # ── MÓDULO EVENTOS ─────────────────────────────────────────────────────────────
 def format_evento(data: dict, guardado: bool) -> str:
-    emoji = data.get("emoji", "\U0001f4c5")
+    emoji = data.get("emoji", "📅")
     hora = f" a las {data['time']}" if data.get("time") else ""
     lines = [f"{emoji} *{data['summary']}*", f"Fecha: {data['date']}{hora}"]
     if data.get("location"):
-        lines.append(f"\U0001f4cd {data['location']}")
+        lines.append(f"📍 {data['location']}")
     if data.get("description"):
         lines.append(f"Nota: {data['description']}")
-    lines.append("\n\u2705 Agregado a Google Calendar" if guardado else "\n\u26a0\ufe0f Anota esto manualmente \u2014 Calendar no configurado aun")
+    lines.append("\n✅ Agregado a Google Calendar" if guardado else "\n⚠️ Anota esto manualmente — Calendar no configurado")
     return "\n".join(lines)
 
 async def parse_evento(text: str) -> dict:
     now = now_argentina()
-    today = now.strftime("%Y-%m-%d")
-    hora_actual = now.strftime("%H:%M")
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=300,
         system="Extraé info de un evento. Responde SOLO JSON válido sin markdown. Usa zona horaria Argentina (UTC-3).",
-        messages=[{"role": "user", "content": f"""Hoy es {today}, hora actual en Argentina: {hora_actual}
+        messages=[{"role": "user", "content": f"""Hoy es {now.strftime("%Y-%m-%d")}, hora actual: {now.strftime("%H:%M")}
 Mensaje: {text}
 Respondé:
 {{"summary":"titulo","date":"YYYY-MM-DD","time":"HH:MM o null","duration_minutes":60,"location":"lugar o null","description":"desc o null","emoji":"emoji"}}"""}]
@@ -462,10 +479,8 @@ async def get_gcal_access_token() -> str | None:
         return None
     async with httpx.AsyncClient() as http:
         r = await http.post("https://oauth2.googleapis.com/token", data={
-            "grant_type":    "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id":     client_id,
-            "client_secret": client_secret,
+            "grant_type": "refresh_token", "refresh_token": refresh_token,
+            "client_id": client_id, "client_secret": client_secret,
         })
         if r.status_code == 200:
             return r.json().get("access_token")
@@ -499,109 +514,81 @@ async def search_and_edit_evento(text: str) -> tuple[bool, str]:
     access_token = await get_gcal_access_token()
     if not access_token:
         return False, "Calendar no configurado"
-
     now = now_argentina()
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=300,
-        system="Extraé qué evento se quiere editar y qué se quiere cambiar. Responde SOLO JSON.",
+        system="Extraé qué evento editar y qué cambiar. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f"""Hoy: {now.strftime("%Y-%m-%d")}
 Mensaje: {text}
 Respondé:
-{{"search_term": "nombre del evento a buscar","location": "nueva ubicacion o null","new_title": "nuevo titulo o null","new_time": "HH:MM o null","new_date": "YYYY-MM-DD o null","description": "nueva descripcion o null"}}"""}]
+{{"search_term":"nombre del evento","location":"nueva ubicacion o null","new_title":"nuevo titulo o null","new_time":"HH:MM o null","new_date":"YYYY-MM-DD o null","description":"nueva descripcion o null"}}"""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.strip("`").lstrip("json").strip()
     edit_data = json.loads(raw)
-
     async with httpx.AsyncClient() as http:
         time_min = (now - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00-03:00")
         time_max = (now + timedelta(days=60)).strftime("%Y-%m-%dT23:59:59-03:00")
-
         r = await http.get(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
             headers={"Authorization": f"Bearer {access_token}"},
-            params={
-                "q": edit_data.get("search_term", ""),
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "singleEvents": "true",
-                "orderBy": "startTime",
-                "maxResults": "5"
-            }
+            params={"q": edit_data.get("search_term", ""), "timeMin": time_min, "timeMax": time_max,
+                    "singleEvents": "true", "orderBy": "startTime", "maxResults": "5"}
         )
-
         if r.status_code != 200:
             return False, "Error buscando eventos"
-
         events = r.json().get("items", [])
         if not events:
-            return False, f"No encontré ningún evento con ese nombre"
-
+            return False, "No encontré ningún evento con ese nombre"
         event = events[0]
         event_id = event["id"]
         event_name = event.get("summary", "Evento")
-
-        if edit_data.get("new_title"):
-            event["summary"] = edit_data["new_title"]
-        if edit_data.get("location"):
-            event["location"] = edit_data["location"]
-        if edit_data.get("description"):
-            event["description"] = edit_data["description"]
+        if edit_data.get("new_title"):    event["summary"] = edit_data["new_title"]
+        if edit_data.get("location"):     event["location"] = edit_data["location"]
+        if edit_data.get("description"):  event["description"] = edit_data["description"]
         if edit_data.get("new_date") or edit_data.get("new_time"):
             if "dateTime" in event.get("start", {}):
-                old_dt = event["start"]["dateTime"][:16]
-                old_date = old_dt[:10]
-                old_time = old_dt[11:16]
-                new_date = edit_data.get("new_date") or old_date
-                new_time = edit_data.get("new_time") or old_time
+                old_dt   = event["start"]["dateTime"][:16]
+                new_date = edit_data.get("new_date") or old_dt[:10]
+                new_time = edit_data.get("new_time") or old_dt[11:16]
                 event["start"] = {"dateTime": f"{new_date}T{new_time}:00", "timeZone": "America/Argentina/Buenos_Aires"}
                 if "dateTime" in event.get("end", {}):
-                    end_dt = datetime.strptime(event["end"]["dateTime"][:16], "%Y-%m-%dT%H:%M")
-                    start_dt = datetime.strptime(f"{new_date}T{new_time}", "%Y-%m-%dT%H:%M")
-                    dur = end_dt - datetime.strptime(old_dt, "%Y-%m-%dT%H:%M")
-                    new_end = start_dt + dur
+                    dur = datetime.strptime(event["end"]["dateTime"][:16], "%Y-%m-%dT%H:%M") - datetime.strptime(old_dt, "%Y-%m-%dT%H:%M")
+                    new_end = datetime.strptime(f"{new_date}T{new_time}", "%Y-%m-%dT%H:%M") + dur
                     event["end"] = {"dateTime": new_end.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "America/Argentina/Buenos_Aires"}
-
         update_r = await http.put(
             f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}",
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
             json=event
         )
-
         if update_r.status_code in [200, 201]:
-            location_str = f"\n📍 {edit_data['location']}" if edit_data.get("location") else ""
-            return True, f"✅ *{event_name}* actualizado{location_str}"
-        else:
-            return False, "Error actualizando el evento"
+            loc_str = f"\n📍 {edit_data['location']}" if edit_data.get("location") else ""
+            return True, f"✅ *{event_name}* actualizado{loc_str}"
+        return False, "Error actualizando el evento"
 
 async def delete_evento(text: str) -> tuple[bool, str]:
-    """Busca evento(s) en Google Calendar y los elimina. Soporta búsqueda por nombre y por fecha."""
     access_token = await get_gcal_access_token()
     if not access_token:
         return False, "Calendar no configurado"
-
     now = now_argentina()
     tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=150,
         system="Extraé info sobre qué evento(s) eliminar. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f"""Hoy: {now.strftime("%Y-%m-%d")}, mañana: {tomorrow}
 Mensaje: {text}
 Respondé:
-{{"search_term": "nombre del evento o null si no se menciona uno concreto",
-  "target_date": "YYYY-MM-DD si se menciona una fecha o 'mañana'/'hoy', sino null",
+{{"search_term": "nombre del evento o null",
+  "target_date": "YYYY-MM-DD si se menciona fecha, sino null",
   "delete_all": true si quiere borrar todos los eventos de esa fecha}}"""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.strip("`").lstrip("json").strip()
     intent = json.loads(raw)
-
     async with httpx.AsyncClient() as http:
         headers = {"Authorization": f"Bearer {access_token}"}
-
         if intent.get("target_date"):
             date_str = intent["target_date"]
             time_min = f"{date_str}T00:00:00-03:00"
@@ -609,30 +596,20 @@ Respondé:
         else:
             time_min = (now - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00-03:00")
             time_max = (now + timedelta(days=60)).strftime("%Y-%m-%dT23:59:59-03:00")
-
-        params = {
-            "timeMin": time_min,
-            "timeMax": time_max,
-            "singleEvents": "true",
-            "orderBy": "startTime",
-            "maxResults": "10"
-        }
+        params = {"timeMin": time_min, "timeMax": time_max, "singleEvents": "true",
+                  "orderBy": "startTime", "maxResults": "10"}
         if intent.get("search_term"):
             params["q"] = intent["search_term"]
-
         r = await http.get(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
             headers=headers, params=params
         )
         if r.status_code != 200:
             return False, "Error buscando eventos"
-
         events = r.json().get("items", [])
         events = [e for e in events if "[TEMP]" not in (e.get("description") or "")]
-
         if not events:
             return False, "No encontré ningún evento para eliminar"
-
         deleted = []
         for event in events:
             del_r = await http.delete(
@@ -643,14 +620,12 @@ Respondé:
                 deleted.append(event.get("summary", "Evento"))
             if not intent.get("delete_all"):
                 break
-
         if not deleted:
             return False, "Error eliminando el evento"
         if len(deleted) == 1:
             return True, f"🗑️ *{deleted[0]}* eliminado del calendario"
-        else:
-            lista = "\n".join(f"• {e}" for e in deleted)
-            return True, f"🗑️ *{len(deleted)} eventos eliminados:*\n{lista}"
+        lista = "\n".join(f"• {e}" for e in deleted)
+        return True, f"🗑️ *{len(deleted)} eventos eliminados:*\n{lista}"
 
 # ── HISTORIAL DE CONVERSACIÓN ──────────────────────────────────────────────────
 chat_history: dict[str, list] = {}
@@ -674,94 +649,74 @@ async def classify(text: str, has_image: bool) -> str:
         model="claude-sonnet-4-20250514", max_tokens=10,
         system="""Responde SOLO una palabra: GASTO, CORREGIR_GASTO, PLANTA, EVENTO, EDITAR_EVENTO, ELIMINAR_EVENTO, RECORDATORIO, SHOPPING o CHAT.
 
-GASTO: registrar un pago, compra o ingreso concreto con monto. Ej: "gasté 3500 en verdura", "cargué nafta", "me pagaron 50000", foto de factura.
-CORREGIR_GASTO: corregir o actualizar un gasto ya registrado. Ej: "me equivoqué, era 7000 no 7500", "el gasto de anthropic era 5000", "cambiá el monto de la verdulería".
-PLANTA: adquirir o mencionar una planta sin contexto de precio como gasto.
+GASTO: registrar un pago, compra o ingreso concreto con monto.
+CORREGIR_GASTO: corregir un gasto ya registrado. Ej: "me equivoqué, era 7000 no 7500", "cambiá el monto de la verdulería".
+PLANTA: adquirir o mencionar una planta.
 EDITAR_EVENTO: modificar un evento existente en el calendario.
-ELIMINAR_EVENTO: eliminar o borrar un evento existente del calendario.
+ELIMINAR_EVENTO: eliminar o borrar un evento del calendario.
 RECORDATORIO: "recordame en X tiempo", "avisame en X", "haceme acordar".
-EVENTO: crear un evento nuevo en el calendario — turno, reunión, cumple, cita, viaje.
-SHOPPING: gestionar lista de compras — "me quedé sin X", "compré X", "agregá X a la lista", "qué me falta".
-CHAT: CUALQUIER pregunta, consulta o conversación — "cuánto gasté?", "cuánto llevo gastado?", "cuánto gané este mes?", preguntas sobre finanzas, consejos, charla, cálculos, redactar algo. Si el mensaje tiene signo de pregunta o pide información → CHAT.
+EVENTO: crear un evento nuevo — turno, reunión, cumple, cita, viaje.
+SHOPPING: gestionar lista de compras — "me quedé sin X", "compré X", "agregá X", "qué me falta".
+CHAT: cualquier pregunta, consulta o conversación. Si tiene "?" o pide información → CHAT.
 
-REGLA CLAVE: si el mensaje PREGUNTA algo (tiene "?", "cuánto", "qué", "cómo", "cuál") → siempre es CHAT, nunca GASTO.""",
+REGLA: si el mensaje PREGUNTA algo → siempre CHAT, nunca GASTO.""",
         messages=[{"role": "user", "content": text}]
     )
     r = response.content[0].text.strip().upper()
-    if "ELIMINAR_EVENTO" in r: return "ELIMINAR_EVENTO"
-    if "EDITAR_EVENTO" in r: return "EDITAR_EVENTO"
-    if "CORREGIR_GASTO" in r: return "CORREGIR_GASTO"
-    if "SHOPPING" in r: return "SHOPPING"
-    if "RECORDATORIO" in r: return "RECORDATORIO"
-    if "PLANTA" in r: return "PLANTA"
-    if "EVENTO" in r: return "EVENTO"
-    if "CHAT" in r: return "CHAT"
+    if "ELIMINAR_EVENTO" in r:  return "ELIMINAR_EVENTO"
+    if "EDITAR_EVENTO" in r:    return "EDITAR_EVENTO"
+    if "CORREGIR_GASTO" in r:   return "CORREGIR_GASTO"
+    if "SHOPPING" in r:         return "SHOPPING"
+    if "RECORDATORIO" in r:     return "RECORDATORIO"
+    if "PLANTA" in r:           return "PLANTA"
+    if "EVENTO" in r:           return "EVENTO"
+    if "CHAT" in r:             return "CHAT"
     return "GASTO"
 
 async def query_finances(month: str = None) -> str:
     now = now_argentina()
     if not month:
         month = now.strftime("%Y-%m")
-
     year, mon = map(int, month.split("-"))
     last_day = monthrange(year, mon)[1]
-    date_start = f"{month}-01"
-    date_end = f"{month}-{last_day:02d}"
-
     async with httpx.AsyncClient() as http:
         r = await http.post(
             f"https://api.notion.com/v1/databases/{NOTION_DB_ID.replace('-','')}/query",
             headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
             json={
-                "filter": {
-                    "and": [
-                        {"property": "Date", "date": {"on_or_after": date_start}},
-                        {"property": "Date", "date": {"on_or_before": date_end}}
-                    ]
-                },
+                "filter": {"and": [
+                    {"property": "Date", "date": {"on_or_after": f"{month}-01"}},
+                    {"property": "Date", "date": {"on_or_before": f"{month}-{last_day:02d}"}}
+                ]},
                 "page_size": 100
             }
         )
         if r.status_code != 200:
             return None
-
         results = r.json().get("results", [])
         if not results:
             return f"No hay registros para {month}."
-
-        ingresos = 0
-        egresos = 0
+        ingresos = egresos = 0
         por_categoria = {}
-
         for page in results:
             props = page.get("properties", {})
-            in_out = props.get("In - Out", {}).get("select", {})
-            in_out_name = in_out.get("name", "") if in_out else ""
+            in_out_name = (props.get("In - Out", {}).get("select", {}) or {}).get("name", "")
             value = props.get("Value (ars)", {}).get("number", 0) or 0
-            cats = [c["name"] for c in props.get("Categoría", {}).get("multi_select", [])]
-
+            cats = [c["name"] for c in props.get("Categor\u00eda", {}).get("multi_select", [])]
             if "INGRESO" in in_out_name:
                 ingresos += value
             else:
                 egresos += value
                 for cat in cats:
                     por_categoria[cat] = por_categoria.get(cat, 0) + value
-
         balance = ingresos - egresos
         top_cats = sorted(por_categoria.items(), key=lambda x: x[1], reverse=True)[:5]
-
-        summary = f"📊 *Finanzas {month}*\n\n"
-        summary += f"💚 Ingresos: ${ingresos:,.0f}\n"
-        summary += f"🔴 Egresos: ${egresos:,.0f}\n"
-        summary += f"{'✅' if balance >= 0 else '⚠️'} Balance: ${balance:,.0f}\n"
+        summary = f"📊 *Finanzas {month}*\n\n💚 Ingresos: ${ingresos:,.0f}\n🔴 Egresos: ${egresos:,.0f}\n{'✅' if balance >= 0 else '⚠️'} Balance: ${balance:,.0f}\n"
         if top_cats:
-            summary += f"\n📂 *Top categorías de gasto:*\n"
-            for cat, val in top_cats:
-                summary += f"• {cat}: ${val:,.0f}\n"
+            summary += "\n📂 *Top categorías:*\n" + "".join(f"• {c}: ${v:,.0f}\n" for c, v in top_cats)
         return summary
 
-async def query_calendar(days_ahead: int = 1, days_back: int = 0) -> str | None:
-    """Consulta eventos de Google Calendar en un rango de días y devuelve un resumen."""
+async def query_calendar(days_ahead: int = 2, days_back: int = 0) -> str | None:
     access_token = await get_gcal_access_token()
     if not access_token:
         return None
@@ -772,36 +727,23 @@ async def query_calendar(days_ahead: int = 1, days_back: int = 0) -> str | None:
         r = await http.get(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
             headers={"Authorization": f"Bearer {access_token}"},
-            params={
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "singleEvents": "true",
-                "orderBy": "startTime",
-                "maxResults": "20"
-            }
+            params={"timeMin": time_min, "timeMax": time_max, "singleEvents": "true",
+                    "orderBy": "startTime", "maxResults": "20"}
         )
         if r.status_code != 200:
             return None
-        events = r.json().get("items", [])
-        # Filtrar eventos temporales
-        events = [e for e in events if "[TEMP]" not in (e.get("description") or "")]
+        events = [e for e in r.json().get("items", []) if "[TEMP]" not in (e.get("description") or "")]
         if not events:
             return "No hay eventos en ese período."
         lines = []
         for e in events:
-            summary = e.get("summary", "Evento")
             start = e.get("start", {})
-            loc = e.get("location", "")
-            loc_str = f" — 📍{loc}" if loc else ""
+            loc_str = f" — 📍{e.get('location', '')}" if e.get("location") else ""
             if "dateTime" in start:
-                dt_str = start["dateTime"][:16]
-                dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M")
-                fecha = dt.strftime("%d/%m")
-                hora = dt.strftime("%H:%M")
-                lines.append(f"• {fecha} {hora} — {summary}{loc_str}")
+                dt = datetime.strptime(start["dateTime"][:16], "%Y-%m-%dT%H:%M")
+                lines.append(f"• {dt.strftime('%d/%m')} {dt.strftime('%H:%M')} — {e.get('summary', 'Evento')}{loc_str}")
             else:
-                fecha = start.get("date", "")
-                lines.append(f"• {fecha} — {summary} (todo el día){loc_str}")
+                lines.append(f"• {start.get('date', '')} — {e.get('summary', 'Evento')} (todo el día){loc_str}")
         return "\n".join(lines)
 
 async def handle_chat(phone: str, text: str) -> str:
@@ -810,48 +752,38 @@ async def handle_chat(phone: str, text: str) -> str:
     now = now_argentina()
     text_lower = text.lower()
 
-    # ── Contexto de finanzas ──────────────────────────────────────────────────
     finance_context = ""
-    finance_keywords = ["gasté", "gaste", "gastado", "ingres", "gané", "gane", "balance", "cuánto", "cuanto", "finanzas", "plata", "mes"]
-    if any(k in text_lower for k in finance_keywords):
+    if any(k in text_lower for k in ["gasté","gaste","gastado","ingres","gané","gane","balance","cuánto","cuanto","finanzas","plata","mes"]):
         mes = now.strftime("%Y-%m")
         if "febrero" in text_lower: mes = f"{now.year}-02"
-        elif "enero" in text_lower: mes = f"{now.year}-01"
-        elif "marzo" in text_lower: mes = f"{now.year}-03"
-        elif "abril" in text_lower: mes = f"{now.year}-04"
-        finance_data = await query_finances(mes)
-        if finance_data:
-            finance_context = f"\n\nDATO REAL DE NOTION (usá esto para responder):\n{finance_data}"
+        elif "enero" in text_lower:  mes = f"{now.year}-01"
+        elif "marzo" in text_lower:  mes = f"{now.year}-03"
+        elif "abril" in text_lower:  mes = f"{now.year}-04"
+        data = await query_finances(mes)
+        if data:
+            finance_context = f"\n\nDATO REAL DE NOTION:\n{data}"
 
-    # ── Contexto de calendario ────────────────────────────────────────────────
     calendar_context = ""
-    calendar_keywords = ["evento", "turno", "reunión", "reunion", "agenda", "calendario",
-                         "tengo algo", "tengo mañana", "qué tengo", "que tengo",
-                         "esta semana", "próximos días", "proximos dias", "mañana", "hoy"]
-    if any(k in text_lower for k in calendar_keywords):
-        # Determinar rango según el mensaje
-        if "esta semana" in text_lower or "próximos días" in text_lower or "proximos dias" in text_lower:
-            days = 7
-        elif "este mes" in text_lower:
-            days = 30
-        else:
-            days = 2  # hoy + mañana por defecto
+    if any(k in text_lower for k in ["evento","turno","reunión","reunion","agenda","calendario","tengo algo","qué tengo","que tengo","esta semana","próximos","proximos","mañana","hoy"]):
+        days = 7 if ("esta semana" in text_lower or "próximos" in text_lower) else (30 if "este mes" in text_lower else 2)
         cal_data = await query_calendar(days_ahead=days)
         if cal_data:
-            calendar_context = f"\n\nDATO REAL DE GOOGLE CALENDAR (usá esto para responder):\n{cal_data}"
+            calendar_context = f"\n\nDATO REAL DE GOOGLE CALENDAR:\n{cal_data}"
 
-    messages = history + [{"role": "user", "content": text}]
+    weather_context = ""
+    if any(k in text_lower for k in ["clima","lluvia","frío","frio","calor","temperatura","viento","tiempo","paraguas","abrigo","nublado","sol","llueve"]):
+        w = await get_weather()
+        if w:
+            weather_lines = format_weather_lines(w)
+            weather_context = f"\n\nCLIMA ACTUAL (Open-Meteo, modelos ECMWF/GFS):\n" + "\n".join(weather_lines)
 
     response = anthropic.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=800,
+        model="claude-sonnet-4-20250514", max_tokens=800,
         system=f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural.
 Usás español rioplatense. Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
-Podés ayudar con cualquier cosa: preguntas, cálculos, redacción, consejos, etc.
-Si el mensaje tiene un monto para registrar, avisale que lo mande sin preámbulos.{finance_context}{calendar_context}""",
-        messages=messages
+Si te preguntan sobre el clima, podés mencionar que los datos vienen de Open-Meteo (modelos ECMWF y GFS).{finance_context}{calendar_context}{weather_context}""",
+        messages=history + [{"role": "user", "content": text}]
     )
-
     reply = response.content[0].text.strip()
     add_to_history(phone, "assistant", reply)
     return reply
@@ -860,8 +792,7 @@ Si el mensaje tiene un monto para registrar, avisale que lo mande sin preámbulo
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
-    verify_token = os.environ.get("WHATSAPP_VERIFY_TOKEN", "finanzas_bot_token")
-    if params.get("hub.verify_token") == verify_token:
+    if params.get("hub.verify_token") == os.environ.get("WHATSAPP_VERIFY_TOKEN", "finanzas_bot_token"):
         return int(params.get("hub.challenge", 0))
     return {"error": "Verification failed"}
 
@@ -869,13 +800,9 @@ async def verify_webhook(request: Request):
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
     try:
-        entry = body["entry"][0]
-        changes = entry["changes"][0]["value"]
-        messages = changes.get("messages")
-        if not messages:
-            return {"ok": True}
-        message = messages[0]
-        background_tasks.add_task(process_message, message)
+        messages = body["entry"][0]["changes"][0]["value"].get("messages")
+        if messages:
+            background_tasks.add_task(process_message, messages[0])
     except Exception:
         pass
     return {"ok": True}
@@ -889,55 +816,46 @@ async def process_message(message: dict):
 
         if msg_type == "text":
             text = message["text"]["body"]
-
         elif msg_type == "image":
             media_id = message["image"]["id"]
-            caption = message["image"].get("caption", "")
-            text = caption
+            text = message["image"].get("caption", "")
             image_b64, image_type = await get_media_base64(media_id)
-
         elif msg_type == "document":
             media_id = message["document"]["id"]
-            caption = message["document"].get("caption", "")
-            text = caption
+            text = message["document"].get("caption", "")
             image_b64, image_type = await get_media_base64(media_id)
-
-        # ── NUEVO: soporte de audios ──────────────────────────────────────────
         elif msg_type == "audio":
             media_id = message["audio"]["id"]
             await send_message(from_number, "🎙️ Transcribiendo audio...")
             transcripcion = await transcribe_audio(media_id)
             if transcripcion:
                 text = transcripcion
-                await send_message(from_number, f"🎙️ _{transcripcion}_")
+                await send_message(from_number, f"🗣️ _{transcripcion}_")
             else:
-                await send_message(from_number, "❌ No pude transcribir el audio. Mandalo como texto por favor.")
+                await send_message(from_number, "❌ No pude transcribir el audio. Mandalo como texto.")
                 return
-        # ─────────────────────────────────────────────────────────────────────
-
         else:
             return
 
         if text.strip().lower() in ["/start", "hola", "help", "ayuda"]:
             await send_message(from_number,
-                "\U0001f44b *Hola! Soy Matrics*\n\n"
-                "\U0001f4b8 *Gastos:* _\"Verduleria 3500\"_\n"
-                "\U0001f33f *Plantas:* _\"Me compre un potus\"_\n"
-                "\U0001f4c5 *Eventos:* _\"Manana a las 10 turno medico\"_\n"
-                "\U0001f4f8 *Fotos:* manda cualquier factura\n"
-                "\U0001f3a4 *Audios:* hablá directo, te entiendo\n\n"
-                "Todo se guarda automaticamente \U0001f4aa"
+                "👋 *Hola! Soy Matrics*\n\n"
+                "💸 *Gastos:* _\"Verduleria 3500\"_\n"
+                "🌿 *Plantas:* _\"Me compre un potus\"_\n"
+                "📅 *Eventos:* _\"Manana a las 10 turno medico\"_\n"
+                "📸 *Fotos:* manda cualquier factura\n"
+                "🎤 *Audios:* hablá directo, te entiendo\n\n"
+                "Todo se guarda automaticamente 💪"
             )
             return
 
-        await send_message(from_number, "\u23f3 Procesando...")
+        await send_message(from_number, "⏳ Procesando...")
 
         tipo = await classify(text, image_b64 is not None)
         exchange_rate = await get_exchange_rate()
 
         if tipo == "GASTO":
             parsed = await parse_with_claude(text, image_b64, image_type, exchange_rate)
-            # Aplicar correcciones de categoría aprendidas
             final_cats, cat_note = await check_and_apply_category(parsed["name"], parsed.get("categoria", []))
             parsed["categoria"] = final_cats
             success, error = await create_notion_entry(parsed, exchange_rate)
@@ -947,9 +865,9 @@ async def process_message(message: dict):
                     reply += f"\n{cat_note}"
                 await send_message(from_number, reply)
             elif "No se pudo interpretar" in error:
-                await send_message(from_number, "\u274c No entendi el monto. Ejemplo: _\"Verduleria 3500\"_")
+                await send_message(from_number, "❌ No entendi el monto. Ejemplo: _\"Verduleria 3500\"_")
             else:
-                await send_message(from_number, f"\u274c Error Notion:\n{error[:200]}")
+                await send_message(from_number, f"❌ Error Notion:\n{error[:200]}")
 
         elif tipo == "CORREGIR_GASTO":
             success, msg = await corregir_gasto(text)
@@ -961,7 +879,7 @@ async def process_message(message: dict):
             if success:
                 await send_message(from_number, format_planta(parsed))
             else:
-                await send_message(from_number, f"\u274c Error guardando planta: {error[:200]}")
+                await send_message(from_number, f"❌ Error guardando planta: {error[:200]}")
 
         elif tipo == "EVENTO":
             parsed = await parse_evento(text)
@@ -996,7 +914,7 @@ async def process_message(message: dict):
         pass
     except Exception as e:
         try:
-            await send_message(from_number, f"\u274c Error: {str(e)[:200]}")
+            await send_message(from_number, f"❌ Error: {str(e)[:200]}")
         except Exception:
             pass
 
@@ -1013,11 +931,7 @@ async def parse_recordatorio(text: str) -> dict:
         messages=[{"role": "user", "content": f"""Ahora son las {now.strftime("%Y-%m-%d %H:%M")} en Argentina.
 Mensaje: {text}
 Respondé:
-{{"summary": "descripcion del recordatorio","fire_at": "YYYY-MM-DDTHH:MM (hora exacta en que disparar)","emoji": "emoji"}}
-Ejemplos:
-- "en 1 hora abri el lavarropa" → fire_at = ahora + 1 hora
-- "en 30 minutos llamar al medico" → fire_at = ahora + 30 min
-- "mañana a las 9 tomar medicamento" → fire_at = mañana 09:00"""}]
+{{"summary": "descripcion","fire_at": "YYYY-MM-DDTHH:MM","emoji": "emoji"}}"""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -1028,18 +942,15 @@ async def create_recordatorio(data: dict) -> tuple[bool, str]:
     access_token = await get_gcal_access_token()
     if not access_token:
         return False, "Calendar no configurado"
-
     fire_at = data["fire_at"]
     start_dt = datetime.strptime(fire_at, "%Y-%m-%dT%H:%M")
     end_dt = start_dt + timedelta(minutes=1)
-
     event = {
         "summary": f"🔔 {data['summary']}",
         "description": "[TEMP]",
         "start": {"dateTime": f"{fire_at}:00", "timeZone": "America/Argentina/Buenos_Aires"},
-        "end": {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "America/Argentina/Buenos_Aires"},
+        "end":   {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "America/Argentina/Buenos_Aires"},
     }
-
     async with httpx.AsyncClient() as http:
         r = await http.post(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
@@ -1053,9 +964,8 @@ def format_recordatorio(data: dict) -> str:
     fire_at = data.get("fire_at", "")
     try:
         dt = datetime.strptime(fire_at, "%Y-%m-%dT%H:%M")
-        hora = dt.strftime("%H:%M")
         fecha = dt.strftime("%d/%m") if dt.date() != now_argentina().date() else "hoy"
-        tiempo_str = f"{fecha} a las {hora}"
+        tiempo_str = f"{fecha} a las {dt.strftime('%H:%M')}"
     except Exception:
         tiempo_str = fire_at
     return f"{emoji} *{data['summary']}*\nTe aviso {tiempo_str}\n\n✅ Recordatorio configurado"
@@ -1066,113 +976,82 @@ async def cron_job():
     access_token = await get_gcal_access_token()
     if not access_token:
         return {"ok": False, "reason": "no gcal token"}
-
     now = now_argentina()
     fired = []
-
     async with httpx.AsyncClient() as http:
         headers = {"Authorization": f"Bearer {access_token}"}
-
-        time_min = now.strftime("%Y-%m-%dT%H:%M:00-03:00")
-        time_max = (now + timedelta(minutes=61)).strftime("%Y-%m-%dT%H:%M:00-03:00")
-
         r = await http.get(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
             headers=headers,
             params={
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "singleEvents": "true",
-                "orderBy": "startTime",
-                "maxResults": "20"
+                "timeMin": now.strftime("%Y-%m-%dT%H:%M:00-03:00"),
+                "timeMax": (now + timedelta(minutes=61)).strftime("%Y-%m-%dT%H:%M:00-03:00"),
+                "singleEvents": "true", "orderBy": "startTime", "maxResults": "20"
             }
         )
-
         if r.status_code != 200:
             return {"ok": False}
-
-        events = r.json().get("items", [])
-
-        for event in events:
-            event_id = event.get("id")
-            summary = event.get("summary", "Evento")
-            description = event.get("description", "") or ""
-            start = event.get("start", {})
-
-            if "dateTime" in start:
-                event_dt_str = start["dateTime"][:16]
-                try:
-                    event_dt = datetime.strptime(event_dt_str, "%Y-%m-%dT%H:%M")
-                    diff_minutes = int((event_dt - now.replace(tzinfo=None)).total_seconds() / 60)
-                except Exception:
-                    continue
-            else:
+        for event in r.json().get("items", []):
+            event_id  = event.get("id")
+            summary   = event.get("summary", "Evento")
+            desc      = event.get("description", "") or ""
+            start     = event.get("start", {})
+            if "dateTime" not in start:
                 continue
-
-            if "[TEMP]" in description and 0 <= diff_minutes <= 1:
-                clean_name = summary.replace("🔔 ", "")
-                await send_message(MY_NUMBER, f"🔔 *Recordatorio*\n{clean_name}")
-                await http.delete(
-                    f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}",
-                    headers=headers
-                )
+            try:
+                diff_minutes = int((datetime.strptime(start["dateTime"][:16], "%Y-%m-%dT%H:%M") - now.replace(tzinfo=None)).total_seconds() / 60)
+            except Exception:
+                continue
+            if "[TEMP]" in desc and 0 <= diff_minutes <= 1:
+                await send_message(MY_NUMBER, f"🔔 *Recordatorio*\n{summary.replace('🔔 ', '')}")
+                await http.delete(f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}", headers=headers)
                 fired.append(f"TEMP: {summary}")
-
-            elif "[REM:60]" in description and 59 <= diff_minutes <= 61:
-                loc = event.get("location", "")
-                loc_str = f"\n📍 {loc}" if loc else ""
+            elif "[REM:60]" in desc and 59 <= diff_minutes <= 61:
+                loc_str = f"\n📍 {event.get('location')}" if event.get("location") else ""
                 await send_message(MY_NUMBER, f"⏰ *En 1 hora:* {summary}{loc_str}")
                 fired.append(f"REM60: {summary}")
-
-            elif "[REM:15]" in description and 14 <= diff_minutes <= 16:
-                loc = event.get("location", "")
-                loc_str = f"\n📍 {loc}" if loc else ""
+            elif "[REM:15]" in desc and 14 <= diff_minutes <= 16:
+                loc_str = f"\n📍 {event.get('location')}" if event.get("location") else ""
                 await send_message(MY_NUMBER, f"⏰ *En 15 minutos:* {summary}{loc_str}")
                 fired.append(f"REM15: {summary}")
-
         if now.hour == DAILY_SUMMARY_HOUR and now.minute == 0:
             await send_daily_summary(http, access_token, now)
             fired.append("DAILY_SUMMARY")
-
     return {"ok": True, "fired": fired, "time": now.strftime("%H:%M")}
 
 async def send_daily_summary(http, access_token: str, now: datetime):
-    today_start = now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT00:00:00-03:00")
-    today_end = now.replace(hour=23, minute=59, second=59).strftime("%Y-%m-%dT23:59:59-03:00")
-
+    """Resumen matutino: clima + eventos del día."""
     r = await http.get(
         "https://www.googleapis.com/calendar/v3/calendars/primary/events",
         headers={"Authorization": f"Bearer {access_token}"},
         params={
-            "timeMin": today_start,
-            "timeMax": today_end,
-            "singleEvents": "true",
-            "orderBy": "startTime",
-            "maxResults": "10"
+            "timeMin": now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT00:00:00-03:00"),
+            "timeMax": now.replace(hour=23, minute=59, second=59).strftime("%Y-%m-%dT23:59:59-03:00"),
+            "singleEvents": "true", "orderBy": "startTime", "maxResults": "10"
         }
     )
-
     if r.status_code != 200:
         return
+    events = [e for e in r.json().get("items", []) if "[TEMP]" not in (e.get("description") or "")]
 
-    events = r.json().get("items", [])
-    events = [e for e in events if "[TEMP]" not in (e.get("description") or "")]
+    w = await get_weather()
+
+    lines = ["☀️ *Buenos días, Martín!*", ""]
+    if w:
+        lines.extend(format_weather_lines(w))
+        lines.append("")
 
     if not events:
-        await send_message(MY_NUMBER, f"☀️ *Buenos días!*\nNo tenés eventos para hoy.")
-        return
-
-    lines = [f"☀️ *Buenos días! Tus eventos de hoy:*\n"]
-    for e in events:
-        summary = e.get("summary", "Evento")
-        start = e.get("start", {})
-        loc = e.get("location", "")
-        if "dateTime" in start:
-            hora = start["dateTime"][11:16]
-            loc_str = f" — {loc}" if loc else ""
-            lines.append(f"• {hora} — {summary}{loc_str}")
-        else:
-            lines.append(f"• {summary} (todo el día)")
+        lines.append("📅 Hoy no tenés eventos agendados.")
+    else:
+        lines.append(f"📅 *{'Tus eventos de hoy' if len(events) > 1 else 'Tu evento de hoy'}:*")
+        for e in events:
+            start = e.get("start", {})
+            loc_str = f" — 📍{e.get('location', '')}" if e.get("location") else ""
+            if "dateTime" in start:
+                lines.append(f"• {start['dateTime'][11:16]} — {e.get('summary', 'Evento')}{loc_str}")
+            else:
+                lines.append(f"• {e.get('summary', 'Evento')} (todo el día){loc_str}")
 
     await send_message(MY_NUMBER, "\n".join(lines))
 
@@ -1182,31 +1061,19 @@ async def health_check():
 
 # ── MÓDULO SHOPPING ────────────────────────────────────────────────────────────
 def notion_headers():
-    return {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
+    return {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
 
 async def parse_shopping_intent(text: str) -> dict:
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=300,
         system="Analizá mensajes sobre lista de compras. Responde SOLO JSON válido sin markdown.",
         messages=[{"role": "user", "content": f"""Mensaje: {text}
-
-Respondé con este JSON:
-{{
-  "action": "out_of_stock" | "in_stock" | "add" | "list",
-  "items": ["item1", "item2"],
-  "frequency": "Habitual" | "Monthly" | "One-time" | null,
-  "store": "Supermercado" | "Verdulería" | "Farmacia" | null
-}}
-
-Reglas:
-- "out_of_stock": "me quedé sin X", "no tengo X", "se acabó X" → destildar en stock
-- "in_stock": "compré X", "ya tengo X", "conseguí X" → tildar en stock
-- "add": "agregá X", "necesito comprar X", "añadí X" → crear ítem nuevo si no existe
-- "list": "qué me falta", "qué tengo que comprar", "mostrame la lista" → listar items sin stock"""}]
+Respondé:
+{{"action": "out_of_stock"|"in_stock"|"add"|"list", "items": ["item1"], "frequency": null, "store": null}}
+- out_of_stock: "me quedé sin X", "no tengo X"
+- in_stock: "compré X", "ya tengo X"
+- add: "agregá X", "necesito comprar X"
+- list: "qué me falta", "mostrame la lista\""""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -1218,31 +1085,22 @@ async def search_shopping_item(name: str) -> list:
         r = await http.post(
             f"https://api.notion.com/v1/databases/{SHOPPING_DB_ID}/query",
             headers=notion_headers(),
-            json={
-                "filter": {
-                    "property": "Name",
-                    "title": {"contains": name[:30]}
-                }
-            }
+            json={"filter": {"property": "Name", "title": {"contains": name[:30]}}}
         )
-        if r.status_code == 200:
-            return r.json().get("results", [])
-        return []
+        return r.json().get("results", []) if r.status_code == 200 else []
 
 async def handle_shopping(text: str) -> str:
     intent = await parse_shopping_intent(text)
     action = intent.get("action")
-    items = intent.get("items", [])
+    items  = intent.get("items", [])
 
     if action == "list":
         async with httpx.AsyncClient() as http:
             r = await http.post(
                 f"https://api.notion.com/v1/databases/{SHOPPING_DB_ID}/query",
                 headers=notion_headers(),
-                json={
-                    "filter": {"property": "en stock", "checkbox": {"equals": False}},
-                    "sorts": [{"property": "tipo", "direction": "ascending"}]
-                }
+                json={"filter": {"property": "en stock", "checkbox": {"equals": False}},
+                      "sorts": [{"property": "tipo", "direction": "ascending"}]}
             )
             if r.status_code != 200:
                 return "❌ No pude leer la lista de compras"
@@ -1253,74 +1111,48 @@ async def handle_shopping(text: str) -> str:
             for item in results:
                 name = item["properties"]["Name"]["title"][0]["plain_text"] if item["properties"]["Name"]["title"] else "?"
                 tipo = item["properties"].get("tipo", {}).get("select", {})
-                tipo_str = f" _{tipo.get('name', '')}_" if tipo else ""
-                lines.append(f"• {name}{tipo_str}")
+                tipo_name = tipo.get("name", "") if tipo else ""
+                lines.append(f"• {name}{f' _{tipo_name}_' if tipo_name else ''}")
             return "\n".join(lines)
 
     if not items:
         return "❓ No entendí qué producto querés actualizar."
 
     results_text = []
-
     for item_name in items:
         if action == "add":
             existing = await search_shopping_item(item_name)
             if existing:
-                page_id = existing[0]["id"]
                 async with httpx.AsyncClient() as http:
-                    await http.patch(
-                        f"https://api.notion.com/v1/pages/{page_id}",
-                        headers=notion_headers(),
-                        json={"properties": {"en stock": {"checkbox": False}}}
-                    )
-                results_text.append(f"📋 _{item_name}_ ya estaba en la lista, aparece ahora como faltante")
+                    await http.patch(f"https://api.notion.com/v1/pages/{existing[0]['id']}",
+                                     headers=notion_headers(),
+                                     json={"properties": {"en stock": {"checkbox": False}}})
+                results_text.append(f"📋 _{item_name}_ ya estaba en la lista, aparece como faltante")
             else:
-                props = {
-                    "Name": {"title": [{"text": {"content": item_name}}]},
-                    "en stock": {"checkbox": False}
-                }
                 async with httpx.AsyncClient() as http:
-                    r = await http.post(
-                        "https://api.notion.com/v1/pages",
-                        headers=notion_headers(),
-                        json={"parent": {"database_id": SHOPPING_DB_ID}, "properties": props}
-                    )
-                if r.status_code == 200:
-                    results_text.append(f"✅ _{item_name}_ agregado a la lista")
-                else:
-                    results_text.append(f"❌ Error agregando _{item_name}_: {r.status_code} — {r.text[:150]}")
+                    r = await http.post("https://api.notion.com/v1/pages", headers=notion_headers(),
+                                        json={"parent": {"database_id": SHOPPING_DB_ID},
+                                              "properties": {"Name": {"title": [{"text": {"content": item_name}}]},
+                                                             "en stock": {"checkbox": False}}})
+                results_text.append(f"✅ _{item_name}_ agregado" if r.status_code == 200 else f"❌ Error agregando _{item_name}_")
 
         elif action in ["out_of_stock", "in_stock"]:
             in_stock = action == "in_stock"
             existing = await search_shopping_item(item_name)
             if existing:
-                page_id = existing[0]["id"]
                 async with httpx.AsyncClient() as http:
-                    await http.patch(
-                        f"https://api.notion.com/v1/pages/{page_id}",
-                        headers=notion_headers(),
-                        json={"properties": {"en stock": {"checkbox": in_stock}}}
-                    )
-                if in_stock:
-                    results_text.append(f"✅ _{item_name}_ marcado como en stock")
-                else:
-                    results_text.append(f"🛒 _{item_name}_ agregado a la lista de compras")
+                    await http.patch(f"https://api.notion.com/v1/pages/{existing[0]['id']}",
+                                     headers=notion_headers(),
+                                     json={"properties": {"en stock": {"checkbox": in_stock}}})
+                results_text.append(f"✅ _{item_name}_ marcado como en stock" if in_stock else f"🛒 _{item_name}_ agregado a la lista")
             else:
                 if not in_stock:
-                    props = {
-                        "Name": {"title": [{"text": {"content": item_name}}]},
-                        "en stock": {"checkbox": False}
-                    }
                     async with httpx.AsyncClient() as http:
-                        r = await http.post(
-                            "https://api.notion.com/v1/pages",
-                            headers=notion_headers(),
-                            json={"parent": {"database_id": SHOPPING_DB_ID}, "properties": props}
-                        )
-                    if r.status_code == 200:
-                        results_text.append(f"🛒 _{item_name}_ no estaba en la lista, lo agregué como faltante")
-                    else:
-                        results_text.append(f"❌ Error: {r.status_code} — {r.text[:150]}")
+                        r = await http.post("https://api.notion.com/v1/pages", headers=notion_headers(),
+                                            json={"parent": {"database_id": SHOPPING_DB_ID},
+                                                  "properties": {"Name": {"title": [{"text": {"content": item_name}}]},
+                                                                 "en stock": {"checkbox": False}}})
+                    results_text.append(f"🛒 _{item_name}_ agregado como faltante" if r.status_code == 200 else f"❌ Error")
                 else:
                     results_text.append(f"❓ _{item_name}_ no está en la lista")
 
