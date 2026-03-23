@@ -595,7 +595,19 @@ def format_planta(data: dict) -> str:
 def format_evento(data: dict, guardado: bool) -> str:
     emoji = data.get("emoji", "📅")
     hora = f" a las {data['time']}" if data.get("time") else ""
-    lines = [f"{emoji} *{data['summary']}*", f"Fecha: {data['date']}{hora}"]
+    # Convertir fecha YYYY-MM-DD a dd/mm/aaaa
+    fecha_raw = data.get("date", "")
+    try:
+        from datetime import datetime as dt
+        fecha = dt.strptime(fecha_raw, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        fecha = fecha_raw
+    # Incluir contexto del usuario en el título si viene en caption
+    summary = data.get("summary", "Evento")
+    caption = data.get("caption", "")
+    if caption and caption.lower() not in summary.lower():
+        summary = f"{summary} — {caption.strip().capitalize()}"
+    lines = [f"{emoji} *{summary}*", f"Fecha: {fecha}{hora}"]
     if data.get("location"):
         lines.append(f"📍 {data['location']}")
     if data.get("description"):
@@ -1057,6 +1069,9 @@ async def process_message(message: dict):
 
         elif tipo == "EVENTO":
             parsed = await parse_evento(text, image_b64, image_type)
+            # Pasar el caption original para enriquecer el título
+            if text.strip():
+                parsed["caption"] = text.strip()
             guardado = await create_evento_gcal(parsed)
             await send_message(from_number, format_evento(parsed, guardado))
 
@@ -1246,28 +1261,57 @@ SHOPPING_CATEGORIES = ["Frutas y verduras", "Enlatado", "Infusion", "Lacteo", "E
 SHOPPING_STORES     = ["Super", "Panaderia", "Verduleria", "Dietetica"]
 SHOPPING_FREQUENCY  = ["Often", "Monthly", "Annual", "One time"]
 
+async def get_ingredients_and_enrich(recipe_name: str) -> tuple[list[dict], bool]:
+    """Una sola llamada Claude: infiere ingredientes Y los enriquece con metadata."""
+    response = anthropic.messages.create(
+        model="claude-sonnet-4-20250514", max_tokens=800,
+        system="Respondé SOLO JSON válido sin markdown ni texto extra.",
+        messages=[{"role": "user", "content": f"""Receta: "{recipe_name}"
+
+1. Listá los ingredientes necesarios
+2. Para cada uno, completá la metadata
+
+Respondé SOLO este array JSON:
+[{{
+  "name": "nombre capitalizado",
+  "emoji": "emoji específico del producto",
+  "category": una de {SHOPPING_CATEGORIES},
+  "store": la más lógica de {SHOPPING_STORES},
+  "frequency": uno de {SHOPPING_FREQUENCY}
+}}]
+
+Criterios frequency:
+- "Often": verduras, lácteos, pan, yerba, huevos
+- "Monthly": aceite, pasta, harina, arroz, enlatados, limpieza
+- "Annual": especias poco usadas, herramientas
+- "One time": ingrediente muy puntual"""}]
+    )
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`").lstrip("json").strip()
+    try:
+        items = json.loads(raw)
+        return items, True
+    except Exception:
+        return [], False
+
 async def enrich_items_with_claude(items: list[str]) -> list[dict]:
-    """Pide a Claude que enriquezca cada ítem con emoji, categoría, tienda y frecuencia."""
+    """Enriquece una lista de items ya conocidos con emoji, categoría, tienda y frecuencia."""
     if not items:
         return []
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=600,
-        system="Enriquecé una lista de ítems de supermercado. Responde SOLO JSON válido sin markdown.",
+        system="Enriquecé una lista de ítems. Responde SOLO JSON válido sin markdown.",
         messages=[{"role": "user", "content": f"""Items: {json.dumps(items, ensure_ascii=False)}
 
 Para cada item respondé un array con:
-- "name": nombre capitalizado correctamente
-- "emoji": emoji MÁS específico para ese producto (nunca usar 🛒)
+- "name": nombre capitalizado
+- "emoji": emoji específico (nunca 🛒)
 - "category": una de {SHOPPING_CATEGORIES}
-- "store": la tienda más lógica de {SHOPPING_STORES}
+- "store": la más lógica de {SHOPPING_STORES}
 - "frequency": uno de {SHOPPING_FREQUENCY}
-  * "Often" = compra frecuente (verduras, lácteos, pan, yerba)
-  * "Monthly" = mensual (aceite, harina, arroz, pasta, limpieza)
-  * "Annual" = esporádico (especias raras, herramientas)
-  * "One time" = compra puntual única
 
-Respondé SOLO el array JSON:
-[{{"name": "Aceite de oliva", "emoji": "🫒", "category": "Comida", "store": "Super", "frequency": "Monthly"}}]"""}]
+Respondé SOLO el array JSON."""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -1275,7 +1319,6 @@ Respondé SOLO el array JSON:
     try:
         return json.loads(raw)
     except Exception:
-        # Fallback: devolver items sin enriquecer
         return [{"name": i.capitalize(), "emoji": "🛒", "category": "", "store": "", "frequency": "One time"} for i in items]
 
 async def search_recipe_in_notion(recipe_name: str) -> list[str] | None:
