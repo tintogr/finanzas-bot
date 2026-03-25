@@ -2291,13 +2291,16 @@ Respondé SOLO este JSON con las propiedades que puedas inferir:
         }
         if recipe_text:
             props["Notes"] = {"rich_text": [{"text": {"content": recipe_text[:2000]}}]}
-        if meta.get("difficult"):
+        # Propiedades opcionales — se agregan solo si Claude las infirió
+        if meta.get("difficult") in ["Easy", "Moderate", "Hard"]:
             props["Difficult "] = {"select": {"name": meta["difficult"]}}
-        if meta.get("type"):
-            props["Type"] = {"multi_select": [{"name": t} for t in meta["type"]]}
-        if meta.get("coccion"):
+        if meta.get("type") and isinstance(meta["type"], list):
+            valid_types = [t for t in meta["type"] if t in ["Dessert", "Dinner", "Breakfast", "Lunch", "Snack"]]
+            if valid_types:
+                props["Type"] = {"multi_select": [{"name": t} for t in valid_types]}
+        if meta.get("coccion") in ["Horno", "Sarten", "Pochar", "Frizzer ", "Varias prep."]:
             props["Cocción "] = {"select": {"name": meta["coccion"]}}
-        if meta.get("healthy"):
+        if meta.get("healthy") in ["Healthy", "Fatty", "ni healthy ni fatty"]:
             props["😈 / 😇"] = {"select": {"name": meta["healthy"]}}
         if relation_ids:
             props["Ingredientess"] = {"relation": relation_ids}
@@ -2307,16 +2310,18 @@ Respondé SOLO este JSON con las propiedades que puedas inferir:
                 "https://api.notion.com/v1/pages",
                 headers=notion_headers(),
                 json={
-                    "parent": {"database_id": RECIPES_DB_ID},
+                    "parent": {"database_id": RECIPES_DB_ID.replace("-", "")},
                     "icon": {"type": "emoji", "emoji": "🍽️"},
                     "properties": props
                 }
             )
             if r.status_code in [200, 201]:
                 return True, ""
-            return False, f"Error creando receta en Notion: {r.text[:150]}"
+            return False, f"Error creando receta en Notion (status {r.status_code}): {r.text[:200]}"
     except Exception as e:
-        return False, f"Excepción en save_recipe_to_notion: {str(e)[:150]}"
+        import traceback
+        tb = traceback.format_exc()
+        return False, f"Excepción: {str(e) or repr(e)} | {tb[-200:]}"
 
 # FIX #12/#14: parse_shopping_intent extrae ingredientes explícitos del texto
 async def parse_shopping_intent(text: str) -> dict:
