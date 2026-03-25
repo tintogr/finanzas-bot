@@ -1556,7 +1556,18 @@ async def process_message(message: dict):
                 await send_message(from_number, f"⚠️ No pude crear el recordatorio: {error[:100]}")
 
         elif tipo == "SHOPPING":
-            respuesta = await handle_shopping(text)
+            shopping_text = text
+            if not shopping_text.strip() and image_b64:
+                extr = anthropic.messages.create(
+                    model="claude-sonnet-4-20250514", max_tokens=400,
+                    system="Transcribí el contenido de la imagen. Si es una receta, describí el nombre y los ingredientes. Si es una lista de compras, listá los ítems. Responde en español, solo el texto extraído, sin comentarios.",
+                    messages=[{"role": "user", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": image_type or "image/jpeg", "data": image_b64}},
+                        {"type": "text", "text": "¿Qué dice esta imagen?"}
+                    ]}]
+                )
+                shopping_text = extr.content[0].text.strip()
+            respuesta = await handle_shopping(shopping_text)
             await send_message(from_number, respuesta)
 
         elif tipo == "CONFIGURAR":
