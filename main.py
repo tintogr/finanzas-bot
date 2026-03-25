@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import time
 import httpx
 from datetime import date, datetime, timedelta, timezone
 from calendar import monthrange
@@ -10,6 +11,20 @@ from anthropic import Anthropic
 app = FastAPI()
 
 anthropic = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+def claude_create(**kwargs):
+    """Wrapper con reintentos automáticos para errores 529 (API sobrecargada)."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            return claude_create(**kwargs)
+        except Exception as e:
+            last_err = e
+            if "529" in str(e) or "overloaded" in str(e).lower():
+                time.sleep(2 ** attempt)   # 1s → 2s → 4s
+                continue
+            raise
+    raise last_err
 NOTION_TOKEN   = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID   = os.environ["NOTION_DATABASE_ID"]
 PLANTS_DB_ID   = os.environ.get("NOTION_PLANTS_DB_ID", "39d22615-0106-43f8-9f01-2632734c38da")
@@ -45,6 +60,10 @@ last_event_touched: dict[str, dict] = {} # phone → {event_id, summary}
 
 # ── Estado pendiente (follow-ups) ────────────────────────────────────────────
 pending_state: dict[str, dict] = {}
+
+# ── Deduplicación de mensajes (evita doble procesamiento por webhook duplicado) ─
+processed_message_ids: set[str] = set()
+MAX_PROCESSED_IDS = 500
 
 # ── WhatsApp helpers ───────────────────────────────────────────────────────────
 async def send_message(to: str, text: str):
@@ -171,6 +190,11 @@ async def get_weather() -> dict | None:
                 "desc":           desc,
                 "emoji":          emoji,
                 "wind_desc":      wind_description(viento),
+                "hoy_max":        round(d["temperature_2m_max"][0]),
+                "hoy_min":        round(d["temperature_2m_min"][0]),
+                "hoy_lluvia":     d["precipitation_sum"][0],
+                "hoy_desc":       desc,
+                "hoy_emoji":      emoji,
                 "manana_max":     round(d["temperature_2m_max"][1]),
                 "manana_min":     round(d["temperature_2m_min"][1]),
                 "manana_lluvia":  d["precipitation_sum"][1],
@@ -300,7 +324,7 @@ async def parse_with_claude(text="", image_b64=None, image_type=None, exchange_r
     if image_b64:
         content.append({"type": "image", "source": {"type": "base64", "media_type": image_type, "data": image_b64}})
     content.append({"type": "text", "text": build_user_prompt(text, exchange_rate)})
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=1000,
         system=SYSTEM_PROMPT, messages=[{"role": "user", "content": content}]
     )
@@ -380,7 +404,7 @@ async def check_and_apply_category(name: str, predicted_cats: list[str]) -> tupl
 
 async def corregir_gasto(text: str, phone: str = None) -> tuple[bool, str]:
     now = now_argentina()
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=200,
         system="Extraé qué gasto corregir y qué cambiar. Si el mensaje no menciona un nombre concreto, usá null en search_term. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f"""Hoy: {now.strftime("%Y-%m-%d")}
@@ -460,7 +484,7 @@ Respondé:
         return True, f"✏️ *{old_name}* corregido\n" + "\n".join(changes) + "\n\n✅ Actualizado en Notion"
 
 async def eliminar_gasto(text: str) -> tuple[bool, str]:
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=100,
         system="Extraé el nombre de la entrada de Notion a eliminar. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f'Mensaje: {text}\nRespondé: {{"search_term": "nombre de la entrada a eliminar"}}'}]
@@ -498,7 +522,7 @@ async def eliminar_gasto(text: str) -> tuple[bool, str]:
             return True, f"🗑️ *{old_name}* eliminado de Notion"
 
 async def eliminar_shopping(text: str) -> tuple[bool, str]:
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=100,
         system="Extraé el nombre del ítem de la lista de compras a eliminar. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f"Mensaje: {text}\nRespondé: {{\"search_term\": \"nombre del item\"}}"}]
@@ -556,7 +580,7 @@ Valores para "ubicacion": Interior, Exterior, Balcón, Terraza
 Valores para "estado": Excelente, Bien, Regular, Necesita atención"""
 
 async def parse_planta(text: str, exchange_rate: float) -> dict:
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=600,
         system=PLANTA_SYSTEM,
         messages=[{"role": "user", "content": f"""Hoy: {now_argentina().strftime("%Y-%m-%d")}. Dolar: ${exchange_rate:,.0f}
@@ -640,7 +664,7 @@ Mensaje: {text or "(ver imagen adjunta)"}
 Extraé la info del evento de la imagen si la hay, o del texto.
 Respondé:
 {{"summary":"titulo","date":"YYYY-MM-DD","time":"HH:MM o null","duration_minutes":60,"location":"lugar o null","description":"desc o null","emoji":"emoji"}}"""})
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=300,
         system="Extraé info de un evento. Responde SOLO JSON válido sin markdown. Usa zona horaria Argentina (UTC-3).",
         messages=[{"role": "user", "content": user_content}]
@@ -746,7 +770,7 @@ async def search_and_edit_evento(text: str, phone: str = None) -> tuple[bool, st
     if not access_token:
         return False, "Calendar no configurado"
     now = now_argentina()
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=300,
         system="Extraé qué evento editar y qué cambiar. Si el mensaje no menciona un nombre concreto de evento (ej: 'el que creamos', 'ese evento', 'el último'), usá null en search_term. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f"""Hoy: {now.strftime("%Y-%m-%d")}
@@ -859,7 +883,7 @@ async def delete_evento(text: str) -> tuple[bool, str]:
         return False, "Calendar no configurado"
     now = now_argentina()
     tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=200,
         system="Extraé info sobre qué evento(s) eliminar. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f"""Hoy: {now.strftime("%Y-%m-%d")}, mañana: {tomorrow}
@@ -984,7 +1008,7 @@ async def classify(text: str, has_image: bool, image_b64: str = None, image_type
         content.append({"type": "image", "source": {"type": "base64", "media_type": image_type or "image/jpeg", "data": image_b64}})
     prompt_text = text if text.strip() else "(ver imagen adjunta)"
     content.append({"type": "text", "text": prompt_text})
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=10,
         # FIX #4 y #15: CONFIGURAR y SHOPPING corregidos
         system="""Responde SOLO una palabra: GASTO, CORREGIR_GASTO, PLANTA, EVENTO, EDITAR_EVENTO, ELIMINAR_EVENTO, RECORDATORIO, SHOPPING, REUNION, CONFIGURAR o CHAT.
@@ -1137,7 +1161,7 @@ async def handle_chat(phone: str, text: str) -> str:
     if any(k in text_lower for k in ["de dónde","de donde","fuente","qué app","que app","cómo sabés","como sabes","qué modelo","que modelo"]):
         source_note = "\n\nSi te preguntan: los datos vienen de Open-Meteo, usando modelos meteorológicos ECMWF y GFS."
 
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=800,
         system=f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural.
 Usás español rioplatense. Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
@@ -1151,7 +1175,7 @@ IMPORTANTE: Si no tenés datos concretos para responder, decilo directamente. No
 # ── MÓDULO CONFIGURACIÓN ──────────────────────────────────────────────────────
 async def handle_configurar(text: str) -> str:
     # FIX #5: soporte de horas y minutos
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=150,
         system="Extraé qué configuración cambiar. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f"""Mensaje: {text}
@@ -1208,7 +1232,7 @@ async def handle_reunion(text: str, image_b64: str = None, image_type: str = Non
     )
     content_parts.append({"type": "text", "text": prompt_reunion})
 
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=600,
         system="Extraé info de notas de reunión. Responde SOLO JSON válido sin markdown.",
         messages=[{"role": "user", "content": content_parts}]
@@ -1449,7 +1473,7 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
         if text.strip() == "save_recipe_yes":
             await send_message(phone, "⏳ Guardando receta...")
             try:
-                ext_response = anthropic.messages.create(
+                ext_response = claude_create(
                     model="claude-sonnet-4-20250514", max_tokens=400,
                     system="Respondé SOLO JSON válido sin markdown.",
                     messages=[{"role": "user", "content": f"""Del siguiente texto de receta, extraé el nombre y TODOS los ingredientes.
@@ -1585,14 +1609,28 @@ FUEL_KEYWORDS = {"nafta", "combustible", "gnc", "gasoil", "premium", "super naft
 
 # FIX #16: prefijos de mensajes propios del bot (para filtrar reenvíos)
 BOT_PREFIXES = (
-    "⏳ Procesando", "🍽️ Receta", "✅ Recordatorio", "🔔 *Recorda",
-    "☀️ *Buenos días", "🛒 *Tu lista", "📊 *Finanzas", "⏰ Te recuerdo",
-    "🍽️ *", "✅ *", "🗑️ *", "✏️ *", "🤝 *",
+    "⏳ Procesando", "🍽️ Receta", "✅ Recordatorio", "🔔 Recorda",
+    "☀️ Buenos días", "🛒 Tu lista", "📊 Finanzas", "⏰ Te recuerdo",
+    "🍽️", "✅ Guardado", "🗑️", "✏️", "🤝",
 )
+
+def is_bot_message(text: str) -> bool:
+    """Detecta reenvíos de mensajes del bot, ignorando asterisks/espacios iniciales."""
+    clean = text.lstrip(" *_~")
+    return clean.startswith(BOT_PREFIXES)
 
 async def process_message(message: dict):
     from_number = "54298154894334"
     try:
+        # Fix B: deduplicar por message ID (evita doble procesamiento)
+        msg_id = message.get("id", "")
+        if msg_id and msg_id in processed_message_ids:
+            return
+        if msg_id:
+            processed_message_ids.add(msg_id)
+            if len(processed_message_ids) > MAX_PROCESSED_IDS:
+                processed_message_ids.clear()
+
         msg_type = message["type"]
         text = ""
         image_b64 = image_type = None
@@ -1627,7 +1665,7 @@ async def process_message(message: dict):
             return
 
         # FIX #16: ignorar mensajes que son reenvíos de respuestas del bot
-        if msg_type == "text" and text.startswith(BOT_PREFIXES):
+        if msg_type == "text" and is_bot_message(text):
             return
 
         if text.strip().lower() in ["/start", "hola", "help", "ayuda"]:
@@ -1781,7 +1819,7 @@ async def process_message(message: dict):
             if not shopping_text.strip() and image_b64:
                 # FIX #12: transcribir imagen con instrucción clara de separar nombre de ingredientes
                 try:
-                    extr = anthropic.messages.create(
+                    extr = claude_create(
                         model="claude-sonnet-4-20250514", max_tokens=800,
                         system="Transcribí EXACTAMENTE lo que está escrito en la imagen. Si es una receta: primero copiá el nombre de la receta, luego listá SOLO los ingredientes que están explícitamente escritos como ingredientes — NO incluyas el nombre de la receta como ingrediente. Si es una lista de compras: listá solo los ítems visibles. Responde en español, solo el texto extraído, sin comentarios adicionales.",
                         messages=[{"role": "user", "content": [
@@ -1837,7 +1875,7 @@ async def health():
 # ── MÓDULO RECORDATORIOS ───────────────────────────────────────────────────────
 async def parse_recordatorio(text: str) -> dict:
     now = now_argentina()
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=300,
         system="Extraé info del recordatorio. Responde SOLO JSON válido sin markdown.",
         messages=[{"role": "user", "content": f"""Ahora son las {now.strftime("%Y-%m-%d %H:%M")} en Argentina.
@@ -1982,7 +2020,16 @@ async def send_daily_summary(http, access_token: str, now: datetime):
     w = await get_weather()
     lines = ["☀️ *Buenos días, Martín!*", ""]
     if w:
-        lines.extend(format_weather_lines(w))
+        # Clima actual
+        lines.append(f"🌡️ {w['temp']}°C (sensación {w['sensacion']}°C) — {w['emoji']} {w['desc']}")
+        if w["lluvia"] > 0:
+            lines.append(f"🌧️ Lluvia ahora: {w['lluvia']}mm")
+        lines.append(f"💨 {w['wind_desc']} ({w['viento']} km/h)")
+        # Pronóstico del día
+        pronostico = f"📊 Hoy: máx {w['hoy_max']}°C, mín {w['hoy_min']}°C"
+        if w["hoy_lluvia"] > 0:
+            pronostico += f", 🌧️ {w['hoy_lluvia']}mm esperados"
+        lines.append(pronostico)
         lines.append("")
     if not events:
         lines.append("📅 Hoy no tenés eventos agendados.")
@@ -2020,7 +2067,7 @@ async def get_ingredients_and_enrich(recipe_name: str, recipe_text: str = None) 
     else:
         context = f'Receta: "{recipe_name}"\n\nInferí los ingredientes típicos/estándar completos de esta receta. Listá todos los que normalmente se necesitan para prepararla.'
 
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=800,
         system="Respondé SOLO JSON válido sin markdown ni texto extra.",
         messages=[{"role": "user", "content": f"""{context}
@@ -2061,7 +2108,7 @@ Criterios frequency:
 async def enrich_items_with_claude(items: list[str]) -> list[dict]:
     if not items:
         return []
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=600,
         system="Enriquecé una lista de ítems. Responde SOLO JSON válido sin markdown.",
         messages=[{"role": "user", "content": f"""Items: {json.dumps(items, ensure_ascii=False)}
@@ -2105,7 +2152,7 @@ async def save_recipe_to_notion(recipe_name: str, source: str = "Matrics", ingre
     try:
         # Claude infiere propiedades de la receta
         try:
-            props_response = anthropic.messages.create(
+            props_response = claude_create(
                 model="claude-sonnet-4-20250514", max_tokens=200,
                 system="Respondé SOLO JSON válido sin markdown.",
                 messages=[{"role": "user", "content": f'''Receta: "{recipe_name}"
@@ -2178,7 +2225,7 @@ Respondé SOLO este JSON con las propiedades que puedas inferir:
 
 # FIX #12/#14: parse_shopping_intent extrae ingredientes explícitos del texto
 async def parse_shopping_intent(text: str) -> dict:
-    response = anthropic.messages.create(
+    response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=400,
         system="Analizá mensajes sobre lista de compras. Responde SOLO JSON válido sin markdown.",
         messages=[{"role": "user", "content": f"""Mensaje: {text}
