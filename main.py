@@ -1493,7 +1493,7 @@ Respondé:
                 ingredient_list = []
 
             enriched = await enrich_items_with_claude(ingredient_list) if ingredient_list else []
-            await save_recipe_to_notion(recipe_name, source="Matrics", ingredient_names=enriched)
+            await save_recipe_to_notion(recipe_name, source="Matrics", ingredient_names=enriched, recipe_text=recipe_text)
 
             if enriched:
                 ing_list = "\n".join(f"• {i.get('emoji','🛒')} {i.get('name','')}" for i in enriched)
@@ -2156,7 +2156,7 @@ async def search_recipe_in_notion(recipe_name: str) -> list[str] | None:
     except Exception:
         return None
 
-async def save_recipe_to_notion(recipe_name: str, source: str = "Matrics", ingredient_names: list[str] = None):
+async def save_recipe_to_notion(recipe_name: str, source: str = "Matrics", ingredient_names: list[str] = None, recipe_text: str = None):
     try:
         # Claude infiere propiedades de la receta
         try:
@@ -2207,6 +2207,8 @@ Respondé SOLO este JSON con las propiedades que puedas inferir:
             "Name": {"title": [{"text": {"content": recipe_name.capitalize()}}]},
             "Source": {"select": {"name": source}},
         }
+        if recipe_text:
+            props["Notes"] = {"rich_text": [{"text": {"content": recipe_text[:2000]}}]}
         if meta.get("difficult"):
             props["Difficult "] = {"select": {"name": meta["difficult"]}}
         if meta.get("type"):
@@ -2233,12 +2235,10 @@ Respondé SOLO este JSON con las propiedades que puedas inferir:
 
 # FIX #12/#14: parse_shopping_intent extrae ingredientes explícitos del texto
 async def parse_shopping_intent(text: str) -> dict:
-    # Sanitizar el texto para evitar que rompa el JSON del prompt
-    safe_text = text.replace('"', "'").replace('\n', ' ').replace('\r', '')[:2000]
     response = claude_create(
-        model="claude-sonnet-4-20250514", max_tokens=800,
+        model="claude-sonnet-4-20250514", max_tokens=400,
         system="Analizá mensajes sobre lista de compras. Responde SOLO JSON válido sin markdown.",
-        messages=[{"role": "user", "content": f"""Mensaje: {safe_text}
+        messages=[{"role": "user", "content": f"""Mensaje: {text}
 
 Respondé:
 {{"action": "out_of_stock"|"in_stock"|"add"|"list",
@@ -2357,7 +2357,7 @@ async def handle_shopping(text: str, phone: str = None) -> str:
                 enriched_direct, ok = [], False
             if ok and enriched_direct:
                 # Guardar receta en Notion
-                await save_recipe_to_notion(recipe_name, source="Matrics", ingredient_names=enriched_direct)
+                await save_recipe_to_notion(recipe_name, source="Matrics", ingredient_names=enriched_direct, recipe_text=text)
                 ing_list = "\n".join(f"• {i.get('emoji','🛒')} {i.get('name','')}" for i in enriched_direct)
                 if phone:
                     pending_state[phone] = {
