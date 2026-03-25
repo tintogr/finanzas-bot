@@ -60,6 +60,31 @@ async def send_message(to: str, text: str):
             "text": {"body": text}
         })
 
+async def send_interactive_buttons(to: str, body: str, buttons: list[dict], header: str = None):
+    """buttons: [{"id": "snooze_5", "title": "5 min"}, ...]  — máx 3"""
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
+                    for b in buttons[:3]
+                ]
+            }
+        }
+    }
+    if header:
+        payload["interactive"]["header"] = {"type": "text", "text": header}
+    async with httpx.AsyncClient() as http:
+        await http.post(WA_API, headers={
+            "Authorization": f"Bearer {WA_TOKEN}",
+            "Content-Type": "application/json"
+        }, json=payload)
+
 async def get_media_base64(media_id: str) -> tuple[str, str]:
     async with httpx.AsyncClient() as http:
         r = await http.get(
@@ -242,7 +267,9 @@ Para el campo "emoji": elegir el emoji MAS especifico segun el contexto real del
 - Salida nocturna -> \U0001f389
 - Streaming/ocio -> \U0001f3ae
 - Vianda/tupper -> \U0001f961
-- Si no es claro -> \U0001f4b8"""
+- Si no es claro -> \U0001f4b8
+
+IMPORTANTE: Si in_out es "→INGRESO←", la categoria SOLO puede ser "Sueldo" o "Venta". No usar categorías de gastos para ingresos."""
 
 def build_user_prompt(text: str, exchange_rate: float) -> str:
     now = now_argentina()
@@ -929,11 +956,20 @@ EDITAR_EVENTO: modificar un evento existente en el calendario.
 ELIMINAR_EVENTO: eliminar o borrar un evento del calendario.
 RECORDATORIO: "recordame en X tiempo", "avisame en X", "haceme acordar".
 EVENTO: crear un evento nuevo — turno, reunión, cumple, cita, viaje.
-SHOPPING: gestionar lista de compras — "me quedé sin X", "compré X", "agregá X", "qué me falta".
+SHOPPING: gestionar lista de compras — "me quedé sin X", "compré X", "agregá X", "qué me falta". También si se manda una imagen de receta o lista de ingredientes sin texto → SHOPPING.
+REUNION: cuando se comparten notas, resumen o fotos de una reunión/llamada. Ej: "reunión con Juan", "notas de la call de hoy", foto de pizarrón/apuntes de reunión.
 CONFIGURAR: cambiar una configuración de Matrics. Ej: "el mensaje de la mañana mandámelo a las 7", "cambiá el horario del resumen a las 8:30".
 CHAT: cualquier pregunta, consulta o conversación. Si tiene "?" o pide información → CHAT.
 
-REGLA: si el mensaje PREGUNTA algo → siempre CHAT, nunca GASTO.""",
+REGLA: si el mensaje PREGUNTA algo → siempre CHAT, nunca GASTO.
+
+IMÁGENES SIN TEXTO — clasificar por contenido visual:
+- Factura, ticket, recibo, comprobante de pago → GASTO
+- Invitación, flyer, screenshot de turno/evento, fecha destacada → EVENTO
+- Foto de receta, lista de ingredientes escrita → SHOPPING
+- Lista de compras manuscrita o fotografiada → SHOPPING
+- Pizarrón, apuntes, notas de reunión, fotos de notas → REUNION
+- Documento de texto, nota genérica, captura de pantalla de mensaje → CHAT""",
         messages=[{"role": "user", "content": content}]
     )
     r = response.content[0].text.strip().upper()
@@ -1285,6 +1321,58 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
             await send_message(phone, "❌ Error actualizando el evento")
         return True
 
+    # ── Snooze de recordatorio ────────────────────────────────────────────────
+    if state_type == "snooze":
+        snooze_map = {"snooze_5": 5, "snooze_15": 15, "snooze_30": 30, "snooze_60": 60}
+        minutes = snooze_map.get(text.strip())
+        del pending_state[phone]
+        if minutes:
+            fire_at = now_argentina() + timedelta(minutes=minutes)
+            summary = state.get("summary", "Recordatorio")
+            event_data = {
+                "summary": summary,
+                "fire_at": fire_at.strftime("%Y-%m-%dT%H:%M")
+            }
+            success, _ = await create_recordatorio(event_data)
+            if success:
+                await send_message(phone, f"⏰ Te recuerdo en {minutes} minutos")
+            else:
+                await send_message(phone, "❌ No pude crear el snooze")
+        return True
+
+    # ── Recordatorio anticipado para evento ───────────────────────────────────
+    if state_type == "event_reminder":
+        reminder_map = {
+            "rem_15": 15, "rem_30": 30, "rem_60": 60,
+            "rem_1d": 1440, "rem_no": None
+        }
+        minutes = reminder_map.get(text.strip(), "unknown")
+        del pending_state[phone]
+        if minutes == "unknown":
+            return False
+        if minutes is None:
+            await send_message(phone, "👍 Sin recordatorio adicional")
+            return True
+        event_id = state.get("event_id")
+        event_summary = state.get("summary", "Evento")
+        event_datetime = state.get("event_datetime")
+        if event_datetime:
+            try:
+                fire_dt = datetime.strptime(event_datetime, "%Y-%m-%dT%H:%M") - timedelta(minutes=minutes)
+                if fire_dt > now_argentina().replace(tzinfo=None):
+                    event_data = {
+                        "summary": f"🔔 {event_summary}",
+                        "fire_at": fire_dt.strftime("%Y-%m-%dT%H:%M")
+                    }
+                    success, _ = await create_recordatorio(event_data)
+                    label = "1 día" if minutes == 1440 else f"{minutes} minutos"
+                    await send_message(phone, f"⏰ Te aviso {label} antes de _{event_summary}_" if success else "❌ No pude crear el recordatorio")
+                else:
+                    await send_message(phone, "⚠️ Ese momento ya pasó, no puedo crear el recordatorio")
+            except Exception:
+                await send_message(phone, "❌ Error creando el recordatorio")
+        return True
+
     return False
 
 # ── Webhook ────────────────────────────────────────────────────────────────────
@@ -1319,6 +1407,12 @@ async def process_message(message: dict):
 
         if msg_type == "text":
             text = message["text"]["body"]
+        elif msg_type == "interactive":
+            # Respuesta a botones interactivos
+            btn = message.get("interactive", {}).get("button_reply", {})
+            text = btn.get("id", "")  # usamos el ID como texto para pending_state
+            if not text:
+                return
         elif msg_type == "image":
             media_id = message["image"]["id"]
             text = message["image"].get("caption", "")
@@ -1424,7 +1518,26 @@ async def process_message(message: dict):
                     "event_id": event_id,
                     "summary": parsed.get("summary", "Evento")
                 }
-            await send_message(from_number, format_evento(parsed, guardado))
+                await send_message(from_number, format_evento(parsed, guardado))
+                if parsed.get("time"):
+                    event_dt = f"{parsed['date']}T{parsed['time']}"
+                    pending_state[from_number] = {
+                        "type": "event_reminder",
+                        "event_id": event_id,
+                        "summary": parsed.get("summary", "Evento"),
+                        "event_datetime": event_dt
+                    }
+                    await send_interactive_buttons(
+                        from_number,
+                        "¿Querés que te avise antes?",
+                        [
+                            {"id": "rem_15", "title": "15 min antes"},
+                            {"id": "rem_60", "title": "1 hora antes"},
+                            {"id": "rem_no", "title": "No gracias"},
+                        ]
+                    )
+            else:
+                await send_message(from_number, format_evento(parsed, guardado))
 
         elif tipo == "EDITAR_EVENTO":
             success, msg = await search_and_edit_evento(text, phone=from_number)
@@ -1552,8 +1665,19 @@ async def cron_job():
             except Exception:
                 continue
             if "[TEMP]" in desc and 0 <= diff_minutes <= 1:
-                await send_message(MY_NUMBER, f"🔔 *Recordatorio*\n{summary.replace('🔔 ', '')}")
+                clean_summary = summary.replace('🔔 ', '')
+                await send_message(MY_NUMBER, f"🔔 *Recordatorio*\n{clean_summary}")
                 await http.delete(f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}", headers=headers)
+                pending_state[MY_NUMBER] = {"type": "snooze", "summary": f"🔔 {clean_summary}"}
+                await send_interactive_buttons(
+                    MY_NUMBER,
+                    "¿Snooze?",
+                    [
+                        {"id": "snooze_5",  "title": "5 min"},
+                        {"id": "snooze_15", "title": "15 min"},
+                        {"id": "snooze_30", "title": "30 min"},
+                    ]
+                )
                 fired.append(f"TEMP: {summary}")
             elif "[REM:60]" in desc and 59 <= diff_minutes <= 61:
                 loc_str = f"\n📍 {event.get('location')}" if event.get("location") else ""
