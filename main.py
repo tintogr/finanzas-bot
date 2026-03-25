@@ -1833,13 +1833,34 @@ async def search_recipe_in_notion(recipe_name: str) -> list[str] | None:
 
 async def save_recipe_to_notion(recipe_name: str, source: str = "Matrics", ingredient_names: list[str] = None):
     try:
-        relation_ids = []
+                relation_ids = []
         if ingredient_names:
-            for ing in ingredient_names:
-                results = await search_shopping_item(ing)
+            for ing_item in ingredient_names if isinstance(ingredient_names[0], dict) else [{"name": n} for n in ingredient_names]:
+                results = await search_shopping_item(ing_item.get("name", ""))
                 if results:
                     relation_ids.append({"id": results[0]["id"]})
-
+                else:
+                    # No existe en Shopping → crearlo con Stock: true (lo tiene)
+                    new_item = dict(ing_item)
+                    new_item["Stock"] = True
+                    async with httpx.AsyncClient() as http:
+                        name = new_item.get("name", "").strip()
+                        emoji = new_item.get("emoji", "🛒")
+                        props = {
+                            "Name":  {"title": [{"text": {"content": name}}]},
+                            "Stock": {"checkbox": True},
+                        }
+                        if new_item.get("category") in SHOPPING_CATEGORIES:
+                            props["Category"] = {"select": {"name": new_item["category"]}}
+                        if new_item.get("store"):
+                            props["Store"] = {"multi_select": [{"name": new_item["store"]}]}
+                        r = await http.post(
+                            "https://api.notion.com/v1/pages",
+                            headers=notion_headers(),
+                            json={"parent": {"database_id": SHOPPING_DB_ID}, "icon": {"type": "emoji", "emoji": emoji}, "properties": props}
+                        )
+                        if r.status_code == 200:
+                            relation_ids.append({"id": r.json()["id"]})
         props = {
             "Name": {"title": [{"text": {"content": recipe_name.capitalize()}}]},
             "Source": {"select": {"name": source}},
@@ -1973,7 +1994,7 @@ async def handle_shopping(text: str, phone: str = None) -> str:
                 enriched_direct, ok = [], False
             if ok and enriched_direct:
                 # Guardar receta en Notion (sin ingredientes relacionados aún)
-                await save_recipe_to_notion(recipe_name, source="Matrics", ingredient_names=None)
+                await save_recipe_to_notion(recipe_name, source="Matrics", ingredient_names=enriched_direct)
                 ing_list = "\n".join(f"• {i.get('emoji','🛒')} {i.get('name','')}" for i in enriched_direct)
                 if phone:
                     pending_state[phone] = {
