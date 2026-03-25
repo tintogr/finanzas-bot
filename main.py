@@ -2167,7 +2167,8 @@ async def get_ingredients_and_enrich(recipe_name: str, recipe_text: str = None) 
 
 Respondé SOLO este array JSON:
 [{{
-  "name": "nombre capitalizado",
+  "name": "nombre del ingrediente capitalizado SIN cantidad (ej: \"Harina Blanca\")",
+  "display": "cantidad + nombre como aparece en la receta (ej: \"2 tazas de harina blanca\"). Si no hay cantidad indicada, igual que name.",
   "emoji": "emoji específico del producto",
   "category": una de {SHOPPING_CATEGORIES},
   "store": tienda más lógica (puede ser una de {SHOPPING_STORES} u otra si aplica, ej: "Ferreteria"),
@@ -2535,15 +2536,27 @@ async def handle_shopping(text: str, phone: str = None) -> str:
                         "recipe_text": text,
                         "ingredients": enriched_direct,
                     }
-                    # Mensaje 1: ingredientes
+                    # Mensaje 1: ingredientes con cantidades (solo para WA, Notion usa solo "name")
+                    ing_list_display = "\n".join(
+                        f"• {i.get('emoji','🛒')} {i.get('display') or i.get('name','')}"
+                        for i in enriched_direct
+                    )
                     await send_message(
                         phone,
-                        f"🍽️ *{recipe_name.capitalize()}*\n\n*Ingredientes:*\n{ing_list}"
+                        f"🍽️ *{recipe_name.capitalize()}*\n\n*Ingredientes:*\n{ing_list_display}"
                     )
-                    # Mensaje 2: procedimiento (si existe) — sin repetir ingredientes
+                    # Mensaje 2: solo preparación, extraída limpiamente sin repetir ingredientes
                     if text and len(text) > 100:
-                        proc_preview = text[:800] + ("..." if len(text) > 800 else "")
-                        await send_message(phone, f"📝 *Procedimiento:*\n{proc_preview}")
+                        try:
+                            proc_resp = claude_create(
+                                model="claude-sonnet-4-20250514", max_tokens=600,
+                                system="Extraé SOLO la sección de preparación/procedimiento de la receta. Sin título, sin lista de ingredientes, sin encabezados irrelevantes como números de receta o categoría. Solo los pasos de preparación en texto limpio y narrativo.",
+                                messages=[{"role": "user", "content": text[:2000]}]
+                            )
+                            proc_text = proc_resp.content[0].text.strip()
+                        except Exception:
+                            proc_text = text[:600]
+                        await send_message(phone, f"📝 *Preparación:*\n{proc_text}")
                     # Botones en mensaje corto separado
                     await send_interactive_buttons(
                         phone,
