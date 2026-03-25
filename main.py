@@ -2325,10 +2325,12 @@ Respondé SOLO este JSON con las propiedades que puedas inferir:
 
 # FIX #12/#14: parse_shopping_intent extrae ingredientes explícitos del texto
 async def parse_shopping_intent(text: str) -> dict:
+    # Sanitizar para evitar que comillas/saltos rompan el JSON del prompt
+    safe_text = text.replace('"', "'").replace('\r', ' ').replace('\n', ' ')[:2000]
     response = claude_create(
-        model="claude-sonnet-4-20250514", max_tokens=400,
+        model="claude-sonnet-4-20250514", max_tokens=800,
         system="Analizá mensajes sobre lista de compras. Responde SOLO JSON válido sin markdown.",
-        messages=[{"role": "user", "content": f"""Mensaje: {text}
+        messages=[{"role": "user", "content": f"""Mensaje: {safe_text}
 
 Respondé:
 {{"action": "out_of_stock"|"in_stock"|"add"|"list",
