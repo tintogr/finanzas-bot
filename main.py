@@ -1531,9 +1531,13 @@ Aplicá la corrección y devolvé la lista corregida como array JSON simple:
             "recipe_text": recipe_text,
             "ingredients": enriched_corrected,
         }
+        await send_message(
+            phone,
+            f"🍽️ *{recipe_name.capitalize()}* — versión corregida:\n\n*Ingredientes:*\n{ing_list}"
+        )
         await send_interactive_buttons(
             phone,
-            f"🍽️ *{recipe_name.capitalize()}* — versión corregida:\n\nIngredientes:\n{ing_list}\n\n¿Está todo bien o seguís corrigiendo?",
+            "¿Está todo bien o seguís corrigiendo?",
             [
                 {"id": "recipe_ok",      "title": "Está bien"},
                 {"id": "recipe_correct", "title": "Seguir corrigiendo"},
@@ -1559,9 +1563,13 @@ Aplicá la corrección y devolvé la lista corregida como array JSON simple:
                 "recipe_name": recipe_name,
                 "ingredients": ingredients,
             }
+            await send_message(
+                phone,
+                f"🍽️ *{recipe_name.capitalize()}* guardada en Recipes ✅\n\n*Ingredientes:*\n{ing_list}"
+            )
             await send_interactive_buttons(
                 phone,
-                f"🍽️ *{recipe_name.capitalize()}* guardada en Recipes ✅\n\nIngredientes:\n{ing_list}\n\n¿Los agregás a la lista de compras?",
+                "¿Los agregás a la lista de compras?",
                 [
                     {"id": "recipe_add_yes", "title": "Sí, agregar"},
                     {"id": "recipe_add_no",  "title": "No por ahora"},
@@ -2475,21 +2483,25 @@ async def handle_shopping(text: str, phone: str = None) -> str:
             if ok and enriched_direct:
                 ing_list = "\n".join(f"• {i.get('emoji','🛒')} {i.get('name','')}" for i in enriched_direct)
                 if phone:
-                    # Mostrar procedimiento si está disponible
-                    procedimiento = ""
-                    if text and len(text) > 200:
-                        # Truncar a 800 chars para no saturar WhatsApp
-                        proc_preview = text[:800] + ("..." if len(text) > 800 else "")
-                        procedimiento = f"\n\n📝 *Procedimiento:*\n{proc_preview}"
                     pending_state[phone] = {
                         "type": "recipe_review",
                         "recipe_name": recipe_name,
                         "recipe_text": text,
                         "ingredients": enriched_direct,
                     }
+                    # Mandar ingredientes + procedimiento como texto libre (puede ser largo)
+                    procedimiento = ""
+                    if text and len(text) > 100:
+                        proc_preview = text[:600] + ("..." if len(text) > 600 else "")
+                        procedimiento = f"\n\n📝 *Procedimiento:*\n{proc_preview}"
+                    await send_message(
+                        phone,
+                        f"🍽️ *{recipe_name.capitalize()}*\n\n*Ingredientes:*\n{ing_list}{procedimiento}"
+                    )
+                    # Botones en mensaje separado — body corto para no superar límite de 1024 chars
                     await send_interactive_buttons(
                         phone,
-                        f"🍽️ *{recipe_name.capitalize()}*\n\n*Ingredientes:*\n{ing_list}{procedimiento}\n\n¿Está todo bien o querés corregir algo?",
+                        "¿Está todo bien o querés corregir algo?",
                         [
                             {"id": "recipe_ok",      "title": "Está bien"},
                             {"id": "recipe_correct", "title": "Quiero corregir"},
