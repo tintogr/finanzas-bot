@@ -1880,14 +1880,13 @@ async def process_message(message: dict):
         elif tipo == "SHOPPING":
             shopping_text = text
             if not shopping_text.strip() and image_b64:
-                # FIX #12: transcribir imagen con instrucción clara de separar nombre de ingredientes
                 try:
                     extr = claude_create(
-                        model="claude-sonnet-4-20250514", max_tokens=800,
-                        system="Transcribí EXACTAMENTE lo que está escrito en la imagen. Si es una receta: primero copiá el nombre de la receta, luego listá SOLO los ingredientes que están explícitamente escritos como ingredientes — NO incluyas el nombre de la receta como ingrediente. Si es una lista de compras: listá solo los ítems visibles. Responde en español, solo el texto extraído, sin comentarios adicionales.",
+                        model="claude-sonnet-4-20250514", max_tokens=1200,
+                        system="Transcribí TODO el contenido de la imagen exactamente como está escrito. Si es una receta: copiá el título, luego todas las secciones (ingredientes con cantidades, notas, preparación) tal como aparecen. Si es una lista de compras: copiá todos los ítems. No omitas nada, no agregues nada.",
                         messages=[{"role": "user", "content": [
                             {"type": "image", "source": {"type": "base64", "media_type": image_type or "image/jpeg", "data": image_b64}},
-                            {"type": "text", "text": "¿Qué dice esta imagen? Transcribí el nombre de la receta por separado y luego los ingredientes como lista."}
+                            {"type": "text", "text": "Transcribí todo el contenido de esta imagen fielmente."}
                         ]}]
                     )
                     shopping_text = extr.content[0].text.strip()
