@@ -14,7 +14,7 @@ NOTION_TOKEN   = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID   = os.environ["NOTION_DATABASE_ID"]
 PLANTS_DB_ID   = os.environ.get("NOTION_PLANTS_DB_ID", "39d22615-0106-43f8-9f01-2632734c38da")
 SHOPPING_DB_ID = os.environ.get("NOTION_SHOPPING_DB_ID", "cb85fdf75d684f61bafea20b5eeb653f")
-RECIPES_DB_ID   = os.environ.get("NOTION_RECIPES_DB_ID", "5eda6aa7-3c8c-4fd6-8433-c6714bcfdd20")
+RECIPES_DB_ID   = os.environ.get("NOTION_RECIPES_DB_ID", "8fa008a7-0720-475a-9868-7c3ba077bc50")
 MEETINGS_DB_ID  = os.environ.get("NOTION_MEETINGS_DB_ID", "ed5b5023-c17c-46e5-be7d-56655f0257ee")
 WA_TOKEN       = os.environ["WHATSAPP_TOKEN"]
 WA_PHONE_ID    = os.environ["WHATSAPP_PHONE_ID"]
@@ -34,6 +34,7 @@ category_overrides: dict[str, list[str]] = {}
 # ── Preferencias del usuario ──────────────────────────────────────────────────
 user_prefs: dict = {
     "daily_summary_hour": None,
+    "daily_summary_minute": None,   # FIX #5: soporte de minutos
 }
 
 # ── Última entrada tocada (gastos) ────────────────────────────────────────────
@@ -664,6 +665,17 @@ async def get_gcal_access_token() -> str | None:
             return r.json().get("access_token")
     return None
 
+# FIX #9: helper para asignar color a eventos según tipo
+def get_event_color(summary: str, is_temp: bool = False) -> str:
+    if is_temp:
+        return "4"   # Flamingo — recordatorios
+    medical_kw = {"dr", "dra", "doctor", "médico", "medico", "turno", "cita", "hospital",
+                  "clínica", "clinica", "odontólogo", "odontologo", "psicólogo", "psicologo",
+                  "dentista", "cardiólogo", "cardiologo", "ortopedista", "kinésiologo"}
+    if any(kw in summary.lower() for kw in medical_kw):
+        return "2"   # Sage — médico
+    return "1"       # Lavender — evento general
+
 async def create_evento_gcal(data: dict) -> tuple[bool, str]:
     access_token = await get_gcal_access_token()
     if not access_token:
@@ -675,7 +687,17 @@ async def create_evento_gcal(data: dict) -> tuple[bool, str]:
     else:
         start = {"date": data["date"]}
         end = {"date": data["date"]}
-    event = {"summary": data.get("summary", "Evento"), "start": start, "end": end}
+    event = {
+        "summary": data.get("summary", "Evento"),
+        "start": start,
+        "end": end,
+        # FIX #8: marcar origen Matrics
+        "source": {"title": "Matrics", "url": "https://web-production-6874a.up.railway.app"},
+        # FIX #9: color por tipo
+        "colorId": get_event_color(data.get("summary", "")),
+        # FIX #10: metadata para búsquedas futuras
+        "extendedProperties": {"private": {"created_by": "matrics", "type": "evento"}},
+    }
     if data.get("description"):
         event["description"] = data["description"]
     if data.get("location"):
@@ -904,6 +926,41 @@ Si hay múltiples eventos mencionados, ponelos todos en search_terms."""}]
         lista = "\n".join(f"• {e}" for e in deleted)
         return True, f"🗑️ *{len(deleted)} eventos eliminados:*\n{lista}"
 
+# FIX #7: busca eventos similares en Calendar antes de crear uno nuevo desde imagen
+async def find_similar_calendar_events(data: dict) -> list:
+    access_token = await get_gcal_access_token()
+    if not access_token:
+        return []
+    summary = data.get("summary", "")
+    if not summary or len(summary) < 4:
+        return []
+    stopwords = {"con", "en", "de", "la", "el", "los", "las", "del", "al", "por", "para",
+                 "turno", "cita", "reunión", "reunion", "evento", "con", "una", "uno"}
+    keywords = [w for w in summary.lower().split() if len(w) > 3 and w not in stopwords]
+    if not keywords:
+        return []
+    now = now_argentina()
+    time_min = now.strftime("%Y-%m-%dT00:00:00-03:00")
+    time_max = (now + timedelta(days=180)).strftime("%Y-%m-%dT23:59:59-03:00")
+    found = {}
+    async with httpx.AsyncClient() as http:
+        headers = {"Authorization": f"Bearer {access_token}"}
+        for kw in keywords[:2]:
+            try:
+                r = await http.get(
+                    "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                    headers=headers,
+                    params={"q": kw, "timeMin": time_min, "timeMax": time_max,
+                            "singleEvents": "true", "orderBy": "startTime", "maxResults": "5"}
+                )
+                if r.status_code == 200:
+                    for e in r.json().get("items", []):
+                        if "[TEMP]" not in (e.get("description") or ""):
+                            found[e["id"]] = e
+            except Exception:
+                pass
+    return list(found.values())[:3]
+
 # ── HISTORIAL DE CONVERSACIÓN ──────────────────────────────────────────────────
 chat_history: dict[str, list] = {}
 MAX_HISTORY = 10
@@ -929,6 +986,7 @@ async def classify(text: str, has_image: bool, image_b64: str = None, image_type
     content.append({"type": "text", "text": prompt_text})
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=10,
+        # FIX #4 y #15: CONFIGURAR y SHOPPING corregidos
         system="""Responde SOLO una palabra: GASTO, CORREGIR_GASTO, PLANTA, EVENTO, EDITAR_EVENTO, ELIMINAR_EVENTO, RECORDATORIO, SHOPPING, REUNION, CONFIGURAR o CHAT.
 
 GASTO: registrar un pago, compra o ingreso concreto con monto.
@@ -938,11 +996,11 @@ ELIMINAR_SHOPPING: eliminar o borrar un ítem de la lista de compras. Ej: "borr�
 PLANTA: adquirir o mencionar una planta.
 EDITAR_EVENTO: modificar un evento existente en el calendario.
 ELIMINAR_EVENTO: eliminar o borrar un evento del calendario.
-RECORDATORIO: "recordame en X tiempo", "avisame en X", "haceme acordar".
+RECORDATORIO: "recordame en X tiempo", "avisame en X", "haceme acordar". NUNCA usar para cambios de horario del resumen matutino.
 EVENTO: crear un evento nuevo — turno, reunión, cumple, cita, viaje. También frases como "hoy/mañana a las X tengo un evento/turno/reunión que se llama Y" → siempre EVENTO.
-SHOPPING: gestionar lista de compras — "me quedé sin X", "compré X", "agregá X", "qué me falta". También si se manda una imagen de receta o lista de ingredientes sin texto → SHOPPING.
+SHOPPING: gestionar lista de compras o recetas — "me quedé sin X", "compré X", "agregá X", "qué me falta", "guardá esta receta", "agrégala a mis recetas", "guardala en Notion", "agregá los ingredientes". También si se manda una imagen de receta o lista de ingredientes sin texto → SHOPPING.
 REUNION: cuando se comparten notas, resumen o fotos de una reunión/llamada. Ej: "reunión con Juan", "notas de la call de hoy", foto de pizarrón/apuntes de reunión.
-CONFIGURAR: cambiar una configuración de Matrics. Ej: "el mensaje de la mañana mandámelo a las 7", "cambiá el horario del resumen a las 8:30".
+CONFIGURAR: cambiar una configuración de Matrics. Ej: "el mensaje de la mañana mandámelo a las 7", "cambiá el horario del resumen a las 8:30", "mandame el buenos días a las 10 y 38", "dime buenos días a las 7.30", "cambiá la hora del resumen". Cualquier mensaje sobre cuándo llega el resumen/buenos días matutino → siempre CONFIGURAR, nunca RECORDATORIO.
 CHAT: cualquier pregunta, consulta o conversación. Si tiene "?" o pide información → CHAT.
 
 REGLA: si el mensaje PREGUNTA algo → siempre CHAT, nunca GASTO.
@@ -1092,14 +1150,17 @@ IMPORTANTE: Si no tenés datos concretos para responder, decilo directamente. No
 
 # ── MÓDULO CONFIGURACIÓN ──────────────────────────────────────────────────────
 async def handle_configurar(text: str) -> str:
+    # FIX #5: soporte de horas y minutos
     response = anthropic.messages.create(
-        model="claude-sonnet-4-20250514", max_tokens=100,
+        model="claude-sonnet-4-20250514", max_tokens=150,
         system="Extraé qué configuración cambiar. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f"""Mensaje: {text}
 Respondé:
 {{"setting": "daily_summary_hour",
-  "value": hora en formato 24h como número entero (ej: 7, 8, 9, 18)}}
-Si no se menciona horario válido, value=null."""}]
+  "hour": hora en formato 24h como entero (ej: 7, 8, 9, 18),
+  "minute": minutos como entero (ej: 0, 30, 38) — si no se mencionan minutos usá 0}}
+Si no se menciona horario válido, hour=null y minute=null.
+Ejemplos: "a las 7.30" → hour=7, minute=30 | "a las 10 y 38" → hour=10, minute=38 | "a las 8" → hour=8, minute=0"""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -1110,20 +1171,25 @@ Si no se menciona horario válido, value=null."""}]
         return "❌ No entendí qué configuración querés cambiar"
 
     setting = data.get("setting")
-    value   = data.get("value")
+    hour    = data.get("hour")
+    minute  = data.get("minute", 0) or 0
 
-    if setting == "daily_summary_hour" and value is not None:
+    if setting == "daily_summary_hour" and hour is not None:
         try:
-            hora = int(value)
+            hora = int(hour)
+            mins = int(minute)
             if not 0 <= hora <= 23:
                 return "❌ El horario tiene que estar entre 0 y 23"
-            user_prefs["daily_summary_hour"] = hora
-            hora_fmt = f"{hora:02d}:00"
+            if not 0 <= mins <= 59:
+                mins = 0
+            user_prefs["daily_summary_hour"]   = hora
+            user_prefs["daily_summary_minute"] = mins
+            hora_fmt = f"{hora:02d}:{mins:02d}"
             return f"✅ Listo — a partir de ahora el resumen matutino te llega a las *{hora_fmt}*\n_(Esta configuración se mantiene hasta el próximo deploy)_"
         except Exception:
             return "❌ No pude interpretar el horario"
 
-    return "❓ No entendí qué querés configurar. Podés decirme por ejemplo: _\"el resumen de la mañana mandámelo a las 7\"_"
+    return "❓ No entendí qué querés configurar. Podés decirme por ejemplo: _\"el resumen de la mañana mandámelo a las 7:30\"_"
 
 # ── MÓDULO REUNIONES ──────────────────────────────────────────────────────────
 async def handle_reunion(text: str, image_b64: str = None, image_type: str = None) -> str:
@@ -1295,14 +1361,20 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
             await send_message(phone, "❌ Error actualizando el evento")
         return True
 
-    # ── Snooze de recordatorio ────────────────────────────────────────────────
+    # FIX #1/#2/#3: Posponer recordatorio (antes "snooze") ────────────────────
     if state_type == "snooze":
-        snooze_map = {"snooze_5": 5, "snooze_15": 15, "snooze_30": 30, "snooze_60": 60}
-        minutes = snooze_map.get(text.strip())
+        summary = state.get("summary", "Recordatorio")  # ya sin 🔔 prefix
         del pending_state[phone]
+
+        # Botón "No posponer"
+        if text.strip() == "snooze_no":
+            await send_message(phone, "👍 Recordatorio descartado")
+            return True
+
+        snooze_map = {"snooze_5": 5, "snooze_15": 15, "snooze_30": 30}
+        minutes = snooze_map.get(text.strip())
         if minutes:
             fire_at = now_argentina() + timedelta(minutes=minutes)
-            summary = state.get("summary", "Recordatorio")
             event_data = {
                 "summary": summary,
                 "fire_at": fire_at.strftime("%Y-%m-%dT%H:%M")
@@ -1311,7 +1383,7 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
             if success:
                 await send_message(phone, f"⏰ Te recuerdo en {minutes} minutos")
             else:
-                await send_message(phone, "❌ No pude crear el snooze")
+                await send_message(phone, "❌ No pude posponer el recordatorio")
         return True
 
     # ── Recordatorio anticipado para evento ───────────────────────────────────
@@ -1370,6 +1442,122 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
             await send_message(phone, f"👍 _{recipe_name.capitalize()}_ guardada. Ingredientes no agregados a la lista.")
         return True
 
+    # FIX #13/#14: Ofrecer guardar receta generada por chat ───────────────────
+    if state_type == "save_recipe_offer":
+        recipe_text = state.get("recipe_text", "")
+        del pending_state[phone]
+        if text.strip() == "save_recipe_yes":
+            await send_message(phone, "⏳ Guardando receta...")
+            try:
+                ext_response = anthropic.messages.create(
+                    model="claude-sonnet-4-20250514", max_tokens=400,
+                    system="Respondé SOLO JSON válido sin markdown.",
+                    messages=[{"role": "user", "content": f"""Del siguiente texto de receta, extraé el nombre y TODOS los ingredientes.
+Texto: {recipe_text[:2000]}
+Respondé:
+{{"name": "nombre de la receta",
+  "ingredients": ["ingrediente1", "ingrediente2", ...]}}"""}]
+                )
+                raw_ext = ext_response.content[0].text.strip()
+                if raw_ext.startswith("```"):
+                    raw_ext = raw_ext.strip("`").lstrip("json").strip()
+                extracted = json.loads(raw_ext)
+                recipe_name = extracted.get("name", "Receta")
+                ingredient_list = extracted.get("ingredients", [])
+            except Exception:
+                recipe_name = "Receta"
+                ingredient_list = []
+
+            enriched = await enrich_items_with_claude(ingredient_list) if ingredient_list else []
+            await save_recipe_to_notion(recipe_name, source="Matrics", ingredient_names=enriched)
+
+            if enriched:
+                ing_list = "\n".join(f"• {i.get('emoji','🛒')} {i.get('name','')}" for i in enriched)
+                pending_state[phone] = {
+                    "type": "recipe_ingredients",
+                    "recipe_name": recipe_name,
+                    "ingredients": enriched
+                }
+                await send_interactive_buttons(
+                    phone,
+                    f"🍽️ *{recipe_name.capitalize()}* guardada en Recipes ✅\n\nIngredientes:\n{ing_list}\n\n¿Los agregás a la lista de compras?",
+                    [
+                        {"id": "recipe_add_yes", "title": "Sí, agregar"},
+                        {"id": "recipe_add_no",  "title": "No por ahora"},
+                    ]
+                )
+            else:
+                await send_message(phone, f"🍽️ *{recipe_name.capitalize()}* guardada en Recipes ✅")
+        else:
+            await send_message(phone, "👍 Receta no guardada.")
+        return True
+
+    # FIX #7: Confirmar si actualizar evento existente o crear uno nuevo ───────
+    if state_type == "confirm_event_or_update":
+        new_data = state.get("new_event_data", {})
+        similar  = state.get("similar_events", [])
+        del pending_state[phone]
+
+        if text.strip() == "evt_update" and similar:
+            target   = similar[0]
+            event_id = target["id"]
+            event    = dict(target)
+            access_token = await get_gcal_access_token()
+            if not access_token:
+                await send_message(phone, "⚠️ Calendar no configurado")
+                return True
+            # Actualizar fecha/hora con los datos del nuevo turno
+            if new_data.get("time"):
+                start = {"dateTime": f"{new_data['date']}T{new_data['time']}:00", "timeZone": "America/Argentina/Buenos_Aires"}
+                end_dt = datetime.strptime(f"{new_data['date']}T{new_data['time']}", "%Y-%m-%dT%H:%M") + timedelta(minutes=new_data.get("duration_minutes", 60))
+                end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "America/Argentina/Buenos_Aires"}
+            else:
+                start = {"date": new_data["date"]}
+                end   = {"date": new_data["date"]}
+            event["start"] = start
+            event["end"]   = end
+            if new_data.get("location"):
+                event["location"] = new_data["location"]
+            async with httpx.AsyncClient() as http:
+                r = await http.put(
+                    f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}",
+                    headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                    json=event
+                )
+            if r.status_code in [200, 201]:
+                old_name = target.get("summary", "Evento")
+                time_str = f" {new_data['time']}" if new_data.get("time") else ""
+                await send_message(phone, f"✅ *{old_name}* actualizado al {new_data['date']}{time_str}")
+                last_event_touched[phone] = {"event_id": event_id, "summary": old_name}
+            else:
+                await send_message(phone, "❌ Error actualizando el evento")
+        else:
+            # Crear evento nuevo
+            guardado, event_id = await create_evento_gcal(new_data)
+            if guardado and event_id:
+                last_event_touched[phone] = {"event_id": event_id, "summary": new_data.get("summary", "Evento")}
+                await send_message(phone, format_evento(new_data, guardado))
+                if new_data.get("time"):
+                    event_dt = f"{new_data['date']}T{new_data['time']}"
+                    pending_state[phone] = {
+                        "type": "event_reminder",
+                        "event_id": event_id,
+                        "summary": new_data.get("summary", "Evento"),
+                        "event_datetime": event_dt
+                    }
+                    await send_interactive_buttons(
+                        phone,
+                        "¿Querés que te avise antes?",
+                        [
+                            {"id": "rem_15", "title": "15 min antes"},
+                            {"id": "rem_60", "title": "1 hora antes"},
+                            {"id": "rem_no", "title": "No gracias"},
+                        ]
+                    )
+            else:
+                await send_message(phone, format_evento(new_data, guardado))
+        return True
+
     return False
 
 # ── Webhook ────────────────────────────────────────────────────────────────────
@@ -1394,6 +1582,13 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 # ── Keywords para detectar carga de combustible ──────────────────────────────
 FUEL_KEYWORDS = {"nafta", "combustible", "gnc", "gasoil", "premium", "super nafta",
                  "carga nafta", "cargue nafta", "puse nafta"}
+
+# FIX #16: prefijos de mensajes propios del bot (para filtrar reenvíos)
+BOT_PREFIXES = (
+    "⏳ Procesando", "🍽️ Receta", "✅ Recordatorio", "🔔 *Recorda",
+    "☀️ *Buenos días", "🛒 *Tu lista", "📊 *Finanzas", "⏰ Te recuerdo",
+    "🍽️ *", "✅ *", "🗑️ *", "✏️ *", "🤝 *",
+)
 
 async def process_message(message: dict):
     from_number = "54298154894334"
@@ -1429,6 +1624,10 @@ async def process_message(message: dict):
                 await send_message(from_number, "❌ No pude transcribir el audio. Mandalo como texto.")
                 return
         else:
+            return
+
+        # FIX #16: ignorar mensajes que son reenvíos de respuestas del bot
+        if msg_type == "text" and text.startswith(BOT_PREFIXES):
             return
 
         if text.strip().lower() in ["/start", "hola", "help", "ayuda"]:
@@ -1508,6 +1707,32 @@ async def process_message(message: dict):
             parsed = await parse_evento(text, image_b64, image_type)
             if text.strip():
                 parsed["caption"] = text.strip()
+
+            # FIX #7: si viene de imagen, buscar eventos similares antes de crear
+            if image_b64:
+                similar = await find_similar_calendar_events(parsed)
+                if similar:
+                    sim_lines = []
+                    for e in similar:
+                        e_start = e.get("start", {})
+                        e_date = e_start.get("dateTime", e_start.get("date", ""))[:10]
+                        sim_lines.append(f"• {e.get('summary','')} ({e_date})")
+                    sim_text = "\n".join(sim_lines)
+                    pending_state[from_number] = {
+                        "type": "confirm_event_or_update",
+                        "new_event_data": parsed,
+                        "similar_events": similar
+                    }
+                    await send_interactive_buttons(
+                        from_number,
+                        f"Encontré eventos similares en tu calendario:\n{sim_text}\n\n¿Qué hacemos?",
+                        [
+                            {"id": "evt_update", "title": "Actualizar existente"},
+                            {"id": "evt_new",    "title": "Crear nuevo"},
+                        ]
+                    )
+                    return
+
             guardado, event_id = await create_evento_gcal(parsed)
             if guardado and event_id:
                 last_event_touched[from_number] = {
@@ -1554,15 +1779,19 @@ async def process_message(message: dict):
         elif tipo == "SHOPPING":
             shopping_text = text
             if not shopping_text.strip() and image_b64:
-                extr = anthropic.messages.create(
-                    model="claude-sonnet-4-20250514", max_tokens=600,
-                    system="Transcribí EXACTAMENTE lo que está escrito en la imagen. Si es una receta: copiá el nombre de la receta y SOLO los ingredientes que están explícitamente listados — no agregues ni inferras ingredientes que no estén escritos. Si es una lista de compras: listá solo los ítems visibles. Responde en español, solo el texto extraído, sin comentarios adicionales.",
-                    messages=[{"role": "user", "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": image_type or "image/jpeg", "data": image_b64}},
-                        {"type": "text", "text": "¿Qué dice esta imagen? Transcribí solo lo que ves escrito, sin agregar nada."}
-                    ]}]
-                )
-                shopping_text = extr.content[0].text.strip()
+                # FIX #12: transcribir imagen con instrucción clara de separar nombre de ingredientes
+                try:
+                    extr = anthropic.messages.create(
+                        model="claude-sonnet-4-20250514", max_tokens=800,
+                        system="Transcribí EXACTAMENTE lo que está escrito en la imagen. Si es una receta: primero copiá el nombre de la receta, luego listá SOLO los ingredientes que están explícitamente escritos como ingredientes — NO incluyas el nombre de la receta como ingrediente. Si es una lista de compras: listá solo los ítems visibles. Responde en español, solo el texto extraído, sin comentarios adicionales.",
+                        messages=[{"role": "user", "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": image_type or "image/jpeg", "data": image_b64}},
+                            {"type": "text", "text": "¿Qué dice esta imagen? Transcribí el nombre de la receta por separado y luego los ingredientes como lista."}
+                        ]}]
+                    )
+                    shopping_text = extr.content[0].text.strip()
+                except Exception:
+                    shopping_text = ""
             respuesta = await handle_shopping(shopping_text, phone=from_number)
             await send_message(from_number, respuesta)
 
@@ -1577,6 +1806,20 @@ async def process_message(message: dict):
         elif tipo == "CHAT":
             respuesta = await handle_chat(from_number, text)
             await send_message(from_number, respuesta)
+            # FIX #13: si la respuesta es una receta, ofrecer guardarla
+            if "Ingredientes:" in respuesta and "Preparación:" in respuesta:
+                pending_state[from_number] = {
+                    "type": "save_recipe_offer",
+                    "recipe_text": respuesta,
+                }
+                await send_interactive_buttons(
+                    from_number,
+                    "¿Guardás esta receta en tus Recetas de Notion?",
+                    [
+                        {"id": "save_recipe_yes", "title": "Sí, guardar"},
+                        {"id": "save_recipe_no",  "title": "No gracias"},
+                    ]
+                )
 
     except json.JSONDecodeError:
         pass
@@ -1614,11 +1857,21 @@ async def create_recordatorio(data: dict) -> tuple[bool, str]:
     fire_at = data["fire_at"]
     start_dt = datetime.strptime(fire_at, "%Y-%m-%dT%H:%M")
     end_dt = start_dt + timedelta(minutes=1)
+    summary_raw = data.get("summary", "Recordatorio")
+    # Evitar doble prefijo 🔔 si ya viene con él
+    if summary_raw.startswith("🔔"):
+        summary_final = summary_raw
+    else:
+        summary_final = f"🔔 {summary_raw}"
     event = {
-        "summary": f"🔔 {data['summary']}",
+        "summary": summary_final,
         "description": "[TEMP]",
         "start": {"dateTime": f"{fire_at}:00", "timeZone": "America/Argentina/Buenos_Aires"},
         "end":   {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "America/Argentina/Buenos_Aires"},
+        # FIX #8/#9/#10
+        "source":   {"title": "Matrics", "url": "https://web-production-6874a.up.railway.app"},
+        "colorId":  "4",   # Flamingo — recordatorios
+        "extendedProperties": {"private": {"created_by": "matrics", "type": "recordatorio"}},
     }
     async with httpx.AsyncClient() as http:
         r = await http.post(
@@ -1668,34 +1921,47 @@ async def cron_job():
             if "dateTime" not in start:
                 continue
             try:
-                diff_minutes = int((datetime.strptime(start["dateTime"][:16], "%Y-%m-%dT%H:%M") - now.replace(tzinfo=None)).total_seconds() / 60)
+                # FIX #1: usar segundos para mayor precisión en el timing
+                diff_seconds = int(
+                    (datetime.strptime(start["dateTime"][:16], "%Y-%m-%dT%H:%M") - now.replace(tzinfo=None))
+                    .total_seconds()
+                )
             except Exception:
                 continue
-            if "[TEMP]" in desc and 0 <= diff_minutes <= 1:
-                clean_summary = summary.replace('🔔 ', '')
+
+            # FIX #1: ventana de -30 a +90 segundos (cubre crons que corren cada 1-2 min)
+            if "[TEMP]" in desc and -30 <= diff_seconds <= 90:
+                clean_summary = summary.replace("🔔 ", "").strip()
                 await send_message(MY_NUMBER, f"🔔 *Recordatorio*\n{clean_summary}")
-                await http.delete(f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}", headers=headers)
-                pending_state[MY_NUMBER] = {"type": "snooze", "summary": f"🔔 {clean_summary}"}
+                await http.delete(
+                    f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}",
+                    headers=headers
+                )
+                # FIX #2/#3: mensaje claro + botón No posponer; summary sin 🔔 para evitar doble prefijo
+                pending_state[MY_NUMBER] = {"type": "snooze", "summary": clean_summary}
                 await send_interactive_buttons(
                     MY_NUMBER,
-                    "¿Snooze?",
+                    f"⏰ *¿Querés posponer este recordatorio?*\n_{clean_summary}_",
                     [
                         {"id": "snooze_5",  "title": "5 min"},
                         {"id": "snooze_15", "title": "15 min"},
-                        {"id": "snooze_30", "title": "30 min"},
+                        {"id": "snooze_no", "title": "No posponer"},
                     ]
                 )
                 fired.append(f"TEMP: {summary}")
-            elif "[REM:60]" in desc and 59 <= diff_minutes <= 61:
+            elif "[REM:60]" in desc and 59 <= diff_seconds // 60 <= 61:
                 loc_str = f"\n📍 {event.get('location')}" if event.get("location") else ""
                 await send_message(MY_NUMBER, f"⏰ *En 1 hora:* {summary}{loc_str}")
                 fired.append(f"REM60: {summary}")
-            elif "[REM:15]" in desc and 14 <= diff_minutes <= 16:
+            elif "[REM:15]" in desc and 14 <= diff_seconds // 60 <= 16:
                 loc_str = f"\n📍 {event.get('location')}" if event.get("location") else ""
                 await send_message(MY_NUMBER, f"⏰ *En 15 minutos:* {summary}{loc_str}")
                 fired.append(f"REM15: {summary}")
-        effective_hour = user_prefs.get("daily_summary_hour") or DAILY_SUMMARY_HOUR
-        if now.hour == effective_hour and now.minute == 0:
+
+        # FIX #5: resumen diario con soporte de minutos
+        effective_hour   = user_prefs.get("daily_summary_hour")   or DAILY_SUMMARY_HOUR
+        effective_minute = user_prefs.get("daily_summary_minute") or 0
+        if now.hour == effective_hour and now.minute == effective_minute:
             await send_daily_summary(http, access_token, now)
             fired.append("DAILY_SUMMARY")
     return {"ok": True, "fired": fired, "time": now.strftime("%H:%M")}
@@ -1747,13 +2013,17 @@ SHOPPING_CATEGORIES = ["Frutas y verduras", "Enlatado", "Infusion", "Lacteo", "E
 SHOPPING_STORES     = ["Super", "Panaderia", "Verduleria", "Dietetica", "Farmacia", "Drogueria", "Ferreteria"]
 SHOPPING_FREQUENCY  = ["Often", "Monthly", "Annual", "One time"]
 
-async def get_ingredients_and_enrich(recipe_name: str) -> tuple[list[dict], bool]:
+# FIX #14: acepta recipe_text opcional para extraer ingredientes reales
+async def get_ingredients_and_enrich(recipe_name: str, recipe_text: str = None) -> tuple[list[dict], bool]:
+    if recipe_text:
+        context = f'Receta: "{recipe_name}"\nTexto completo de la receta:\n{recipe_text[:2000]}\n\nExtrae TODOS los ingredientes que aparecen en el texto de la receta.'
+    else:
+        context = f'Receta: "{recipe_name}"\n\nInferí los ingredientes típicos/estándar completos de esta receta. Listá todos los que normalmente se necesitan para prepararla.'
+
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514", max_tokens=800,
         system="Respondé SOLO JSON válido sin markdown ni texto extra.",
-        messages=[{"role": "user", "content": f"""Receta: "{recipe_name}"
-
-Listá SOLO los ingredientes que se mencionan explícitamente. No agregues ingredientes inferidos ni típicos de la receta si no están en el nombre o descripción.
+        messages=[{"role": "user", "content": f"""{context}
 
 Respondé SOLO este array JSON:
 [{{
@@ -1906,9 +2176,10 @@ Respondé SOLO este JSON con las propiedades que puedas inferir:
     except Exception:
         pass
 
+# FIX #12/#14: parse_shopping_intent extrae ingredientes explícitos del texto
 async def parse_shopping_intent(text: str) -> dict:
     response = anthropic.messages.create(
-        model="claude-sonnet-4-20250514", max_tokens=300,
+        model="claude-sonnet-4-20250514", max_tokens=400,
         system="Analizá mensajes sobre lista de compras. Responde SOLO JSON válido sin markdown.",
         messages=[{"role": "user", "content": f"""Mensaje: {text}
 
@@ -1916,13 +2187,16 @@ Respondé:
 {{"action": "out_of_stock"|"in_stock"|"add"|"list",
   "items": ["item1", "item2"],
   "recipe_name": "nombre de la receta o null",
-  "is_recipe_request": true/false}}
+  "is_recipe_request": true/false,
+  "recipe_ingredients": ["ingrediente1", "ingrediente2", ...]}}
 
 - out_of_stock: "me quedé sin X", "no tengo X"
 - in_stock: "compré X", "ya tengo X"
 - add: "agregá X", "necesito X", ingredientes para algo
 - list: "qué me falta", "mostrame la lista"
-- is_recipe_request=true si pide ingredientes de una receta específica"""}]
+- is_recipe_request=true si pide ingredientes de una receta específica o si el texto es una receta
+- recipe_ingredients: si el texto incluye una lista de ingredientes (ej: texto de una receta), extraelos todos aquí. Si no hay lista explícita de ingredientes, usá [].
+  IMPORTANTE: NO incluyas el nombre de la receta como ingrediente."""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -1986,6 +2260,8 @@ async def handle_shopping(text: str, phone: str = None) -> str:
     items       = intent.get("items", [])
     is_recipe   = intent.get("is_recipe_request", False)
     recipe_name = intent.get("recipe_name")
+    # FIX #12: ingredientes explícitos extraídos del texto (ej: imagen de receta)
+    recipe_ingredients_raw = intent.get("recipe_ingredients", [])
     recipe_note = ""
 
     if action == "add" and is_recipe and recipe_name:
@@ -2014,11 +2290,16 @@ async def handle_shopping(text: str, phone: str = None) -> str:
                 recipe_note = f"📖 *{recipe_name.capitalize()}* (de tus recetas)\n"
         else:
             try:
-                enriched_direct, ok = await get_ingredients_and_enrich(recipe_name)
+                # FIX #12/#14: usar ingredientes explícitos del texto si están disponibles
+                if recipe_ingredients_raw:
+                    enriched_direct = await enrich_items_with_claude(recipe_ingredients_raw)
+                    ok = True
+                else:
+                    enriched_direct, ok = await get_ingredients_and_enrich(recipe_name)
             except Exception:
                 enriched_direct, ok = [], False
             if ok and enriched_direct:
-                # Guardar receta en Notion (sin ingredientes relacionados aún)
+                # Guardar receta en Notion
                 await save_recipe_to_notion(recipe_name, source="Matrics", ingredient_names=enriched_direct)
                 ing_list = "\n".join(f"• {i.get('emoji','🛒')} {i.get('name','')}" for i in enriched_direct)
                 if phone:
