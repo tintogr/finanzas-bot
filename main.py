@@ -31,6 +31,8 @@ PLANTS_DB_ID   = os.environ.get("NOTION_PLANTS_DB_ID", "39d22615-0106-43f8-9f01-
 SHOPPING_DB_ID = os.environ.get("NOTION_SHOPPING_DB_ID", "cb85fdf75d684f61bafea20b5eeb653f")
 RECIPES_DB_ID   = os.environ.get("NOTION_RECIPES_DB_ID", "8fa008a7-0720-475a-9868-7c3ba077bc50")
 MEETINGS_DB_ID  = os.environ.get("NOTION_MEETINGS_DB_ID", "ed5b5023-c17c-46e5-be7d-56655f0257ee")
+TASKS_DB_ID     = os.environ.get("NOTION_TASKS_DB_ID", "90b44158-7916-4837-94de-129dde448fc4")
+CONFIG_DB_ID    = os.environ.get("NOTION_CONFIG_DB_ID", "2f81017d-a20c-426a-ada8-8fcf0743338")
 WA_TOKEN       = os.environ["WHATSAPP_TOKEN"]
 WA_PHONE_ID    = os.environ["WHATSAPP_PHONE_ID"]
 WA_API         = f"https://graph.facebook.com/v22.0/{WA_PHONE_ID}/messages"
@@ -49,7 +51,13 @@ category_overrides: dict[str, list[str]] = {}
 # ── Preferencias del usuario ──────────────────────────────────────────────────
 user_prefs: dict = {
     "daily_summary_hour": None,
-    "daily_summary_minute": None,   # FIX #5: soporte de minutos
+    "daily_summary_minute": None,
+    "greeting_name": None,          # nombre del saludo matutino
+    "resumen_extras": [],           # lista de instrucciones extra en lenguaje natural
+    "resumen_nocturno_hour": 22,    # hora del resumen nocturno
+    "resumen_nocturno_enabled": True,
+    "news_topics": [],              # temas de noticias solicitados
+    "_config_page_id": None,        # ID de la página en Matrics Config
 }
 
 # ── Última entrada tocada (gastos) ────────────────────────────────────────────
@@ -770,13 +778,20 @@ async def search_and_edit_evento(text: str, phone: str = None) -> tuple[bool, st
     if not access_token:
         return False, "Calendar no configurado"
     now = now_argentina()
+    # Contexto del último evento para correcciones naturales ("no era en abril, era el 29 de marzo")
+    last_event_ctx = ""
+    if phone and phone in last_event_touched:
+        last_event_ctx = f"\nÚltimo evento creado/editado: \"{last_event_touched[phone].get('summary', '')}\" — usalo como contexto si el mensaje no nombra un evento explícito."
     response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=300,
-        system="Extraé qué evento editar y qué cambiar. Si el mensaje no menciona un nombre concreto de evento (ej: 'el que creamos', 'ese evento', 'el último'), usá null en search_term. Responde SOLO JSON.",
-        messages=[{"role": "user", "content": f"""Hoy: {now.strftime("%Y-%m-%d")}
-Mensaje: {text}
+        system=f"""Extraé qué evento editar y qué cambiar. Hoy es {now.strftime("%Y-%m-%d")}.{last_event_ctx}
+Reglas:
+- Si el mensaje es una CORRECCIÓN de algo recién dicho (ej: "no era abril era el 29 de marzo", "me equivoqué la hora es X") → search_term=null y aplicá la corrección al último evento.
+- Si el mensaje no menciona un nombre concreto de evento → search_term=null.
+- Responde SOLO JSON.""",
+        messages=[{"role": "user", "content": f"""Mensaje: {text}
 Respondé:
-{{"search_term":"nombre del evento o null si es referencia vaga","location":"nueva ubicacion o null","new_title":"nuevo titulo o null","new_time":"HH:MM o null","new_date":"YYYY-MM-DD o null","description":"nueva descripcion o null"}}"""}]
+{{"search_term":"nombre del evento o null si es referencia vaga o corrección","location":"nueva ubicacion o null","new_title":"nuevo titulo o null","new_time":"HH:MM o null","new_date":"YYYY-MM-DD o null","description":"nueva descripcion o null"}}"""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -999,6 +1014,27 @@ def add_to_history(phone: str, role: str, content: str):
     if len(chat_history[phone]) > MAX_HISTORY:
         chat_history[phone] = chat_history[phone][-MAX_HISTORY:]
 
+
+# ── Inteligencia conversacional ────────────────────────────────────────────────
+async def needs_clarification(phone: str, text: str, context: str) -> str | None:
+    """Si el mensaje es ambiguo dado el contexto, devuelve una pregunta de aclaración.
+    Retorna None si el mensaje es suficientemente claro para actuar."""
+    try:
+        resp = claude_create(
+            model="claude-sonnet-4-20250514", max_tokens=100,
+            system=f"""Sos Matrics. Evaluá si el mensaje del usuario es suficientemente claro para ejecutar la acción indicada.
+Contexto: {context}
+Si el mensaje es claro → respondé solo: CLEAR
+Si hay ambigüedad → respondé solo la pregunta de aclaración más concisa y natural posible (máx 1 pregunta, tono rioplatense).""",
+            messages=[{"role": "user", "content": text}]
+        )
+        result = resp.content[0].text.strip()
+        if result == "CLEAR" or result.startswith("CLEAR"):
+            return None
+        return result
+    except Exception:
+        return None
+
 # ── CLASIFICADOR ───────────────────────────────────────────────────────────────
 async def classify(text: str, has_image: bool, image_b64: str = None, image_type: str = None) -> str:
     if has_image and not text.strip() and not image_b64:
@@ -1161,30 +1197,134 @@ async def handle_chat(phone: str, text: str) -> str:
     if any(k in text_lower for k in ["de dónde","de donde","fuente","qué app","que app","cómo sabés","como sabes","qué modelo","que modelo"]):
         source_note = "\n\nSi te preguntan: los datos vienen de Open-Meteo, usando modelos meteorológicos ECMWF y GFS."
 
+    # Búsqueda web para plataformas de streaming y disponibilidad actual
+    streaming_context = ""
+    streaming_kw = ["plataforma","streaming","netflix","amazon","prime","disney","hbo","max","flow",
+                    "paramount","apple tv","dónde ver","donde ver","dónde está","donde está","justwatch"]
+    if any(k in text_lower for k in streaming_kw):
+        try:
+            # Extraer nombre de la peli/serie del historial reciente
+            search_query = text
+            if history:
+                last_assistant = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+                if last_assistant:
+                    search_query = f"{text} {last_assistant[:100]}"
+            async with httpx.AsyncClient(timeout=6) as http_s:
+                r_s = await http_s.get(
+                    "https://www.justwatch.com/ar/buscar",
+                    params={"q": search_query[:80]},
+                    headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "es-AR"}
+                )
+                if r_s.status_code == 200 and "justwatch" in r_s.url.host:
+                    streaming_context = "\n\nNota: Para saber dónde ver algo ahora mismo en Argentina, recomendá JustWatch (justwatch.com/ar) — ahí está actualizado en tiempo real. No puedo consultar disponibilidad actual de streaming directamente."
+                else:
+                    streaming_context = "\n\nNota: La disponibilidad en plataformas de streaming cambia constantemente. Recomendá buscar en *JustWatch* (justwatch.com/ar) para Argentina, que muestra en tiempo real dónde está disponible."
+        except Exception:
+            streaming_context = "\n\nNota: Para disponibilidad actual en streaming en Argentina, recomendá *JustWatch* (justwatch.com/ar)."
+
     response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=800,
         system=f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural.
 Usás español rioplatense. Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
-IMPORTANTE: Si no tenés datos concretos para responder, decilo directamente. No inventes información que no tenés.{finance_context}{calendar_context}{weather_context}{source_note}""",
+IMPORTANTE: Si no tenés datos concretos para responder, decilo directamente. No inventes información que no tenés.
+Para disponibilidad en plataformas de streaming: NO inventes ni supongas. Siempre decí que la disponibilidad cambia y recomendá JustWatch.{finance_context}{calendar_context}{weather_context}{source_note}{streaming_context}""",
         messages=history + [{"role": "user", "content": text}]
     )
     reply = response.content[0].text.strip()
     add_to_history(phone, "assistant", reply)
     return reply
 
+
+# ── Config persistente en Notion ───────────────────────────────────────────────
+async def load_user_config(wa_number: str):
+    """Carga config del usuario desde Notion y actualiza user_prefs en memoria."""
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.post(
+                f"https://api.notion.com/v1/databases/{CONFIG_DB_ID.replace('-','')}/query",
+                headers=notion_headers(),
+                json={"filter": {"property": "WA Number", "rich_text": {"equals": wa_number}}, "page_size": 1}
+            )
+            if r.status_code != 200 or not r.json().get("results"):
+                return
+            page = r.json()["results"][0]
+            props = page["properties"]
+            def get_num(p): return (props.get(p, {}).get("number") or None)
+            def get_txt(p):
+                rt = props.get(p, {}).get("rich_text", [])
+                return rt[0]["plain_text"] if rt else None
+            def get_chk(p): return props.get(p, {}).get("checkbox", False)
+
+            if get_num("Resumen Hour") is not None:
+                user_prefs["daily_summary_hour"]   = int(get_num("Resumen Hour"))
+            if get_num("Resumen Minute") is not None:
+                user_prefs["daily_summary_minute"] = int(get_num("Resumen Minute"))
+            if get_num("Resumen Nocturno Hour") is not None:
+                user_prefs["resumen_nocturno_hour"] = int(get_num("Resumen Nocturno Hour"))
+            user_prefs["resumen_nocturno_enabled"] = get_chk("Resumen Nocturno Enabled")
+            extras = get_txt("Resumen Extras")
+            if extras:
+                user_prefs["resumen_extras"] = [e.strip() for e in extras.split("|") if e.strip()]
+            greeting = get_txt("Greeting Name")
+            if greeting:
+                user_prefs["greeting_name"] = greeting
+            topics = get_txt("News Topics")
+            if topics:
+                user_prefs["news_topics"] = [t.strip() for t in topics.split(",") if t.strip()]
+            user_prefs["_config_page_id"] = page["id"]
+    except Exception:
+        pass
+
+async def save_user_config(wa_number: str):
+    """Guarda user_prefs actuales en Notion."""
+    try:
+        page_id = user_prefs.get("_config_page_id")
+        if not page_id:
+            await load_user_config(wa_number)
+            page_id = user_prefs.get("_config_page_id")
+        if not page_id:
+            return
+        extras_str = " | ".join(user_prefs.get("resumen_extras", []))
+        topics_str = ", ".join(user_prefs.get("news_topics", []))
+        props = {
+            "Greeting Name":   {"rich_text": [{"text": {"content": user_prefs.get("greeting_name") or "Buenos días"}}]},
+            "Resumen Extras":  {"rich_text": [{"text": {"content": extras_str}}]},
+            "News Topics":     {"rich_text": [{"text": {"content": topics_str}}]},
+        }
+        if user_prefs.get("daily_summary_hour") is not None:
+            props["Resumen Hour"]   = {"number": user_prefs["daily_summary_hour"]}
+            props["Resumen Minute"] = {"number": user_prefs.get("daily_summary_minute", 0)}
+        if user_prefs.get("resumen_nocturno_hour") is not None:
+            props["Resumen Nocturno Hour"] = {"number": user_prefs["resumen_nocturno_hour"]}
+        props["Resumen Nocturno Enabled"] = {"checkbox": user_prefs.get("resumen_nocturno_enabled", True)}
+        async with httpx.AsyncClient() as http:
+            await http.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers=notion_headers(),
+                json={"properties": props}
+            )
+    except Exception:
+        pass
+
 # ── MÓDULO CONFIGURACIÓN ──────────────────────────────────────────────────────
 async def handle_configurar(text: str) -> str:
-    # FIX #5: soporte de horas y minutos
     response = claude_create(
-        model="claude-sonnet-4-20250514", max_tokens=150,
+        model="claude-sonnet-4-20250514", max_tokens=200,
         system="Extraé qué configuración cambiar. Responde SOLO JSON.",
         messages=[{"role": "user", "content": f"""Mensaje: {text}
 Respondé:
 {{"setting": "daily_summary_hour",
-  "hour": hora en formato 24h como entero (ej: 7, 8, 9, 18),
-  "minute": minutos como entero (ej: 0, 30, 38) — si no se mencionan minutos usá 0}}
-Si no se menciona horario válido, hour=null y minute=null.
-Ejemplos: "a las 7.30" → hour=7, minute=30 | "a las 10 y 38" → hour=10, minute=38 | "a las 8" → hour=8, minute=0"""}]
+  "hour": hora en formato 24h como entero — convertí AM/PM (7am→7, 7pm→19). null si no hay horario,
+  "minute": minutos como entero — si no se mencionan usá 0,
+  "greeting_name": nuevo nombre del saludo matutino o null,
+  "add_extra": instrucción nueva para agregar al Resumen Diario, o null (ej: "decime una frase motivadora"),
+  "remove_extra": texto de instrucción a quitar del Resumen Diario, o null}}
+Ejemplos:
+- "mandame el resumen a las 7:20 am" → hour=7 minute=20
+- "agregá al resumen que me digas una frase motivadora" → add_extra="decime una frase motivadora"
+- "sacá el clima del resumen" → remove_extra="clima"
+- "llamá al resumen Despertador" → greeting_name="Despertador"
+Si nada aplica, todo null."""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -1197,6 +1337,27 @@ Ejemplos: "a las 7.30" → hour=7, minute=30 | "a las 10 y 38" → hour=10, minu
     setting = data.get("setting")
     hour    = data.get("hour")
     minute  = data.get("minute", 0) or 0
+    greeting_name = data.get("greeting_name")
+    add_extra  = data.get("add_extra")
+    remove_extra = data.get("remove_extra")
+
+    changed = []
+
+    if greeting_name:
+        user_prefs["greeting_name"] = greeting_name
+        changed.append(f"📛 Saludo del Resumen Diario → *{greeting_name}*")
+
+    if add_extra:
+        extras = user_prefs.get("resumen_extras", [])
+        if add_extra not in extras:
+            extras.append(add_extra)
+            user_prefs["resumen_extras"] = extras
+        changed.append(f"➕ Extra agregado: _{add_extra}_")
+
+    if remove_extra:
+        extras = user_prefs.get("resumen_extras", [])
+        user_prefs["resumen_extras"] = [e for e in extras if remove_extra.lower() not in e.lower()]
+        changed.append(f"➖ Extra removido: _{remove_extra}_")
 
     if setting == "daily_summary_hour" and hour is not None:
         try:
@@ -1209,11 +1370,15 @@ Ejemplos: "a las 7.30" → hour=7, minute=30 | "a las 10 y 38" → hour=10, minu
             user_prefs["daily_summary_hour"]   = hora
             user_prefs["daily_summary_minute"] = mins
             hora_fmt = f"{hora:02d}:{mins:02d}"
-            return f"✅ Listo — a partir de ahora el resumen matutino te llega a las *{hora_fmt}*\n_(Esta configuración se mantiene hasta el próximo deploy)_"
+            changed.append(f"🕐 Horario del resumen → *{hora_fmt}*")
         except Exception:
             return "❌ No pude interpretar el horario"
 
-    return "❓ No entendí qué querés configurar. Podés decirme por ejemplo: _\"el resumen de la mañana mandámelo a las 7:30\"_"
+    if changed:
+        await save_user_config(MY_NUMBER)
+        return "✅ Listo:\n" + "\n".join(changed)
+
+    return "❓ No entendí qué querés configurar. Podés decirme:\n• _\"mandame el Resumen Diario a las 7:20 am\"_\n• _\"agregá al Resumen Diario que me digas una frase motivadora\"_\n• _\"sacá el clima del Resumen Diario\"_"
 
 # ── MÓDULO REUNIONES ──────────────────────────────────────────────────────────
 async def handle_reunion(text: str, image_b64: str = None, image_type: str = None) -> str:
@@ -1755,6 +1920,10 @@ async def process_message(message: dict):
             if handled:
                 return
 
+        # Cargar config persistente del usuario si no está en memoria
+        if user_prefs.get("_config_page_id") is None:
+            await load_user_config(from_number)
+
         tipo = await classify(text, image_b64 is not None, image_b64, image_type)
         exchange_rate = await get_exchange_rate()
 
@@ -1809,6 +1978,13 @@ async def process_message(message: dict):
                 await send_message(from_number, f"❌ Error guardando planta: {error[:200]}")
 
         elif tipo == "EVENTO":
+            if not image_b64:
+                clarif = await needs_clarification(from_number, text,
+                    "el usuario quiere crear un evento en Google Calendar. "
+                    "Necesitamos al menos fecha y título. Si falta la fecha o el nombre del evento, preguntar.")
+                if clarif:
+                    await send_message(from_number, clarif)
+                    return
             parsed = await parse_evento(text, image_b64, image_type)
             if text.strip():
                 parsed["caption"] = text.strip()
@@ -1870,8 +2046,15 @@ async def process_message(message: dict):
                 await send_message(from_number, format_evento(parsed, guardado))
 
         elif tipo == "EDITAR_EVENTO":
-            success, msg = await search_and_edit_evento(text, phone=from_number)
-            await send_message(from_number, msg if success else f"⚠️ {msg}")
+            clarif = await needs_clarification(from_number, text,
+                "el usuario quiere editar un evento del calendario. "
+                f"Último evento tocado: {last_event_touched.get(from_number, {}).get('summary', 'ninguno')}. "
+                "Si no queda claro qué evento editar o qué cambiar, preguntar.")
+            if clarif:
+                await send_message(from_number, clarif)
+            else:
+                success, msg = await search_and_edit_evento(text, phone=from_number)
+                await send_message(from_number, msg if success else f"⚠️ {msg}")
 
         elif tipo == "ELIMINAR_EVENTO":
             success, msg = await delete_evento(text)
@@ -2089,12 +2272,18 @@ async def cron_job():
                 await send_message(MY_NUMBER, f"⏰ *En 15 minutos:* {summary}{loc_str}")
                 fired.append(f"REM15: {summary}")
 
-        # FIX #5: resumen diario con soporte de minutos
+        # Resumen diario matutino
         effective_hour   = user_prefs.get("daily_summary_hour")   or DAILY_SUMMARY_HOUR
         effective_minute = user_prefs.get("daily_summary_minute") or 0
         if now.hour == effective_hour and now.minute == effective_minute:
             await send_daily_summary(http, access_token, now)
             fired.append("DAILY_SUMMARY")
+        # Resumen nocturno
+        nocturno_enabled = user_prefs.get("resumen_nocturno_enabled", True)
+        nocturno_hour    = user_prefs.get("resumen_nocturno_hour", 22)
+        if nocturno_enabled and now.hour == nocturno_hour and now.minute == 0:
+            await send_resumen_nocturno(http, access_token, now)
+            fired.append("RESUMEN_NOCTURNO")
     return {"ok": True, "fired": fired, "time": now.strftime("%H:%M")}
 
 async def send_daily_summary(http, access_token: str, now: datetime):
@@ -2111,31 +2300,126 @@ async def send_daily_summary(http, access_token: str, now: datetime):
         return
     events = [e for e in r.json().get("items", []) if "[TEMP]" not in (e.get("description") or "")]
     w = await get_weather()
-    lines = ["☀️ *Buenos días, Martín!*", ""]
+    await load_user_config(MY_NUMBER)
+    greeting = user_prefs.get("greeting_name") or "Buenos días"
+    lines = [f"☀️ *{greeting}, Martín!*", ""]
     if w:
-        # Clima actual
         lines.append(f"🌡️ {w['temp']}°C (sensación {w['sensacion']}°C) — {w['emoji']} {w['desc']}")
         if w["lluvia"] > 0:
             lines.append(f"🌧️ Lluvia ahora: {w['lluvia']}mm")
         lines.append(f"💨 {w['wind_desc']} ({w['viento']} km/h)")
-        # Pronóstico del día
         pronostico = f"📊 Hoy: máx {w['hoy_max']}°C, mín {w['hoy_min']}°C"
         if w["hoy_lluvia"] > 0:
             pronostico += f", 🌧️ {w['hoy_lluvia']}mm esperados"
         lines.append(pronostico)
         lines.append("")
-    if not events:
-        lines.append("📅 Hoy no tenés eventos agendados.")
+    # Si es lunes, incluir agenda semanal
+    if now.weekday() == 0:
+        try:
+            async with httpx.AsyncClient() as http_week:
+                r_week = await http_week.get(
+                    "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    params={"timeMin": now.strftime("%Y-%m-%dT00:00:00-03:00"),
+                            "timeMax": (now + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59-03:00"),
+                            "singleEvents": "true", "orderBy": "startTime", "maxResults": "20"}
+                )
+                if r_week.status_code == 200:
+                    week_events = [e for e in r_week.json().get("items", []) if "[TEMP]" not in (e.get("description") or "")]
+                    if week_events:
+                        lines.append("📆 *Tu semana:*")
+                        for e in week_events:
+                            s = e.get("start", {})
+                            if "dateTime" in s:
+                                dt = datetime.strptime(s["dateTime"][:16], "%Y-%m-%dT%H:%M")
+                                lines.append(f"• {dt.strftime('%a %d/%m')} {dt.strftime('%H:%M')} — {e.get('summary', '')}")
+                            else:
+                                lines.append(f"• {s.get('date', '')[:10]} — {e.get('summary', '')} (todo el día)")
+                        lines.append("")
+        except Exception:
+            pass
     else:
-        lines.append(f"📅 *{'Tus eventos de hoy' if len(events) > 1 else 'Tu evento de hoy'}:*")
-        for e in events:
-            start = e.get("start", {})
-            loc_str = f" — 📍{e.get('location', '')}" if e.get("location") else ""
-            if "dateTime" in start:
-                lines.append(f"• {start['dateTime'][11:16]} — {e.get('summary', 'Evento')}{loc_str}")
-            else:
-                lines.append(f"• {e.get('summary', 'Evento')} (todo el día){loc_str}")
+        if not events:
+            lines.append("📅 Hoy no tenés eventos agendados.")
+        else:
+            lines.append(f"📅 *{'Tus eventos de hoy' if len(events) > 1 else 'Tu evento de hoy'}:*")
+            for e in events:
+                start = e.get("start", {})
+                loc_str = f" — 📍{e.get('location', '')}" if e.get("location") else ""
+                if "dateTime" in start:
+                    lines.append(f"• {start['dateTime'][11:16]} — {e.get('summary', 'Evento')}{loc_str}")
+                else:
+                    lines.append(f"• {e.get('summary', 'Evento')} (todo el día){loc_str}")
+    # Extras configurados por el usuario
+    extras = user_prefs.get("resumen_extras", [])
+    if extras:
+        try:
+            extras_prompt = "\n".join(f"- {e}" for e in extras)
+            extra_resp = claude_create(
+                model="claude-sonnet-4-20250514", max_tokens=300,
+                system=f"Sos Matrics. Hoy es {now.strftime('%A %d/%m/%Y')}. Generá contenido breve (máx 3 líneas por item) para los siguientes extras del Resumen Diario. Usás español rioplatense, tono natural y cálido.",
+                messages=[{"role": "user", "content": f"Generá estos extras para el resumen matutino:\n{extras_prompt}"}]
+            )
+            extra_text = extra_resp.content[0].text.strip()
+            if extra_text:
+                lines.append("")
+                lines.append(extra_text)
+        except Exception:
+            pass
     await send_message(MY_NUMBER, "\n".join(lines))
+
+
+async def send_resumen_nocturno(http, access_token: str, now: datetime):
+    """Resumen nocturno: eventos de mañana + sugerencias naturales."""
+    manana = now + timedelta(days=1)
+    r = await http.get(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "timeMin": manana.strftime("%Y-%m-%dT00:00:00-03:00"),
+            "timeMax": manana.strftime("%Y-%m-%dT23:59:59-03:00"),
+            "singleEvents": "true", "orderBy": "startTime", "maxResults": "10"
+        }
+    )
+    events_manana = []
+    if r.status_code == 200:
+        events_manana = [e for e in r.json().get("items", []) if "[TEMP]" not in (e.get("description") or "")]
+
+    eventos_str = ""
+    if events_manana:
+        lineas = []
+        for e in events_manana:
+            s = e.get("start", {})
+            if "dateTime" in s:
+                lineas.append(f"• {s['dateTime'][11:16]} — {e.get('summary','')}")
+            else:
+                lineas.append(f"• {e.get('summary','')} (todo el día)")
+        eventos_str = "\n".join(lineas)
+
+    context = f"Hoy es {now.strftime('%A %d/%m/%Y')}. Hora: {now.strftime('%H:%M')}."
+    if eventos_str:
+        context += f"\nEventos de mañana:\n{eventos_str}"
+    else:
+        context += "\nMañana no hay eventos agendados."
+
+    try:
+        resp = claude_create(
+            model="claude-sonnet-4-20250514", max_tokens=300,
+            system=f"""Sos Matrics. {context}
+Generá un resumen nocturno breve y natural en español rioplatense. Incluí:
+1. Un saludo de buenas noches y qué hay para mañana (si hay eventos mencionálos, si no decilo también).
+2. Una sugerencia espontánea: podría ser agendar algo, agregar algo a la lista de compras, registrar un gasto del día, o simplemente un pensamiento de cierre.
+Sé conciso, cálido, natural. Máximo 5 líneas en total.""",
+            messages=[{"role": "user", "content": "Generá el resumen nocturno."}]
+        )
+        msg = resp.content[0].text.strip()
+    except Exception:
+        if eventos_str:
+            msg = f"🌙 Buenas noches! Mañana tenés:\n{eventos_str}\n\nQue descanses 😴"
+        else:
+            msg = "🌙 Buenas noches! Mañana el día está libre. Que descanses 😴"
+
+    await send_message(MY_NUMBER, msg)
 
 @app.get("/health")
 async def health_check():
