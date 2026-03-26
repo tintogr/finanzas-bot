@@ -1054,7 +1054,7 @@ CORREGIR_GASTO: corregir un gasto ya registrado. Ej: "me equivoqué, era 7000 no
 ELIMINAR_GASTO: eliminar o borrar una entrada de Notion. Ej: "borrá ese gasto", "eliminá la entrada que se llama X", "sacá ese registro de Notion".
 ELIMINAR_SHOPPING: eliminar o borrar un ítem de la lista de compras. Ej: "borrá Tomates de la lista", "eliminá ese ítem del shopping".
 PLANTA: adquirir o mencionar una planta.
-EDITAR_EVENTO: modificar un evento existente en el calendario.
+EDITAR_EVENTO: modificar un evento existente en el calendario. También cuando el usuario corrige algo que acaba de decir sobre un evento: "no era en abril era el 29 de marzo", "me equivoqué la hora es X", "al final el turno es el jueves", "cambiá la fecha del gim", "al final arranco el gim el 29 de marzo no de abril" → siempre EDITAR_EVENTO. Si el mensaje menciona un nombre o actividad relacionada con algo reciente (gim, turno, gym) + una fecha nueva → EDITAR_EVENTO.
 ELIMINAR_EVENTO: eliminar o borrar un evento del calendario.
 RECORDATORIO: "recordame en X tiempo", "avisame en X", "haceme acordar". NUNCA usar para cambios de horario del resumen matutino.
 EVENTO: crear un evento nuevo — turno, reunión, cumple, cita, viaje. También frases como "hoy/mañana a las X tengo un evento/turno/reunión que se llama Y" → siempre EVENTO.
@@ -1222,6 +1222,34 @@ async def handle_chat(phone: str, text: str) -> str:
         except Exception:
             streaming_context = "\n\nNota: Para disponibilidad actual en streaming en Argentina, recomendá *JustWatch* (justwatch.com/ar)."
 
+    # Detectar si la consulta requiere info actual (streaming, noticias, precios, eventos recientes, etc.)
+    needs_web = any(k in text_lower for k in [
+        "plataforma","streaming","netflix","amazon","prime","disney","hbo","max","flow","paramount",
+        "dónde ver","donde ver","está disponible","justwatch",
+        "precio","cotización","cotizacion","cuánto sale","cuanto sale",
+        "noticia","novedades","último","ultimo","recientemente","hoy salió","hoy salio",
+        "quién ganó","quien gano","resultado","score","partido",
+        "clima de","temperatura en","llueve en",
+    ])
+    if needs_web:
+        try:
+            web_resp = claude_create(
+                model="claude-sonnet-4-20250514", max_tokens=600,
+                system=f"Sos Matrics. Hoy: {now.strftime('%d/%m/%Y')}. Respondés en español rioplatense, conciso. Buscá info actualizada para responder.",
+                messages=history + [{"role": "user", "content": text}],
+                tools=[{"type": "web_search_20250305", "name": "web_search"}]
+            )
+            # Procesar resultado con tool use
+            reply_parts = []
+            for block in web_resp.content:
+                if hasattr(block, "text"):
+                    reply_parts.append(block.text)
+            reply = " ".join(reply_parts).strip() or web_resp.content[-1].text.strip()
+            add_to_history(phone, "assistant", reply)
+            return reply
+        except Exception:
+            pass  # Si falla web_search, continuar con respuesta normal
+
     response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=800,
         system=f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural.
@@ -1276,12 +1304,11 @@ async def load_user_config(wa_number: str):
         pass
 
 async def save_user_config(wa_number: str):
-    """Guarda user_prefs actuales en Notion."""
+    """Guarda user_prefs actuales en Notion. Carga config si no tiene page_id."""
     try:
-        page_id = user_prefs.get("_config_page_id")
-        if not page_id:
+        if not user_prefs.get("_config_page_id"):
             await load_user_config(wa_number)
-            page_id = user_prefs.get("_config_page_id")
+        page_id = user_prefs.get("_config_page_id")
         if not page_id:
             return
         extras_str = " | ".join(user_prefs.get("resumen_extras", []))
@@ -1378,7 +1405,16 @@ Si nada aplica, todo null."""}]
         await save_user_config(MY_NUMBER)
         return "✅ Listo:\n" + "\n".join(changed)
 
-    return "❓ No entendí qué querés configurar. Podés decirme:\n• _\"mandame el Resumen Diario a las 7:20 am\"_\n• _\"agregá al Resumen Diario que me digas una frase motivadora\"_\n• _\"sacá el clima del Resumen Diario\"_"
+    # No hubo instrucción concreta — preguntar amablemente qué quiere configurar
+    extras_actuales = user_prefs.get("resumen_extras", [])
+    hora_actual = user_prefs.get("daily_summary_hour") or DAILY_SUMMARY_HOUR
+    mins_actual = user_prefs.get("daily_summary_minute") or 0
+    estado = f"Actualmente el Resumen Diario llega a las *{hora_actual:02d}:{mins_actual:02d}*"
+    if extras_actuales:
+        estado += f" e incluye: {', '.join(extras_actuales)}"
+    else:
+        estado += " sin extras configurados"
+    return f"¡Dale! ¿Qué querés modificar del Resumen Diario?\n\n{estado}\n\nPodés pedirme cosas como cambiar el horario, agregar que te cuente el clima de mañana, una frase del día, o lo que se te ocurra."
 
 # ── MÓDULO REUNIONES ──────────────────────────────────────────────────────────
 async def handle_reunion(text: str, image_b64: str = None, image_type: str = None) -> str:
@@ -1981,7 +2017,8 @@ async def process_message(message: dict):
             if not image_b64:
                 clarif = await needs_clarification(from_number, text,
                     "el usuario quiere crear un evento en Google Calendar. "
-                    "Necesitamos al menos fecha y título. Si falta la fecha o el nombre del evento, preguntar.")
+                    "Si el mensaje tiene un título claro Y una fecha (aunque sea relativa como 'mañana', 'el martes', 'el 29 de marzo') → CLEAR. "
+                    "Solo preguntar si falta tanto el título como la fecha, o si es completamente ambiguo.")
                 if clarif:
                     await send_message(from_number, clarif)
                     return
@@ -2046,15 +2083,20 @@ async def process_message(message: dict):
                 await send_message(from_number, format_evento(parsed, guardado))
 
         elif tipo == "EDITAR_EVENTO":
-            clarif = await needs_clarification(from_number, text,
-                "el usuario quiere editar un evento del calendario. "
-                f"Último evento tocado: {last_event_touched.get(from_number, {}).get('summary', 'ninguno')}. "
-                "Si no queda claro qué evento editar o qué cambiar, preguntar.")
-            if clarif:
-                await send_message(from_number, clarif)
-            else:
+            last_ev = last_event_touched.get(from_number, {}).get("summary", "")
+            # Si hay contexto reciente del último evento, no pedir aclaración — intentar directamente
+            if last_ev:
                 success, msg = await search_and_edit_evento(text, phone=from_number)
                 await send_message(from_number, msg if success else f"⚠️ {msg}")
+            else:
+                clarif = await needs_clarification(from_number, text,
+                    "el usuario quiere editar un evento del calendario pero no hay contexto reciente. "
+                    "Si no queda claro qué evento editar, preguntar cuál.")
+                if clarif:
+                    await send_message(from_number, clarif)
+                else:
+                    success, msg = await search_and_edit_evento(text, phone=from_number)
+                    await send_message(from_number, msg if success else f"⚠️ {msg}")
 
         elif tipo == "ELIMINAR_EVENTO":
             success, msg = await delete_evento(text)
