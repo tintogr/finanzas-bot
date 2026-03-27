@@ -1048,14 +1048,22 @@ Si hay ambigüedad → respondé solo la pregunta de aclaración más concisa y 
         return None
 
 # ── CLASIFICADOR ───────────────────────────────────────────────────────────────
-async def classify(text: str, has_image: bool, image_b64: str = None, image_type: str = None) -> str:
+async def classify(text: str, has_image: bool, image_b64: str = None, image_type: str = None, history: list = None) -> str:
     if has_image and not text.strip() and not image_b64:
         return "GASTO"
     content = []
     if image_b64:
         content.append({"type": "image", "source": {"type": "base64", "media_type": image_type or "image/jpeg", "data": image_b64}})
     prompt_text = text if text.strip() else "(ver imagen adjunta)"
-    content.append({"type": "text", "text": prompt_text})
+    # Incluir contexto de conversación reciente para clasificar mejor mensajes cortos o ambiguos
+    history_ctx = ""
+    if history and len(text.strip()) < 80:
+        recent = history[-10:] if len(history) >= 10 else history
+        history_ctx = "\nContexto reciente de la conversación:\n" + "\n".join(
+            f"{'Usuario' if m['role']=='user' else 'Matrics'}: {str(m['content'])[:120]}"
+            for m in recent
+        ) + "\n\nTeniendo en cuenta ese contexto, clasificá el siguiente mensaje:"
+    content.append({"type": "text", "text": history_ctx + "\n" + prompt_text if history_ctx else prompt_text})
     response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=10,
         # FIX #4 y #15: CONFIGURAR y SHOPPING corregidos
@@ -1209,65 +1217,38 @@ async def handle_chat(phone: str, text: str) -> str:
     if any(k in text_lower for k in ["de dónde","de donde","fuente","qué app","que app","cómo sabés","como sabes","qué modelo","que modelo"]):
         source_note = "\n\nSi te preguntan: los datos vienen de Open-Meteo, usando modelos meteorológicos ECMWF y GFS."
 
-    # Búsqueda web para plataformas de streaming y disponibilidad actual
-    streaming_context = ""
-    streaming_kw = ["plataforma","streaming","netflix","amazon","prime","disney","hbo","max","flow",
-                    "paramount","apple tv","dónde ver","donde ver","dónde está","donde está","justwatch"]
-    if any(k in text_lower for k in streaming_kw):
-        try:
-            # Extraer nombre de la peli/serie del historial reciente
-            search_query = text
-            if history:
-                last_assistant = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
-                if last_assistant:
-                    search_query = f"{text} {last_assistant[:100]}"
-            async with httpx.AsyncClient(timeout=6) as http_s:
-                r_s = await http_s.get(
-                    "https://www.justwatch.com/ar/buscar",
-                    params={"q": search_query[:80]},
-                    headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "es-AR"}
-                )
-                if r_s.status_code == 200 and "justwatch" in r_s.url.host:
-                    streaming_context = "\n\nNota: Para saber dónde ver algo ahora mismo en Argentina, recomendá JustWatch (justwatch.com/ar) — ahí está actualizado en tiempo real. No puedo consultar disponibilidad actual de streaming directamente."
-                else:
-                    streaming_context = "\n\nNota: La disponibilidad en plataformas de streaming cambia constantemente. Recomendá buscar en *JustWatch* (justwatch.com/ar) para Argentina, que muestra en tiempo real dónde está disponible."
-        except Exception:
-            streaming_context = "\n\nNota: Para disponibilidad actual en streaming en Argentina, recomendá *JustWatch* (justwatch.com/ar)."
 
-    # Detectar si la consulta requiere info actual (streaming, noticias, precios, eventos recientes, etc.)
-    needs_web = any(k in text_lower for k in [
-        "plataforma","streaming","netflix","amazon","prime","disney","hbo","max","flow","paramount",
-        "dónde ver","donde ver","está disponible","justwatch",
-        "precio","cotización","cotizacion","cuánto sale","cuanto sale",
-        "noticia","novedades","último","ultimo","recientemente","hoy salió","hoy salio",
-        "quién ganó","quien gano","resultado","score","partido",
-        "clima de","temperatura en","llueve en",
-    ])
-    if needs_web:
-        try:
-            web_resp = claude_create(
-                model="claude-sonnet-4-20250514", max_tokens=600,
-                system=f"Sos Matrics. Hoy: {now.strftime('%d/%m/%Y')}. Respondés en español rioplatense, conciso. Buscá info actualizada para responder.",
-                messages=history + [{"role": "user", "content": text}],
-                tools=[{"type": "web_search_20250305", "name": "web_search"}]
-            )
-            # Procesar resultado con tool use
-            reply_parts = []
-            for block in web_resp.content:
-                if hasattr(block, "text"):
-                    reply_parts.append(block.text)
-            reply = " ".join(reply_parts).strip() or web_resp.content[-1].text.strip()
+
+    # Siempre ofrecer web_search como tool disponible — Claude decide solo si la usa
+    try:
+        web_resp = claude_create(
+            model="claude-sonnet-4-20250514", max_tokens=800,
+            system=f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural en español rioplatense.
+Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
+Tenés acceso a búsqueda web — usala cuando el usuario pregunta algo que requiere info actual (disponibilidad de pelis/series, noticias, precios, resultados, clima de ciudades, etc.).
+Si no necesitás buscar, respondé directamente.
+IMPORTANTE: No inventes datos que no tenés. Si no sabés algo, decilo y buscá o recomendá dónde encontrarlo.{finance_context}{calendar_context}{weather_context}{source_note}""",
+            messages=history + [{"role": "user", "content": text}],
+            tools=[{"type": "web_search_20250305", "name": "web_search"}]
+        )
+        # Procesar respuesta que puede incluir tool_use blocks
+        reply_parts = []
+        for block in web_resp.content:
+            if hasattr(block, "text") and block.text:
+                reply_parts.append(block.text)
+        reply = " ".join(reply_parts).strip()
+        if reply:
             add_to_history(phone, "assistant", reply)
             return reply
-        except Exception:
-            pass  # Si falla web_search, continuar con respuesta normal
+    except Exception:
+        pass  # Si falla web_search (ej: plan sin acceso), continuar con respuesta normal
 
     response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=800,
         system=f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural.
 Usás español rioplatense. Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
 IMPORTANTE: Si no tenés datos concretos para responder, decilo directamente. No inventes información que no tenés.
-Para disponibilidad en plataformas de streaming: NO inventes ni supongas. Siempre decí que la disponibilidad cambia y recomendá JustWatch.{finance_context}{calendar_context}{weather_context}{source_note}{streaming_context}""",
+Para disponibilidad en plataformas de streaming: NO inventes ni supongas. Siempre decí que la disponibilidad cambia y recomendá JustWatch.{finance_context}{calendar_context}{weather_context}{source_note}""",
         messages=history + [{"role": "user", "content": text}]
     )
     reply = response.content[0].text.strip()
@@ -1972,7 +1953,7 @@ async def process_message(message: dict):
         if user_prefs.get("_config_page_id") is None:
             await load_user_config(from_number)
 
-        tipo = await classify(text, image_b64 is not None, image_b64, image_type)
+        tipo = await classify(text, image_b64 is not None, image_b64, image_type, history=get_history(from_number))
         exchange_rate = await get_exchange_rate()
 
         if tipo == "GASTO":
