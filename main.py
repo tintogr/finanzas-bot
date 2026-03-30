@@ -1071,8 +1071,8 @@ RECORDATORIO: "recordame en X tiempo", "avisame en X". NUNCA para cambios de hor
 EVENTO: crear un evento nuevo — turno, reunión, cumple, cita, viaje.
 SHOPPING: gestionar lista de compras o recetas.
 REUNION: notas o fotos de una reunión/llamada.
-CONFIGURAR: cambiar configuración de Matrics. Cualquier mensaje sobre cuándo llega el resumen → siempre CONFIGURAR.
-CHAT: cualquier pregunta, consulta o conversación. Si tiene "?" o pide información → CHAT.
+CONFIGURAR: cambiar configuración de Matrics. Solo cuando el usuario quiere CAMBIAR algo. Ej: "el resumen mandámelo a las 7", "cambiá el horario", "agregá una frase motivadora al resumen". Nunca cuando pregunta o se queja.
+CHAT: cualquier pregunta, consulta o conversación. Si tiene "?" o pide información → CHAT. Incluye preguntas sobre por qué no llegó el resumen, quejas, consultas sobre el estado del bot, etc.
 
 REGLA: si el mensaje PREGUNTA algo → siempre CHAT, nunca GASTO.
 
@@ -1172,6 +1172,57 @@ async def query_calendar(days_ahead: int = 2, days_back: int = 0) -> str | None:
                 lines.append(f"• {start.get('date', '')} — {e.get('summary', 'Evento')} (todo el día){loc_str}")
         return "\n".join(lines)
 
+async def get_gmail_summary() -> str | None:
+    access_token = await get_gcal_access_token()
+    if not access_token:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"q": "is:unread is:important newer_than:2d", "maxResults": 10}
+            )
+            if r.status_code != 200:
+                return None
+            messages = r.json().get("messages", [])
+            if not messages:
+                return None
+            mail_data = []
+            for msg in messages[:8]:
+                msg_r = await http.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg['id']}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]}
+                )
+                if msg_r.status_code == 200:
+                    headers = {h["name"]: h["value"] for h in msg_r.json().get("payload", {}).get("headers", [])}
+                    snippet = msg_r.json().get("snippet", "")
+                    mail_data.append({
+                        "from": headers.get("From", ""),
+                        "subject": headers.get("Subject", ""),
+                        "snippet": snippet[:200]
+                    })
+            if not mail_data:
+                return None
+            mail_text = "\n".join(
+                f"De: {m['from']}\nAsunto: {m['subject']}\nPreview: {m['snippet']}"
+                for m in mail_data
+            )
+            resp = claude_create(
+                model="claude-sonnet-4-20250514", max_tokens=300,
+                system="""Analizá estos mails no leídos e identificá solo los verdaderamente importantes.
+Importante: facturas/vencimientos, mails de personas conocidas que requieren respuesta, algo urgente.
+Ignorá: newsletters, notificaciones automáticas, publicidad, confirmaciones rutinarias.
+Si hay mails importantes, resumilos brevemente en español rioplatense, máx 3 líneas.
+Si no hay nada importante, respondé solo: NONE""",
+                messages=[{"role": "user", "content": mail_text}]
+            )
+            result = resp.content[0].text.strip()
+            return None if result == "NONE" else result
+    except Exception:
+        return None
+
 async def handle_chat(phone: str, text: str) -> str:
     history = get_history(phone)
     add_to_history(phone, "user", text)
@@ -1207,6 +1258,12 @@ async def handle_chat(phone: str, text: str) -> str:
     if any(k in text_lower for k in ["de dónde","de donde","fuente","qué app","que app","cómo sabés","como sabes","qué modelo","que modelo"]):
         source_note = "\n\nSi te preguntan: los datos vienen de Open-Meteo, usando modelos meteorológicos ECMWF y GFS."
 
+    gmail_context = ""
+    if any(k in text_lower for k in ["mail", "correo", "email", "gmail", "bandeja", "mensaje"]):
+        gmail_data = await get_gmail_summary()
+        if gmail_data:
+            gmail_context = f"\n\nMAILS IMPORTANTES NO LEÍDOS:\n{gmail_data}"
+
     try:
         web_resp = claude_create(
             model="claude-sonnet-4-20250514", max_tokens=800,
@@ -1214,7 +1271,7 @@ async def handle_chat(phone: str, text: str) -> str:
 Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
 Tenés acceso a búsqueda web — usala cuando el usuario pregunta algo que requiere info actual.
 Si no necesitás buscar, respondé directamente.
-IMPORTANTE: No inventes datos que no tenés.{finance_context}{calendar_context}{weather_context}{source_note}""",
+IMPORTANTE: No inventes datos que no tenés.{finance_context}{calendar_context}{weather_context}{gmail_context}{source_note}""",
             messages=history + [{"role": "user", "content": text}],
             tools=[{"type": "web_search_20250305", "name": "web_search"}]
         )
@@ -1233,7 +1290,7 @@ IMPORTANTE: No inventes datos que no tenés.{finance_context}{calendar_context}{
         model="claude-sonnet-4-20250514", max_tokens=800,
         system=f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural.
 Usás español rioplatense. Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
-IMPORTANTE: Si no tenés datos concretos, decilo directamente. No inventes información.{finance_context}{calendar_context}{weather_context}{source_note}""",
+IMPORTANTE: Si no tenés datos concretos, decilo directamente. No inventes información.{finance_context}{calendar_context}{weather_context}{gmail_context}{source_note}""",
         messages=history + [{"role": "user", "content": text}]
     )
     reply = response.content[0].text.strip()
@@ -2168,6 +2225,7 @@ def format_recordatorio(data: dict) -> str:
 # ── CRON JOB ───────────────────────────────────────────────────────────────────
 @app.get("/cron")
 async def cron_job():
+    await load_user_config(MY_NUMBER)
     access_token = await get_gcal_access_token()
     if not access_token:
         return {"ok": False, "reason": "no gcal token"}
@@ -2303,6 +2361,11 @@ async def send_daily_summary(http, access_token: str, now: datetime):
                     lines.append(f"• {start['dateTime'][11:16]} — {e.get('summary', 'Evento')}{loc_str}")
                 else:
                     lines.append(f"• {e.get('summary', 'Evento')} (todo el día){loc_str}")
+    gmail_summary = await get_gmail_summary()
+    if gmail_summary:
+        lines.append("")
+        lines.append(f"📬 *Mails importantes:*\n{gmail_summary}")
+
     extras = user_prefs.get("resumen_extras", [])
     if extras:
         try:
