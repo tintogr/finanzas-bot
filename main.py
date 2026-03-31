@@ -1377,6 +1377,7 @@ async def buscar_gastos(query: str, mes: str = None) -> str:
         return f"Error: {str(e)[:100]}"
 
 
+async def handle_chat(phone: str, text: str) -> str:
     history = get_history(phone)
     add_to_history(phone, "user", text)
     now = now_argentina()
