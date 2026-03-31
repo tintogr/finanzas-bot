@@ -1251,44 +1251,57 @@ async def get_gmail_summary(query_hint: str = None) -> str | None:
                 return None
 
             mail_data = []
-            for msg in messages[:8]:  # máx 8 mails
+            for msg in messages[:15]:
+                # Primero solo metadata para no bajar todo el HTML
                 msg_r = await http.get(
                     f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg['id']}",
                     headers=headers,
-                    params={"format": "full"}
+                    params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]}
                 )
                 if msg_r.status_code != 200:
                     continue
-                msg_data = msg_r.json()
-                hdrs = {h["name"]: h["value"] for h in msg_data.get("payload", {}).get("headers", [])}
-                snippet = msg_data.get("snippet", "")
+                msg_meta = msg_r.json()
+                hdrs = {h["name"]: h["value"] for h in msg_meta.get("payload", {}).get("headers", [])}
+                snippet = msg_meta.get("snippet", "")[:300]
 
-                # Buscar PDFs adjuntos
+                # Solo bajar el cuerpo completo si parece factura/comprobante
+                invoice_keywords = ["factura", "comprobante", "invoice", "vencimiento", "pago", "importe", "total"]
+                subject_lower = hdrs.get("Subject", "").lower()
+                is_invoice = any(k in subject_lower or k in snippet.lower() for k in invoice_keywords)
+
                 pdf_texts = []
-                parts = msg_data.get("payload", {}).get("parts", [])
-                for part in parts[:5]:  # máx 5 partes por mail
-                    mime = part.get("mimeType", "")
-                    filename = part.get("filename", "")
-                    is_pdf = mime == "application/pdf" or (mime == "application/octet-stream" and filename.lower().endswith(".pdf"))
-                    if is_pdf:
-                        attachment_id = part.get("body", {}).get("attachmentId")
-                        if attachment_id:
-                            try:
-                                att_r = await http.get(
-                                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg['id']}/attachments/{attachment_id}",
-                                    headers=headers
-                                )
-                                if att_r.status_code == 200:
-                                    pdf_b64 = att_r.json().get("data", "").replace("-", "+").replace("_", "/")
-                                    if pdf_b64:
-                                        pdf_texts.append(pdf_b64)
-                            except Exception:
-                                pass
+                if is_invoice:
+                    full_r = await http.get(
+                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg['id']}",
+                        headers=headers,
+                        params={"format": "full"}
+                    )
+                    if full_r.status_code == 200:
+                        parts = full_r.json().get("payload", {}).get("parts", [])
+                        for part in parts[:5]:
+                            mime = part.get("mimeType", "")
+                            filename = part.get("filename", "")
+                            is_pdf = mime == "application/pdf" or (mime == "application/octet-stream" and filename.lower().endswith(".pdf"))
+                            if is_pdf:
+                                attachment_id = part.get("body", {}).get("attachmentId")
+                                if attachment_id:
+                                    try:
+                                        att_r = await http.get(
+                                            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg['id']}/attachments/{attachment_id}",
+                                            headers=headers
+                                        )
+                                        if att_r.status_code == 200:
+                                            pdf_b64 = att_r.json().get("data", "").replace("-", "+").replace("_", "/")
+                                            if pdf_b64:
+                                                pdf_texts.append(pdf_b64)
+                                                break  # 1 PDF por mail alcanza
+                                    except Exception:
+                                        pass
 
                 mail_data.append({
                     "from": hdrs.get("From", ""),
                     "subject": hdrs.get("Subject", ""),
-                    "snippet": snippet[:300],
+                    "snippet": snippet,
                     "pdf_attachments": pdf_texts
                 })
 
@@ -1459,10 +1472,25 @@ async def handle_chat(phone: str, text: str) -> str:
 
     system = f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural en español rioplatense.
 Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
-Tenés herramientas disponibles — usalas cuando el usuario necesite información real (agenda, finanzas, clima, mails, info actual de internet).
-Podés usar varias herramientas en el mismo turno si el mensaje lo requiere.
-Si no necesitás herramientas, respondé directamente.
-IMPORTANTE: No inventes datos que no tenés."""
+
+Tenés acceso a información real del usuario a través de herramientas:
+- Su calendario de Google (eventos, turnos, agenda)
+- Sus finanzas en Notion (gastos e ingresos registrados, por categoría o por nombre)
+- Su Gmail (mails recibidos, facturas, comprobantes, comunicaciones)
+- El clima actual y pronóstico
+- Búsqueda web para información externa
+
+Antes de responder cualquier pregunta, pensá qué fuentes son relevantes y consultá todas las que hagan falta.
+
+RAZONAMIENTO IMPORTANTE para preguntas sobre pagos de servicios:
+1. Buscá la factura en Gmail para saber el monto exacto que debería haberse pagado
+2. Buscá en Notion usando MÚLTIPLES términos: el nombre de la empresa (ej: "CALF") Y el tipo de servicio (ej: "luz", "electricidad") Y variantes posibles
+3. Si encontrás un pago en Notion con monto parecido al de la factura, asumí que corresponde al mismo gasto aunque el nombre sea diferente
+4. Si el monto registrado difiere del de la factura, mencionalo y ofrecé corregirlo
+5. Si no encontrás ningún pago relacionado, decí que no aparece registrado
+
+Podés usar varias herramientas en el mismo turno. No respondas hasta tener la información necesaria.
+IMPORTANTE: No inventes datos. Si no encontrás info en ninguna fuente, decilo claramente."""
 
     messages = history + [{"role": "user", "content": text}]
 
