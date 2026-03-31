@@ -1251,7 +1251,7 @@ async def get_gmail_summary(query_hint: str = None) -> str | None:
                 return None
 
             mail_data = []
-            for msg in messages[:10]:
+            for msg in messages[:8]:  # máx 8 mails
                 msg_r = await http.get(
                     f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg['id']}",
                     headers=headers,
@@ -1266,7 +1266,7 @@ async def get_gmail_summary(query_hint: str = None) -> str | None:
                 # Buscar PDFs adjuntos
                 pdf_texts = []
                 parts = msg_data.get("payload", {}).get("parts", [])
-                for part in parts:
+                for part in parts[:5]:  # máx 5 partes por mail
                     mime = part.get("mimeType", "")
                     filename = part.get("filename", "")
                     is_pdf = mime == "application/pdf" or (mime == "application/octet-stream" and filename.lower().endswith(".pdf"))
@@ -1312,7 +1312,7 @@ Mails:
 
             # Agregar PDFs como imágenes/documentos
             for m in mail_data:
-                for pdf_b64 in m["pdf_attachments"][:2]:  # máx 2 PDFs por mail
+                for pdf_b64 in m["pdf_attachments"][:1]:  # máx 1 PDF por mail
                     try:
                         content.append({
                             "type": "document",
@@ -1419,11 +1419,24 @@ async def handle_chat(phone: str, text: str) -> str:
         },
         {
             "name": "consultar_gmail",
-            "description": "Consulta los mails del último mes. Usá cuando el usuario pregunta sobre emails, facturas recibidas, montos a pagar, vencimientos, si le escribieron, servicios (luz, gas, internet, teléfono), etc. También usá junto con buscar_gastos cuando preguntan cuánto deberían haber pagado vs cuánto pagaron.",
+            "description": "Consulta los mails importantes no leídos de los últimos 2 días. Usá cuando el usuario pregunta sobre emails, correos, facturas recibidas, si le escribieron, notificaciones importantes, etc.",
             "input_schema": {
                 "type": "object",
                 "properties": {},
                 "required": []
+            }
+        },
+        {
+            "name": "corregir_gasto",
+            "description": "Corrige el monto u otros campos de un gasto ya registrado en Notion. Usá cuando el usuario confirma que querés corregir algo, o cuando encontrás una diferencia entre una factura y lo registrado y el usuario pide corregirlo.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": "string", "description": "Nombre o parte del nombre del gasto a corregir. Ej: 'luz', 'CALF', 'Movistar'"},
+                    "new_value_ars": {"type": "number", "description": "Nuevo monto en ARS"},
+                    "mes": {"type": "string", "description": "Mes en formato YYYY-MM. Si no se especifica usa el mes actual."}
+                },
+                "required": ["search_term", "new_value_ars"]
             }
         },
         {
@@ -1446,25 +1459,10 @@ async def handle_chat(phone: str, text: str) -> str:
 
     system = f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural en español rioplatense.
 Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
-
-Tenés acceso a información real del usuario a través de herramientas:
-- Su calendario de Google (eventos, turnos, agenda)
-- Sus finanzas en Notion (gastos e ingresos registrados, por categoría o por nombre)
-- Su Gmail (mails recibidos, facturas, comprobantes, comunicaciones)
-- El clima actual y pronóstico
-- Búsqueda web para información externa
-
-Antes de responder cualquier pregunta, pensá qué fuentes son relevantes y consultá todas las que hagan falta.
-
-RAZONAMIENTO IMPORTANTE para preguntas sobre pagos de servicios:
-1. Buscá la factura en Gmail para saber el monto exacto que debería haberse pagado
-2. Buscá en Notion usando MÚLTIPLES términos: el nombre de la empresa (ej: "CALF") Y el tipo de servicio (ej: "luz", "electricidad") Y variantes posibles
-3. Si encontrás un pago en Notion con monto parecido al de la factura, asumí que corresponde al mismo gasto aunque el nombre sea diferente
-4. Si el monto registrado difiere del de la factura, mencionalo y ofrecé corregirlo
-5. Si no encontrás ningún pago relacionado, decí que no aparece registrado
-
-Podés usar varias herramientas en el mismo turno. No respondas hasta tener la información necesaria.
-IMPORTANTE: No inventes datos. Si no encontrás info en ninguna fuente, decilo claramente."""
+Tenés herramientas disponibles — usalas cuando el usuario necesite información real (agenda, finanzas, clima, mails, info actual de internet).
+Podés usar varias herramientas en el mismo turno si el mensaje lo requiere.
+Si no necesitás herramientas, respondé directamente.
+IMPORTANTE: No inventes datos que no tenés."""
 
     messages = history + [{"role": "user", "content": text}]
 
@@ -1504,6 +1502,47 @@ IMPORTANTE: No inventes datos. Si no encontrás info en ninguna fuente, decilo c
             elif tool_name == "consultar_finanzas":
                 mes = tool_input.get("mes") or now.strftime("%Y-%m")
                 result = await query_finances(mes) or f"No hay registros para {mes}."
+
+            elif tool_name == "corregir_gasto":
+                search_term = tool_input.get("search_term", "")
+                new_value = tool_input.get("new_value_ars")
+                mes = tool_input.get("mes") or now.strftime("%Y-%m")
+                year, mon = map(int, mes.split("-"))
+                from calendar import monthrange as mr
+                last_day = mr(year, mon)[1]
+                try:
+                    async with httpx.AsyncClient() as http:
+                        r = await http.post(
+                            f"https://api.notion.com/v1/databases/{NOTION_DB_ID.replace('-','')}/query",
+                            headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
+                            json={
+                                "filter": {"and": [
+                                    {"property": "Date", "date": {"on_or_after": f"{mes}-01"}},
+                                    {"property": "Date", "date": {"on_or_before": f"{mes}-{last_day:02d}"}},
+                                    {"property": "Name", "title": {"contains": search_term[:30]}}
+                                ]},
+                                "sorts": [{"property": "Date", "direction": "descending"}],
+                                "page_size": 1
+                            }
+                        )
+                        if r.status_code == 200 and r.json().get("results"):
+                            page = r.json()["results"][0]
+                            page_id = page["id"]
+                            old_name = page["properties"]["Name"]["title"][0]["plain_text"] if page["properties"]["Name"]["title"] else search_term
+                            old_value = page["properties"].get("Value (ars)", {}).get("number", 0) or 0
+                            upd = await http.patch(
+                                f"https://api.notion.com/v1/pages/{page_id}",
+                                headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
+                                json={"properties": {"Value (ars)": {"number": float(new_value)}}}
+                            )
+                            if upd.status_code == 200:
+                                result = f"Corrección exitosa: '{old_name}' actualizado de ${old_value:,.0f} a ${new_value:,.0f} ARS."
+                            else:
+                                result = f"Error actualizando en Notion: {upd.text[:100]}"
+                        else:
+                            result = f"No encontré ningún gasto llamado '{search_term}' en {mes}."
+                except Exception as e:
+                    result = f"Error: {str(e)[:100]}"
 
             elif tool_name == "buscar_gastos":
                 query = tool_input.get("query", "")
@@ -2086,6 +2125,31 @@ Aplicá la corrección y devolvé la lista corregida como array JSON simple:
             )
         else:
             await send_message(phone, "👍 Receta no guardada.")
+        return True
+
+    if state_type == "chat_correction":
+        # Usuario confirmó corrección ofrecida por Claude en CHAT
+        page_id   = state.get("page_id")
+        old_value = state.get("old_value")
+        new_value = state.get("new_value")
+        name      = state.get("name", "gasto")
+        del pending_state[phone]
+        if text.strip().lower() in ["si", "sí", "dale", "ok", "yes", "corregilo", "corregí", "corrigelo"]:
+            if page_id and new_value:
+                async with httpx.AsyncClient() as http:
+                    r = await http.patch(
+                        f"https://api.notion.com/v1/pages/{page_id}",
+                        headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
+                        json={"properties": {"Value (ars)": {"number": float(new_value)}}}
+                    )
+                if r.status_code == 200:
+                    await send_message(phone, f"✅ *{name}* corregido: ${old_value:,.0f} → *${new_value:,.0f} ARS*")
+                else:
+                    await send_message(phone, f"❌ No pude corregir: {r.text[:100]}")
+            else:
+                await send_message(phone, "❌ No tengo suficiente info para hacer la corrección.")
+        else:
+            await send_message(phone, "👍 Quedó como estaba.")
         return True
 
     if state_type == "confirm_service_providers":
