@@ -314,12 +314,12 @@ Emoji: elegí el más específico según el contexto real."""
 
     # Si Claude pide info adicional (no usa tool)
     if response.stop_reason == "end_turn":
-        return next((b.text for b in response.content if hasattr(b, "text")), "❌ Error procesando").strip()
+        return next((b.text for b in response.content if hasattr(b, "text") and b.text), "❌ Error procesando").strip()
 
     # Claude usó la tool
     tool_block = next((b for b in response.content if b.type == "tool_use"), None)
     if not tool_block:
-        return next((b.text for b in response.content if hasattr(b, "text")), "❌ Error procesando").strip()
+        return next((b.text for b in response.content if hasattr(b, "text") and b.text), "❌ Error procesando").strip()
 
     data = dict(tool_block.input)
     final_cats, cat_note = await check_and_apply_category(data.get("name", ""), data.get("categoria", []))
@@ -355,7 +355,7 @@ Emoji: elegí el más específico según el contexto real."""
         messages=messages,
         tools=tools
     )
-    reply = next((b.text for b in final_response.content if hasattr(b, "text")), "").strip()
+    reply = next((b.text for b in final_response.content if hasattr(b, "text") and b.text), "").strip()
 
     # Follow-up nafta (mantiene comportamiento actual)
     if success and page_id:
@@ -1267,7 +1267,10 @@ async def get_gmail_summary(query_hint: str = None) -> str | None:
                 pdf_texts = []
                 parts = msg_data.get("payload", {}).get("parts", [])
                 for part in parts:
-                    if part.get("mimeType") == "application/pdf":
+                    mime = part.get("mimeType", "")
+                    filename = part.get("filename", "")
+                    is_pdf = mime == "application/pdf" or (mime == "application/octet-stream" and filename.lower().endswith(".pdf"))
+                    if is_pdf:
                         attachment_id = part.get("body", {}).get("attachmentId")
                         if attachment_id:
                             try:
@@ -1332,7 +1335,48 @@ Mails:
     except Exception:
         return None
 
-async def handle_chat(phone: str, text: str) -> str:
+async def buscar_gastos(query: str, mes: str = None) -> str:
+    """Busca entradas individuales en Finances por nombre."""
+    now = now_argentina()
+    if not mes:
+        mes = now.strftime("%Y-%m")
+    year, mon = map(int, mes.split("-"))
+    from calendar import monthrange
+    last_day = monthrange(year, mon)[1]
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.post(
+                f"https://api.notion.com/v1/databases/{NOTION_DB_ID.replace('-','')}/query",
+                headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
+                json={
+                    "filter": {"and": [
+                        {"property": "Date", "date": {"on_or_after": f"{mes}-01"}},
+                        {"property": "Date", "date": {"on_or_before": f"{mes}-{last_day:02d}"}},
+                        {"property": "Name", "title": {"contains": query[:30]}}
+                    ]},
+                    "sorts": [{"property": "Date", "direction": "descending"}],
+                    "page_size": 10
+                }
+            )
+            if r.status_code != 200:
+                return "Error consultando Notion."
+            results = r.json().get("results", [])
+            if not results:
+                return f"No encontré gastos que contengan '{query}' en {mes}."
+            lines = []
+            for page in results:
+                props = page.get("properties", {})
+                name = props.get("Name", {}).get("title", [{}])[0].get("plain_text", "?") if props.get("Name", {}).get("title") else "?"
+                value = props.get("Value (ars)", {}).get("number", 0) or 0
+                date = (props.get("Date", {}).get("date") or {}).get("start", "")[:10]
+                in_out = (props.get("In - Out", {}).get("select") or {}).get("name", "")
+                direction = "INGRESO" if "INGRESO" in in_out else "EGRESO"
+                lines.append(f"• {date} — {name}: ${value:,.0f} ({direction})")
+            return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {str(e)[:100]}"
+
+
     history = get_history(phone)
     add_to_history(phone, "user", text)
     now = now_argentina()
@@ -1382,6 +1426,18 @@ async def handle_chat(phone: str, text: str) -> str:
             }
         },
         {
+            "name": "buscar_gastos",
+            "description": "Busca entradas individuales de gastos/ingresos en Notion por nombre. Usá cuando el usuario pregunta si pagó algo específico, si hay un gasto de una empresa concreta, si registró tal o cual pago, etc.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Nombre o parte del nombre a buscar. Ej: 'CALF', 'Movistar', 'alquiler'"},
+                    "mes": {"type": "string", "description": "Mes a consultar en formato YYYY-MM. Si no se especifica, usa el mes actual."}
+                },
+                "required": ["query"]
+            }
+        },
+        {
             "type": "web_search_20250305",
             "name": "web_search"
         }
@@ -1409,7 +1465,7 @@ IMPORTANTE: No inventes datos que no tenés."""
 
     # Si no usó tools, devolver respuesta directa
     if response.stop_reason == "end_turn":
-        reply = next((b.text for b in response.content if hasattr(b, "text")), "").strip()
+        reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "").strip()
         add_to_history(phone, "assistant", reply)
         return reply
 
@@ -1432,6 +1488,11 @@ IMPORTANTE: No inventes datos que no tenés."""
             elif tool_name == "consultar_finanzas":
                 mes = tool_input.get("mes") or now.strftime("%Y-%m")
                 result = await query_finances(mes) or f"No hay registros para {mes}."
+
+            elif tool_name == "buscar_gastos":
+                query = tool_input.get("query", "")
+                mes = tool_input.get("mes") or now.strftime("%Y-%m")
+                result = await buscar_gastos(query, mes)
 
             elif tool_name == "consultar_clima":
                 w = await get_weather()
@@ -1480,7 +1541,7 @@ IMPORTANTE: No inventes datos que no tenés."""
         })
 
     if not tool_results:
-        reply = next((b.text for b in response.content if hasattr(b, "text")), "").strip()
+        reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "").strip()
         add_to_history(phone, "assistant", reply)
         return reply
 
@@ -1497,9 +1558,9 @@ IMPORTANTE: No inventes datos que no tenés."""
             messages=messages,
             tools=tools
         )
-        reply = next((b.text for b in final_response.content if hasattr(b, "text")), "").strip()
+        reply = next((b.text for b in final_response.content if hasattr(b, "text") and b.text), "").strip()
     except Exception:
-        reply = next((b.text for b in response.content if hasattr(b, "text")), "❌ Error procesando").strip()
+        reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "❌ Error procesando").strip()
 
     add_to_history(phone, "assistant", reply)
     return reply
