@@ -1395,6 +1395,16 @@ async def handle_chat(phone: str, text: str) -> str:
     add_to_history(phone, "user", text)
     now = now_argentina()
 
+    # Armar contexto del usuario desde su config en Notion
+    user_context_parts = []
+    providers = user_prefs.get("service_providers", {})
+    if providers:
+        prov_str = ", ".join(f"{k}: {v}" for k, v in providers.items())
+        user_context_parts.append(f"Proveedores de servicios: {prov_str}.")
+    if user_prefs.get("greeting_name"):
+        user_context_parts.append(f"Nombre del usuario: {user_prefs['greeting_name']}.")
+    user_context = "\n".join(user_context_parts)
+
     tools = [
         {
             "name": "consultar_calendario",
@@ -1472,6 +1482,8 @@ async def handle_chat(phone: str, text: str) -> str:
 
     system = f"""Sos Matrics, asistente personal en WhatsApp. Respondés conciso y natural en español rioplatense.
 Hoy: {now.strftime("%d/%m/%Y")} {now.strftime("%H:%M")}.
+{user_context}
+Si el usuario pregunta algo que ya sabés por su configuración, respondé directamente sin usar herramientas.
 
 Tenés acceso a información real del usuario a través de herramientas:
 - Su calendario de Google (eventos, turnos, agenda)
