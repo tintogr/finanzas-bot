@@ -290,13 +290,16 @@ async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=N
         content.append({"type": "image", "source": {"type": "base64", "media_type": image_type, "data": image_b64}})
     content.append({"type": "text", "text": text or "(ver imagen adjunta)"})
 
+    history = get_history(phone)
+
     system = f"""Sos Matrics, asistente personal por WhatsApp. Hablas en espanol rioplatense, natural y conciso.
 Hoy: {now.strftime("%Y-%m-%d")} {now.strftime("%H:%M")}. Tasa dolar blue: ${exchange_rate:,.0f} ARS/USD.
 
 Tu tarea: registrar gastos e ingresos del usuario.
 - Si el mensaje tiene descripcion Y monto -> usa la tool registrar_gasto directamente.
-- Si falta el monto u otra info esencial -> pregunta de forma natural y breve, sin registrar nada.
-- Si hay ambiguedad (ej: "compre algo") -> pregunta que fue y cuanto.
+- Si hay una imagen (ticket, screenshot de pedido, factura) -> lee TODOS los items, suma los montos vos mismo, y registra el total. No le pidas al usuario que sume.
+- Si falta el monto Y no hay imagen de donde sacarlo -> pregunta de forma natural y breve.
+- Si hay ambiguedad (ej: "compre algo" sin monto ni imagen) -> pregunta que fue y cuanto.
 
 Categorias disponibles: Supermercado, Sueldo, Servicios, Transporte, Vianda, Salud, Salud Mental, Salida, Birra, Ocio, Compras, Depto, Plantas, Viajes, Venta.
 Servicios = pagos recurrentes (alquiler, luz, gas, internet, streaming, gimnasio). Depto = compras fisicas para el depto (muebles, materiales, herramientas).
@@ -308,16 +311,22 @@ Emoji: elegi el mas especifico segun el contexto real."""
     response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=1000,
         system=system,
-        messages=[{"role": "user", "content": content}],
+        messages=history + [{"role": "user", "content": content}],
         tools=tools
     )
 
     if response.stop_reason == "end_turn":
-        return next((b.text for b in response.content if hasattr(b, "text") and b.text), "Error procesando").strip()
+        reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "Error procesando").strip()
+        add_to_history(phone, "user", text)
+        add_to_history(phone, "assistant", reply)
+        return reply
 
     tool_block = next((b for b in response.content if b.type == "tool_use"), None)
     if not tool_block:
-        return next((b.text for b in response.content if hasattr(b, "text") and b.text), "Error procesando").strip()
+        reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "Error procesando").strip()
+        add_to_history(phone, "user", text)
+        add_to_history(phone, "assistant", reply)
+        return reply
 
     data = dict(tool_block.input)
     final_cats, cat_note = await check_and_apply_category(data.get("name", ""), data.get("categoria", []))
@@ -362,6 +371,8 @@ Emoji: elegi el mas especifico segun el contexto real."""
             pending_state[phone] = {"type": "litros_followup", "page_id": page_id, "name": data["name"]}
             reply += "\n\n⛽ Cuantos litros cargaste?"
 
+    add_to_history(phone, "user", text)
+    add_to_history(phone, "assistant", reply)
     return reply
 
 
@@ -1357,6 +1368,7 @@ RAZONAMIENTO IMPORTANTE para preguntas sobre pagos de servicios:
 3. Si encontras un pago en Notion con monto parecido al de la factura, asumi que corresponde al mismo gasto aunque el nombre sea diferente
 4. Si el monto registrado difiere del de la factura, mencionalo y ofrece corregirlo
 5. Si no encontras ningun pago relacionado, deci que no aparece registrado
+6. Si mencionaste facturas pendientes y el usuario dice que ya las pago, busca en Notion para verificar antes de pedir montos
 
 Podes usar varias herramientas en el mismo turno. No respondas hasta tener la informacion necesaria.
 IMPORTANTE: No inventes datos. Si no encontras info en ninguna fuente, decilo claramente."""
@@ -1620,7 +1632,7 @@ IMPORTANTE: No inventes datos. Usa zona horaria Argentina (UTC-3)."""
         content.append({"type": "image", "source": {"type": "base64", "media_type": image_type or "image/jpeg", "data": image_b64}})
     content.append({"type": "text", "text": text or "(ver imagen adjunta)"})
 
-    messages = [{"role": "user", "content": content}]
+    messages = get_history(phone) + [{"role": "user", "content": content}]
 
     try:
         response = claude_create(
@@ -1631,7 +1643,10 @@ IMPORTANTE: No inventes datos. Usa zona horaria Argentina (UTC-3)."""
         return "Error procesando tu mensaje. Intenta de nuevo."
 
     if response.stop_reason == "end_turn":
-        return next((b.text for b in response.content if hasattr(b, "text") and b.text), "").strip()
+        reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "").strip()
+        add_to_history(phone, "user", text)
+        add_to_history(phone, "assistant", reply)
+        return reply
 
     tool_results = []
     evento_creado = None
@@ -1789,8 +1804,12 @@ IMPORTANTE: No inventes datos. Usa zona horaria Argentina (UTC-3)."""
                 {"id": "rem_no", "title": "No gracias"},
             ]
         )
+        add_to_history(phone, "user", text)
+        add_to_history(phone, "assistant", reply)
         return None
 
+    add_to_history(phone, "user", text)
+    add_to_history(phone, "assistant", reply)
     return reply
 
 
