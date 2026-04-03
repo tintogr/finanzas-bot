@@ -2912,6 +2912,44 @@ async def cron_job():
     return {"ok": True, "fired": fired, "time": now.strftime("%H:%M")}
 
 
+async def query_servicios_mes(month: str = None) -> str:
+    """Devuelve entradas individuales de categoria Servicios del mes."""
+    now = now_argentina()
+    if not month:
+        month = now.strftime("%Y-%m")
+    year, mon = map(int, month.split("-"))
+    last_day = monthrange(year, mon)[1]
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.post(
+                f"https://api.notion.com/v1/databases/{NOTION_DB_ID.replace('-','')}/query",
+                headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
+                json={
+                    "filter": {"and": [
+                        {"property": "Date", "date": {"on_or_after": f"{month}-01"}},
+                        {"property": "Date", "date": {"on_or_before": f"{month}-{last_day:02d}"}},
+                        {"property": "Category", "multi_select": {"contains": "Servicios"}}
+                    ]},
+                    "sorts": [{"property": "Date", "direction": "descending"}],
+                    "page_size": 30
+                }
+            )
+            if r.status_code != 200:
+                return "Error consultando Notion."
+            results = r.json().get("results", [])
+            if not results:
+                return f"No hay pagos de Servicios registrados en {month}."
+            lines = [f"Pagos de Servicios registrados en {month}:"]
+            for page in results:
+                props = page.get("properties", {})
+                name = props.get("Name", {}).get("title", [{}])[0].get("plain_text", "?") if props.get("Name", {}).get("title") else "?"
+                value = props.get("Value (ars)", {}).get("number", 0) or 0
+                date_val = (props.get("Date", {}).get("date") or {}).get("start", "")[:10]
+                lines.append(f"- {date_val} -- {name}: ${value:,.0f}")
+            return "\n".join(lines)
+    except Exception:
+        return "Error consultando pagos de servicios."
+                        
 async def send_daily_summary(http, access_token: str, now: datetime):
     r = await http.get(
         "https://www.googleapis.com/calendar/v3/calendars/primary/events",
@@ -2979,7 +3017,7 @@ async def send_daily_summary(http, access_token: str, now: datetime):
     # Facturas: cruzar Gmail con Notion antes de mostrar
     gmail_summary = await get_gmail_summary()
     if gmail_summary:
-        finances_context = await query_finances(now.strftime("%Y-%m"))
+        finances_context = await query_servicios_mes(now.strftime("%Y-%m"))
         filtered_gmail = gmail_summary
         if finances_context:
             try:
