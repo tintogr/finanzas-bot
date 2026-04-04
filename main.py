@@ -390,7 +390,7 @@ def wind_description(kmh: float) -> str:
     if kmh < 89:  return "Viento muy fuerte"
     return "Temporal"
 
-async def get_weather() -> dict | None:
+async def get_weather(days: int = 2) -> dict | None:
     try:
         lat, lon = get_current_location()
         async with httpx.AsyncClient(timeout=5) as http:
@@ -401,7 +401,7 @@ async def get_weather() -> dict | None:
                     "current": "temperature_2m,apparent_temperature,precipitation,windspeed_10m,weathercode",
                     "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max,weathercode",
                     "timezone": "America/Argentina/Buenos_Aires",
-                    "forecast_days": 2
+                    "forecast_days": max(days, 7)
                 }
             )
             if r.status_code != 200:
@@ -413,6 +413,18 @@ async def get_weather() -> dict | None:
             viento = round(c["windspeed_10m"])
             desc_manana, emoji_manana = WMO_CODES.get(d["weathercode"][1], ("Variable", "🌡️"))
             viento_manana = round(d["windspeed_10m_max"][1])
+            # Build 7-day forecast list
+            forecast_days = []
+            for i in range(min(7, len(d["weathercode"]))):
+                fd, fe = WMO_CODES.get(d["weathercode"][i], ("Variable", "🌡️"))
+                forecast_days.append({
+                    "date": d.get("time", [""] * 7)[i] if "time" in d else "",
+                    "max": round(d["temperature_2m_max"][i]),
+                    "min": round(d["temperature_2m_min"][i]),
+                    "lluvia": d["precipitation_sum"][i],
+                    "desc": fd,
+                    "emoji": fe,
+                })
             return {
                 "temp":           round(c["temperature_2m"]),
                 "sensacion":      round(c["apparent_temperature"]),
@@ -433,6 +445,7 @@ async def get_weather() -> dict | None:
                 "manana_desc":    desc_manana,
                 "manana_emoji":   emoji_manana,
                 "manana_wind_desc": wind_description(viento_manana),
+                "forecast_days":  forecast_days,
             }
     except Exception:
         return None
@@ -1498,7 +1511,7 @@ async def handle_chat(phone: str, text: str) -> str:
     noc_en = user_prefs.get("resumen_nocturno_enabled", True)
     user_context_parts.append(f"Resumen nocturno: {'activado' if noc_en else 'desactivado'} a las {int(noc_h):02d}:00.")
     # Ubicacion: siempre incluir, indicando si es real o default
-    if current_location.get("source") in ("owntracks", "restored", "whatsapp"):
+    if current_location.get("source") == "owntracks":
         place = is_at_known_place()
         if place:
             user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): {place['name']}.")
@@ -2566,6 +2579,17 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
             await send_message(phone, "Quedo como estaba.")
         return True
 
+    if state_type == "geo_reminder_fired":
+        page_id = state.get("page_id")
+        name = state.get("name", "Recordatorio")
+        del pending_state[phone]
+        if text.strip() == "geo_done":
+            await deactivate_geo_reminder(page_id)
+            await send_message(phone, f"✅ _{name}_ desactivado.")
+        else:
+            await send_message(phone, "Ok, te sigo avisando cuando estes cerca.")
+        return True
+
     if state_type == "geo_reminder_awaiting_location":
         description = state.get("description", "Recordatorio")
         recurrent = state.get("recurrent", False)
@@ -2674,18 +2698,13 @@ async def handle_geo_reminder(phone: str, text: str) -> str:
     response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=300,
         system=f"""Extrae info de un recordatorio geolocalizacion. Hoy: {now.strftime("%Y-%m-%d")}.
-
-TIPOS:
-- "shop": cuando el usuario menciona un TIPO de comercio generico o un nombre de cadena/local. Ej: "ferreteria", "farmacia", "La Anonima", "cualquier super". En este caso shop_name es el tipo o nombre del comercio.
-- "place": cuando el usuario menciona un LUGAR ESPECIFICO con direccion o persona. Ej: "casa de Pili", "Av. San Martin 123", "el trabajo de Juan".
-
 Responde SOLO JSON valido sin markdown:
-{{"description": "que recordar (accion que tiene que hacer)",
+{{"description": "que recordar",
   "type": "place" o "shop",
-  "shop_name": "tipo o nombre del comercio si type es shop (ej: 'ferreteria', 'farmacia', 'La Anonima'), null si type es place",
-  "address": "direccion exacta si la menciona, null si no",
-  "recurrent": true si quiere que le avise CADA VEZ que pase, false si es una sola vez,
-  "needs_location": true SOLO si type es place Y no hay direccion}}""",
+  "shop_name": "nombre del comercio si es tipo shop, null si no",
+  "address": "direccion si la menciona, null si no",
+  "recurrent": true si es algo que se repite cada vez que pasa, false si es una vez,
+  "needs_location": true si necesitas que el usuario comparta la ubicacion del lugar}}""",
         messages=[{"role": "user", "content": text}]
     )
     raw = response.content[0].text.strip().strip("`").lstrip("json").strip()
@@ -3416,6 +3435,14 @@ Extraé cada factura. Responde SOLO:
     add_to_history(MY_NUMBER, "assistant", msg_text)
 
 async def send_resumen_nocturno(http, access_token: str, now: datetime):
+    is_sunday = now.weekday() == 6
+    if is_sunday:
+        await send_resumen_nocturno_dominical(http, access_token, now)
+    else:
+        await send_resumen_nocturno_regular(http, access_token, now)
+
+async def send_resumen_nocturno_regular(http, access_token: str, now: datetime):
+    """Resumen nocturno de lunes a sabado."""
     manana = now + timedelta(days=1)
     r = await http.get(
         "https://www.googleapis.com/calendar/v3/calendars/primary/events",
@@ -3441,20 +3468,25 @@ async def send_resumen_nocturno(http, access_token: str, now: datetime):
                 lineas.append(f"- {e.get('summary','')} (todo el dia)")
         eventos_str = "\n".join(lineas)
 
+    w = await get_weather()
     context = f"Hoy es {now.strftime('%A %d/%m/%Y')}. Hora: {now.strftime('%H:%M')}."
     if eventos_str:
         context += f"\nEventos de manana:\n{eventos_str}"
     else:
         context += "\nManana no hay eventos agendados."
+    if w:
+        context += f"\nClima esta noche: {w['temp']}°C, {w['desc']}."
+        context += f"\nManana: {w['manana_min']}-{w['manana_max']}°C, {w['manana_desc']}."
 
     try:
         resp = claude_create(
             model="claude-sonnet-4-20250514", max_tokens=300,
             system=f"""Sos Matrics. {context}
 Genera un resumen nocturno breve y natural en espanol rioplatense. Inclui:
-1. Un saludo de buenas noches y que hay para manana.
-2. Una sugerencia espontanea: agendar algo, agregar a la lista de compras, registrar un gasto del dia, o un pensamiento de cierre.
-Se conciso, calido, natural. Maximo 5 lineas en total.""",
+1. Saludo de buenas noches con clima de esta noche y de manana.
+2. Que hay para manana (o que el dia esta libre).
+3. Una sugerencia espontanea: agendar algo, agregar a la lista, registrar un gasto, o pensamiento de cierre.
+Conciso, calido, natural. Maximo 5 lineas.""",
             messages=[{"role": "user", "content": "Genera el resumen nocturno."}]
         )
         msg = resp.content[0].text.strip()
@@ -3464,6 +3496,146 @@ Se conciso, calido, natural. Maximo 5 lineas en total.""",
         else:
             msg = "Buenas noches! Manana el dia esta libre. Que descanses"
 
+    await send_message(MY_NUMBER, msg)
+    add_to_history(MY_NUMBER, "assistant", msg)
+
+async def send_resumen_nocturno_dominical(http, access_token: str, now: datetime):
+    """Resumen nocturno especial del domingo."""
+    lines = ["🌙 *Buenas noches! Resumen del domingo*", ""]
+
+    # Clima esta noche + manana
+    w = await get_weather(days=7)
+    if w:
+        lines.append(f"🌡️ *Esta noche:* {w['temp']}°C, {w['desc']}")
+        lines.append(f"☀️ *Manana lunes:* {w['manana_min']}-{w['manana_max']}°C, {w['manana_desc']}")
+        lines.append("")
+
+    # Agenda de la semana
+    try:
+        r_week = await http.get(
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={
+                "timeMin": (now + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00-03:00"),
+                "timeMax": (now + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59-03:00"),
+                "singleEvents": "true", "orderBy": "startTime", "maxResults": "20"
+            }
+        )
+        week_events = []
+        if r_week.status_code == 200:
+            week_events = [e for e in r_week.json().get("items", []) if "[TEMP]" not in (e.get("description") or "")]
+        if week_events:
+            lines.append("🗓️ *Tu semana:*")
+            for e in week_events:
+                s = e.get("start", {})
+                if "dateTime" in s:
+                    dt = datetime.strptime(s["dateTime"][:16], "%Y-%m-%dT%H:%M")
+                    lines.append(f"- {dt.strftime('%a %d/%m')} {dt.strftime('%H:%M')} — {e.get('summary','')}")
+                else:
+                    lines.append(f"- {s.get('date','')[:10]} — {e.get('summary','')} (todo el dia)")
+            lines.append("")
+            # Destacar evento temprano del lunes
+            lunes_early = [e for e in week_events if e.get("start",{}).get("dateTime","")[:10] == (now + timedelta(days=1)).strftime("%Y-%m-%d")]
+            if lunes_early:
+                primero = lunes_early[0]
+                hora = primero.get("start",{}).get("dateTime","")[11:16]
+                if hora and hora < "10:00":
+                    lines.append(f"⚠️ Mañana arranças temprano: *{primero.get('summary','')}* a las {hora}")
+                    lines.append("")
+        else:
+            lines.append("🗓️ La semana que viene está libre de eventos.")
+            lines.append("")
+    except Exception:
+        pass
+
+    # Finanzas de la semana (egresos)
+    try:
+        lunes = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+        hoy = now.strftime("%Y-%m-%d")
+        async with httpx.AsyncClient() as http_fin:
+            r_fin = await http_fin.post(
+                f"https://api.notion.com/v1/databases/{NOTION_DB_ID.replace('-','')}/query",
+                headers=notion_headers(),
+                json={
+                    "filter": {"and": [
+                        {"property": "Date", "date": {"on_or_after": lunes}},
+                        {"property": "Date", "date": {"on_or_before": hoy}},
+                    ]},
+                    "page_size": 50
+                }
+            )
+            if r_fin.status_code == 200:
+                results = r_fin.json().get("results", [])
+                egresos = 0
+                por_cat = {}
+                for page in results:
+                    props = page.get("properties", {})
+                    in_out = (props.get("In - Out", {}).get("select") or {}).get("name", "")
+                    value = props.get("Value (ars)", {}).get("number", 0) or 0
+                    if "INGRESO" not in in_out:
+                        egresos += value
+                        for cat in [c["name"] for c in props.get("Category", {}).get("multi_select", [])]:
+                            por_cat[cat] = por_cat.get(cat, 0) + value
+                if egresos > 0:
+                    top = sorted(por_cat.items(), key=lambda x: x[1], reverse=True)[:3]
+                    top_str = " · ".join(f"{c} ${v:,.0f}" for c, v in top)
+                    lines.append(f"💰 *Esta semana gastaste:* ${egresos:,.0f}")
+                    if top_str:
+                        lines.append(f"_{top_str}_")
+                    lines.append("")
+    except Exception:
+        pass
+
+    # Clima de la semana resumido por Claude
+    if w and w.get("forecast_days"):
+        try:
+            forecast_txt = "\n".join(
+                f"- {fd['date']}: {fd['min']}-{fd['max']}°C, {fd['desc']}, lluvia {fd['lluvia']}mm"
+                for fd in w["forecast_days"][1:7]
+            )
+            clima_resp = claude_create(
+                model="claude-sonnet-4-20250514", max_tokens=80,
+                system="Resume el pronostico semanal en 2 lineas maximas, lenguaje natural rioplatense, destacando lo mas relevante (frio, lluvia, calor).",
+                messages=[{"role": "user", "content": forecast_txt}]
+            )
+            clima_semana = clima_resp.content[0].text.strip()
+            lines.append(f"🌦️ *Clima de la semana:* {clima_semana}")
+            lines.append("")
+        except Exception:
+            pass
+
+    # Facturas con vencimiento esta semana
+    try:
+        pending_tasks = await get_pending_factura_tasks()
+        semana_fin = (now + timedelta(days=7)).date()
+        facturas_urgentes = []
+        for t in pending_tasks:
+            if t.get("due"):
+                try:
+                    due_date = datetime.strptime(t["due"][:10], "%Y-%m-%d").date()
+                    if due_date <= semana_fin:
+                        days_left = (due_date - now.date()).days
+                        facturas_urgentes.append((t["name"], t["due"][:10], days_left))
+                except Exception:
+                    pass
+        if facturas_urgentes:
+            lines.append("⚠️ *Facturas con vencimiento esta semana:*")
+            for nombre, fecha, dias in facturas_urgentes:
+                alerta = "mañana" if dias == 1 else f"en {dias} días" if dias > 0 else "hoy"
+                lines.append(f"- {nombre} — vence {alerta} ({fecha})")
+            lines.append("")
+    except Exception:
+        pass
+
+    # Texto de cierre
+    lines.append("_Es un buen momento para anotar algo pendiente — un evento, una tarea, lo que se te venga a la cabeza para la semana._")
+    lines.append("")
+    lines.append("_Si querés, también puedo mostrarte:_")
+    lines.append("_• Tu lista de compras_")
+    lines.append("_• Tus recordatorios geolocalizados activos_")
+    lines.append("_• Tus tasks pendientes_")
+
+    msg = "\n".join(lines)
     await send_message(MY_NUMBER, msg)
     add_to_history(MY_NUMBER, "assistant", msg)
 
@@ -3644,12 +3816,28 @@ async def receive_location(request: Request):
                     if shop.get("opening_hours"):
                         shop_info += f"\n🕐 {shop['opening_hours']}"
                     shop_info += f"\n🗺️ {shop['maps_link']}"
-                    msg = f"📍 Recordatorio de ubicación\n{reminder['name']}\n\n{shop_info}"
+                    msg = f"📍 *{reminder['name']}*\n\n{shop_info}"
                 else:
-                    msg = f"📍 Recordatorio de ubicación\n{reminder['name']}"
-                await send_message(MY_NUMBER, msg)
-                if not reminder.get("recurrent"):
-                    await deactivate_geo_reminder(reminder["page_id"])
+                    msg = f"📍 *{reminder['name']}*"
+                if reminder.get("recurrent"):
+                    # Recurrente: avisa y listo
+                    await send_message(MY_NUMBER, msg)
+                else:
+                    # One-time: avisa + pregunta
+                    await send_message(MY_NUMBER, msg)
+                    pending_state[MY_NUMBER] = {
+                        "type": "geo_reminder_fired",
+                        "page_id": reminder["page_id"],
+                        "name": reminder["name"],
+                    }
+                    await send_interactive_buttons(
+                        MY_NUMBER,
+                        "¿Ya lo resolviste?",
+                        [
+                            {"id": "geo_done", "title": "Ya pasé ✓"},
+                            {"id": "geo_keep", "title": "Seguir avisando"},
+                        ]
+                    )
 
         # Chequear si hay oportunidad de compra cercana
         phone = MY_NUMBER
