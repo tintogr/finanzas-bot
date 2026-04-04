@@ -2674,13 +2674,18 @@ async def handle_geo_reminder(phone: str, text: str) -> str:
     response = claude_create(
         model="claude-sonnet-4-20250514", max_tokens=300,
         system=f"""Extrae info de un recordatorio geolocalizacion. Hoy: {now.strftime("%Y-%m-%d")}.
+
+TIPOS:
+- "shop": cuando el usuario menciona un TIPO de comercio generico o un nombre de cadena/local. Ej: "ferreteria", "farmacia", "La Anonima", "cualquier super". En este caso shop_name es el tipo o nombre del comercio.
+- "place": cuando el usuario menciona un LUGAR ESPECIFICO con direccion o persona. Ej: "casa de Pili", "Av. San Martin 123", "el trabajo de Juan".
+
 Responde SOLO JSON valido sin markdown:
-{{"description": "que recordar",
+{{"description": "que recordar (accion que tiene que hacer)",
   "type": "place" o "shop",
-  "shop_name": "nombre del comercio si es tipo shop, null si no",
-  "address": "direccion si la menciona, null si no",
-  "recurrent": true si es algo que se repite cada vez que pasa, false si es una vez,
-  "needs_location": true si necesitas que el usuario comparta la ubicacion del lugar}}""",
+  "shop_name": "tipo o nombre del comercio si type es shop (ej: 'ferreteria', 'farmacia', 'La Anonima'), null si type es place",
+  "address": "direccion exacta si la menciona, null si no",
+  "recurrent": true si quiere que le avise CADA VEZ que pase, false si es una sola vez,
+  "needs_location": true SOLO si type es place Y no hay direccion}}""",
         messages=[{"role": "user", "content": text}]
     )
     raw = response.content[0].text.strip().strip("`").lstrip("json").strip()
