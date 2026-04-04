@@ -2061,6 +2061,18 @@ async def load_user_config(wa_number: str):
                 except Exception:
                     user_prefs["known_places"] = []
             user_prefs["_config_page_id"] = page["id"]
+
+            # Restaurar ubicacion si hay coordenadas guardadas y OwnTracks no mando nada aun
+            saved_lat = get_num("Latitude")
+            saved_lon = get_num("Longitude")
+            saved_city = get_txt("City")
+            if saved_lat is not None and saved_lon is not None:
+                if current_location.get("source") == "default":
+                    current_location["lat"] = float(saved_lat)
+                    current_location["lon"] = float(saved_lon)
+                    current_location["source"] = "restored"
+                    if saved_city:
+                        current_location["location_name"] = saved_city
     except Exception:
         pass
 
@@ -3127,6 +3139,28 @@ Se conciso, calido, natural. Maximo 5 lineas en total.""",
 # ── ENDPOINT UBICACION (OwnTracks) ────────────────────────────────────────────
 _last_proximity_check: dict[str, datetime] = {}
 _last_proximity_store: dict[str, str] = {}
+_last_location_save: datetime | None = None
+
+async def save_location_to_notion(lat: float, lon: float, loc_name: str = None):
+    """Persiste la ubicacion en Notion Config para sobrevivir reinicios."""
+    page_id = user_prefs.get("_config_page_id")
+    if not page_id:
+        return
+    try:
+        props = {
+            "Latitude":  {"number": lat},
+            "Longitude": {"number": lon},
+        }
+        if loc_name:
+            props["City"] = {"rich_text": [{"text": {"content": loc_name}}]}
+        async with httpx.AsyncClient(timeout=5) as http:
+            await http.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers=notion_headers(),
+                json={"properties": props}
+            )
+    except Exception:
+        pass
 
 @app.post("/location")
 async def receive_location(request: Request):
@@ -3154,6 +3188,12 @@ async def receive_location(request: Request):
         loc_name = await reverse_geocode(float(lat), float(lon))
         if loc_name:
             current_location["location_name"] = loc_name
+
+        # Persistir ubicacion en Notion (max cada 5 min)
+        global _last_location_save
+        if not _last_location_save or (now - _last_location_save).total_seconds() > 300:
+            _last_location_save = now
+            await save_location_to_notion(float(lat), float(lon), current_location.get("location_name"))
 
         # Chequear si hay oportunidad de compra cercana
         phone = MY_NUMBER
