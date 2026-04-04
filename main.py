@@ -1450,15 +1450,15 @@ async def handle_chat(phone: str, text: str) -> str:
     if user_prefs.get("greeting_name"):
         user_context_parts.append(f"Nombre del usuario: {user_prefs['greeting_name']}.")
     resumen_h = user_prefs.get("daily_summary_hour")
-    resumen_m = user_prefs.get("daily_summary_minute", 0)
+    resumen_m = user_prefs.get("daily_summary_minute") or 0
     if resumen_h is not None:
-        user_context_parts.append(f"Resumen diario configurado a las {resumen_h:02d}:{resumen_m:02d}.")
+        user_context_parts.append(f"Resumen diario configurado a las {int(resumen_h):02d}:{int(resumen_m):02d}.")
     extras = user_prefs.get("resumen_extras", [])
     if extras:
         user_context_parts.append(f"Extras del resumen: {', '.join(extras)}.")
-    noc_h = user_prefs.get("resumen_nocturno_hour", 22)
+    noc_h = user_prefs.get("resumen_nocturno_hour") or 22
     noc_en = user_prefs.get("resumen_nocturno_enabled", True)
-    user_context_parts.append(f"Resumen nocturno: {'activado' if noc_en else 'desactivado'} a las {noc_h:02d}:00.")
+    user_context_parts.append(f"Resumen nocturno: {'activado' if noc_en else 'desactivado'} a las {int(noc_h):02d}:00.")
     # Ubicacion: siempre incluir, indicando si es real o default
     if current_location.get("source") == "owntracks":
         place = is_at_known_place()
