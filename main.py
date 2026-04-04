@@ -1186,8 +1186,7 @@ ELIMINAR_EVENTO: eliminar o borrar un evento del calendario.
 RECORDATORIO: "recordame en X tiempo", "avisame en X". NUNCA para cambios de horario del resumen. NUNCA cuando menciona un lugar fisico o comercio.
 GEO_REMINDER: recordatorios basados en ubicacion. "recordame cuando pase cerca de X", "cuando este en/cerca de X avisame que Y", "cuando vaya a La Anonima recordame Z". Cualquier recordatorio que involucre un lugar fisico, comercio, o persona con direccion.
 EVENTO: crear un evento nuevo -- turno, reunion, cumple, cita, viaje.
-SHOPPING: gestionar lista de compras o recetas.
-REUNION: notas o fotos de una reunion/llamada.
+SHOPPING: gestionar lista de compras o recetas. Incluye preguntas sobre el estado de la lista: "que tengo en la lista", "tengo algo pendiente", "que me falta comprar", "hay algo en la lista".REUNION: notas o fotos de una reunion/llamada.
 CONFIGURAR: cambiar configuracion de Matrics. Solo cuando el usuario quiere CAMBIAR algo. Ej: "el resumen mandamelo a las 7", "cambia el horario", "agrega una frase motivadora al resumen". Nunca cuando pregunta o se queja.
 CHAT: cualquier pregunta, consulta o conversacion. Si tiene "?" o pide informacion -> CHAT. Incluye preguntas sobre por que no llego el resumen, quejas, consultas sobre el estado del bot, etc.
 
