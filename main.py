@@ -88,24 +88,25 @@ def is_in_transit() -> bool:
     return current_location.get("velocity", 0) > 5
 
 async def reverse_geocode(lat: float, lon: float) -> str | None:
-    """Devuelve nombre de barrio/zona usando Nominatim (OSM). Sin key, gratis."""
+    """Devuelve nombre de localidad usando Nominatim. Prueba zooms progresivos para cubrir pueblos chicos."""
     try:
         async with httpx.AsyncClient(timeout=5) as http:
-            r = await http.get(
-                "https://nominatim.openstreetmap.org/reverse",
-                params={"lat": lat, "lon": lon, "format": "json", "zoom": 14, "addressdetails": 1},
-                headers={"User-Agent": "Matrics/1.0"}
-            )
-            if r.status_code == 200:
+            for zoom in [14, 12, 10, 8]:
+                r = await http.get(
+                    "https://nominatim.openstreetmap.org/reverse",
+                    params={"lat": lat, "lon": lon, "format": "json", "zoom": zoom, "addressdetails": 1},
+                    headers={"User-Agent": "Matrics/1.0"}
+                )
+                if r.status_code != 200:
+                    continue
                 addr = r.json().get("address", {})
-                parts = []
-                for key in ["suburb", "neighbourhood", "city_district", "town", "city"]:
+                for key in ["village", "town", "suburb", "city_district", "municipality", "city", "county"]:
                     val = addr.get(key)
-                    if val and val not in parts:
-                        parts.append(val)
-                        if len(parts) == 2:
-                            break
-                return ", ".join(parts) if parts else None
+                    if val:
+                        state = addr.get("state", "")
+                        if state and state.lower() not in val.lower():
+                            return f"{val}, {state}"
+                        return val
     except Exception:
         pass
     return None
@@ -1443,10 +1444,15 @@ async def handle_chat(phone: str, text: str) -> str:
     if current_location.get("source") == "owntracks":
         place = is_at_known_place()
         if place:
-            user_context_parts.append(f"Ubicacion actual: {place['name']}.")
+            user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): {place['name']}.")
         else:
-            loc_name = current_location.get("location_name") or f"{current_location['lat']:.4f}, {current_location['lon']:.4f}"
-            user_context_parts.append(f"Ubicacion actual: {loc_name}.")
+            loc_name = current_location.get("location_name")
+            lat_c = current_location["lat"]
+            lon_c = current_location["lon"]
+            if loc_name:
+                user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): {loc_name} (coords: {lat_c:.4f}, {lon_c:.4f}).")
+            else:
+                user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): coords {lat_c:.4f}, {lon_c:.4f}. IMPORTANTE: no inventes el nombre de la ciudad a partir de las coordenadas — si el usuario pregunta donde esta, dale las coordenadas o preguntale.")
     else:
         user_context_parts.append(f"Ubicacion aproximada: Neuquen (sin GPS activo).")
     user_context = "\n".join(user_context_parts)
@@ -2913,7 +2919,7 @@ async def cron_job():
 
 
 async def query_servicios_mes(month: str = None) -> str:
-    """Devuelve entradas individuales de categoria Servicios del mes."""
+    """Devuelve entradas individuales de categoria Servicios del mes para cruzar con facturas."""
     now = now_argentina()
     if not month:
         month = now.strftime("%Y-%m")
@@ -2935,11 +2941,11 @@ async def query_servicios_mes(month: str = None) -> str:
                 }
             )
             if r.status_code != 200:
-                return "Error consultando Notion."
+                return f"Error consultando Notion ({month})."
             results = r.json().get("results", [])
             if not results:
-                return f"No hay pagos de Servicios registrados en {month}."
-            lines = [f"Pagos de Servicios registrados en {month}:"]
+                return f"Sin pagos de Servicios en {month}."
+            lines = [f"Pagos Servicios {month}:"]
             for page in results:
                 props = page.get("properties", {})
                 name = props.get("Name", {}).get("title", [{}])[0].get("plain_text", "?") if props.get("Name", {}).get("title") else "?"
@@ -2947,9 +2953,9 @@ async def query_servicios_mes(month: str = None) -> str:
                 date_val = (props.get("Date", {}).get("date") or {}).get("start", "")[:10]
                 lines.append(f"- {date_val} -- {name}: ${value:,.0f}")
             return "\n".join(lines)
-    except Exception:
-        return "Error consultando pagos de servicios."
-                        
+    except Exception as e:
+        return f"Error: {str(e)[:80]}"
+
 async def send_daily_summary(http, access_token: str, now: datetime):
     r = await http.get(
         "https://www.googleapis.com/calendar/v3/calendars/primary/events",
@@ -3014,23 +3020,39 @@ async def send_daily_summary(http, access_token: str, now: datetime):
                 else:
                     lines.append(f"- {e.get('summary', 'Evento')} (todo el dia){loc_str}")
 
-    # Facturas: cruzar Gmail con Notion antes de mostrar
+    # Facturas: cruzar Gmail con Notion (mes actual + anterior) antes de mostrar
     gmail_summary = await get_gmail_summary()
     if gmail_summary:
-        finances_context = await query_servicios_mes(now.strftime("%Y-%m"))
+        mes_actual = now.strftime("%Y-%m")
+        year_f, mon_f = map(int, mes_actual.split("-"))
+        mes_anterior = f"{year_f}-{mon_f-1:02d}" if mon_f > 1 else f"{year_f-1}-12"
+        svc_actual = await query_servicios_mes(mes_actual)
+        svc_anterior = await query_servicios_mes(mes_anterior)
+        finances_context = f"{svc_actual}\n\n{svc_anterior}"
         filtered_gmail = gmail_summary
-        if finances_context:
-            try:
-                filter_resp = claude_create(
-                    model="claude-sonnet-4-20250514", max_tokens=400,
-                    system="Sos Matrics. Recibis un resumen de mails con facturas y el registro de gastos del mes en Notion. Tu tarea: identificar cuales facturas YA FUERON PAGADAS comparando por proveedor/empresa. Los montos pueden diferir hasta un 5% (ej: factura $62.728 y pago registrado $62.000 son el mismo). Devuelve solo las facturas que NO esten pagadas, indicando monto y vencimiento. Si todas estan pagas, responde: 'Todas las facturas del mes estan registradas como pagadas.' Espanol rioplatense, conciso.",
-                    messages=[{"role": "user", "content": f"Mails con facturas:\n{gmail_summary}\n\nGastos registrados este mes:\n{finances_context}"}]
-                )
-                filtered_gmail = filter_resp.content[0].text.strip()
-            except Exception:
-                pass
+        try:
+            filter_resp = claude_create(
+                model="claude-sonnet-4-20250514", max_tokens=400,
+                system="""Sos Matrics. Tenes facturas detectadas en Gmail y pagos de Servicios registrados en Notion (este mes y el anterior).
+
+Tu tarea: para cada factura del Gmail, determina si ya fue pagada.
+
+Reglas de matching:
+- El nombre puede diferir: "CALF", "luz", "electricidad", "CALF Energia" son el mismo proveedor
+- Los montos pueden diferir hasta un 10% (ej: factura $62.728 y pago $62.000 = pagada)
+- Fijate en el periodo de la factura: si dice "periodo 02/26" y hay un pago de febrero, coincide
+- Si el item de Notion dice el mes (ej "Luz marzo"), cruzalo con el periodo de la factura
+- Si encontras un pago del mes anterior que podria corresponder a la factura actual, aclaralo
+- Si hay dudas reales sobre si un pago corresponde, mencionalo brevemente
+
+Mostrar SOLO las facturas sin pago registrado claro. Si todas estan pagas, decilo en una linea. Espanol rioplatense, conciso.""",
+                messages=[{"role": "user", "content": f"Facturas en Gmail:\n{gmail_summary}\n\nPagos registrados en Notion:\n{finances_context}"}]
+            )
+            filtered_gmail = filter_resp.content[0].text.strip()
+        except Exception:
+            pass
         lines.append("")
-        lines.append(f"*Mails importantes:*\n{filtered_gmail}")
+        lines.append(f"*Facturas:*\n{filtered_gmail}")
 
     extras = user_prefs.get("resumen_extras", [])
     if extras:
