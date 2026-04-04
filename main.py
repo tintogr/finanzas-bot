@@ -1176,7 +1176,7 @@ async def classify(text: str, has_image: bool, image_b64: str = None, image_type
         model="claude-sonnet-4-20250514", max_tokens=10,
         system="""Responde SOLO una palabra: GASTO, CORREGIR_GASTO, PLANTA, EVENTO, EDITAR_EVENTO, ELIMINAR_EVENTO, RECORDATORIO, SHOPPING, REUNION, CONFIGURAR o CHAT.
 
-GASTO: registrar un pago, compra o ingreso concreto con monto. Tambien cuando el mensaje menciona una compra o gasto SIN monto (ej: "compre en la verduleria", "fui al super") -- Matrics pedira el monto.
+GASTO: registrar un pago, compra o ingreso concreto con monto. Tambien cuando el mensaje menciona una compra o gasto SIN monto (ej: "compre en la verduleria", "fui al super") -- Matrics pedira el monto. EXCEPCION: si el mensaje menciona "lista de compras" o "todo lo que habia en la lista" -> SHOPPING.
 CORREGIR_GASTO: corregir un gasto ya registrado.
 ELIMINAR_GASTO: eliminar o borrar una entrada de Notion.
 ELIMINAR_SHOPPING: eliminar o borrar un item de la lista de compras.
@@ -4335,7 +4335,24 @@ async def handle_shopping(text: str, phone: str = None) -> str:
                 lines.append(f"- {name}{f' _{cat}_' if cat else ''}")
             return "\n".join(lines)
 
-    if not items:
+    if not items or (len(items) == 1 and items[0].lower() in ["todo", "all", "todos", "everything"]):
+        if action in ("in_stock", "out_of_stock"):
+            # Marcar TODOS los items pendientes
+            async with httpx.AsyncClient() as http:
+                r = await http.post(
+                    f"https://api.notion.com/v1/databases/{SHOPPING_DB_ID}/query",
+                    headers=notion_headers(),
+                    json={"filter": {"property": "Stock", "checkbox": {"equals": False}}, "page_size": 50}
+                )
+                if r.status_code == 200:
+                    results = r.json().get("results", [])
+                    for item in results:
+                        await http.patch(
+                            f"https://api.notion.com/v1/pages/{item['id']}",
+                            headers=notion_headers(),
+                            json={"properties": {"Stock": {"checkbox": action == "in_stock"}}}
+                        )
+                    return f"Listo, {len(results)} items marcados como {'en stock' if action == 'in_stock' else 'faltantes'}."
         return "No entendi que producto queres actualizar."
 
     if action == "add":
