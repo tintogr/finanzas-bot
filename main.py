@@ -98,7 +98,7 @@ async def reverse_geocode(lat: float, lon: float) -> str | None:
     """Devuelve nombre de localidad usando Nominatim. Prueba zooms progresivos para cubrir pueblos chicos."""
     try:
         async with httpx.AsyncClient(timeout=5) as http:
-            for zoom in [14, 12, 10, 8]:
+            for zoom in [14, 12, 10, 8, 6]:
                 r = await http.get(
                     "https://nominatim.openstreetmap.org/reverse",
                     params={"lat": lat, "lon": lon, "format": "json", "zoom": zoom, "addressdetails": 1},
@@ -106,14 +106,21 @@ async def reverse_geocode(lat: float, lon: float) -> str | None:
                 )
                 if r.status_code != 200:
                     continue
-                addr = r.json().get("address", {})
-                for key in ["village", "town", "suburb", "city_district", "municipality", "city", "county"]:
+                data = r.json()
+                addr = data.get("address", {})
+                for key in ["village", "town", "suburb", "city_district", "municipality", "city", "county", "state_district", "state"]:
                     val = addr.get(key)
                     if val:
                         state = addr.get("state", "")
                         if state and state.lower() not in val.lower():
                             return f"{val}, {state}"
                         return val
+                # Fallback: usar el display_name recortado
+                display = data.get("display_name", "")
+                if display:
+                    # Tomar las primeras 2 partes del display_name (ej: "Villa Ventana, Tornquist")
+                    parts = [p.strip() for p in display.split(",")[:2]]
+                    return ", ".join(parts)
     except Exception:
         pass
     return None
@@ -1491,7 +1498,7 @@ async def handle_chat(phone: str, text: str) -> str:
     noc_en = user_prefs.get("resumen_nocturno_enabled", True)
     user_context_parts.append(f"Resumen nocturno: {'activado' if noc_en else 'desactivado'} a las {int(noc_h):02d}:00.")
     # Ubicacion: siempre incluir, indicando si es real o default
-    if current_location.get("source") == "owntracks":
+    if current_location.get("source") in ("owntracks", "restored", "whatsapp"):
         place = is_at_known_place()
         if place:
             user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): {place['name']}.")
@@ -1500,7 +1507,9 @@ async def handle_chat(phone: str, text: str) -> str:
             if loc_name:
                 user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): {loc_name}.")
             else:
-                user_context_parts.append("Ubicacion GPS activa via OwnTracks pero sin nombre de localidad resuelto. No inventes el nombre de la ciudad — decile al usuario que tenes sus coordenadas pero no el nombre del lugar.")
+                lat_c = float(current_location.get("lat") or USER_LAT)
+                lon_c = float(current_location.get("lon") or USER_LON)
+                user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): coordenadas {lat_c:.5f}, {lon_c:.5f}. El nombre del lugar no se pudo resolver automaticamente — usa las coordenadas para responder preguntas sobre ubicacion, no las interpolees con ciudades que no esten confirmadas.")
     else:
         user_context_parts.append("Ubicacion aproximada: Neuquen (sin GPS activo).")
     user_context = "\n".join(user_context_parts)
