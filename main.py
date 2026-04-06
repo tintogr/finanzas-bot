@@ -2565,7 +2565,7 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
                 await send_message(phone, "Error creando el recordatorio")
         return True
 
-if state_type == "recurring_event_reminder":
+    if state_type == "recurring_event_reminder":
         event_id = state.get("event_id")
         summary = state.get("summary", "Evento")
         del pending_state[phone]
