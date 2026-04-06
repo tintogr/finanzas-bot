@@ -2152,12 +2152,143 @@ EVENTOS RECURRENTES:
         {"role": "assistant", "content": response.content},
         {"role": "user", "content": tool_results}
     ]
-    try:
-        final_response = claude_create(
-            model="claude-sonnet-4-20250514", max_tokens=600,
-            system=system, messages=messages, tools=tools
-        )
-        reply = next((b.text for b in final_response.content if hasattr(b, "text") and b.text), "").strip()
+
+    # Loop para soportar multiples rondas de tool calls (max 4)
+    reply = ""
+    for _round in range(4):
+        try:
+            next_response = claude_create(
+                model="claude-sonnet-4-20250514", max_tokens=600,
+                system=system, messages=messages, tools=tools
+            )
+        except Exception:
+            reply = "Error procesando tu mensaje."
+            break
+
+        # Extraer texto si hay
+        round_text = next((b.text for b in next_response.content if hasattr(b, "text") and b.text), "").strip()
+        if round_text:
+            reply = round_text
+
+        # Si no hay mas tool calls, terminamos
+        round_tools = [b for b in next_response.content if b.type == "tool_use"]
+        if not round_tools:
+            break
+
+        # Ejecutar tools de esta ronda
+        round_results = []
+        for block in round_tools:
+            t_name = block.name
+            t_input = block.input
+            t_result = ""
+            try:
+                if t_name == "crear_evento":
+                    data = dict(t_input)
+                    if not data.get("duration_minutes"):
+                        data["duration_minutes"] = 60
+                    if data.get("recurrence"):
+                        data["date"] = fix_recurring_event_date(data["date"], data["recurrence"])
+                    guardado, event_id = await create_evento_gcal(data)
+                    if guardado and event_id:
+                        last_event_touched[phone] = {"event_id": event_id, "summary": data.get("summary", "Evento")}
+                        evento_creado = {"data": data, "event_id": event_id}
+                        hora = f" a las {data['time']}" if data.get("time") else ""
+                        try:
+                            fecha = datetime.strptime(data["date"], "%Y-%m-%d").strftime("%d/%m/%Y")
+                        except Exception:
+                            fecha = data["date"]
+                        t_result = f"Evento creado: {data.get('emoji','')} {data['summary']} el {fecha}{hora}."
+                    else:
+                        t_result = "Error creando el evento."
+                elif t_name == "eliminar_evento":
+                    s_term = t_input.get("search_term", "")
+                    t_date = t_input.get("target_date")
+                    d_all = t_input.get("delete_all", False)
+                    at = await get_gcal_access_token()
+                    if at:
+                        now_dt = now_argentina()
+                        if t_date:
+                            t_min = f"{t_date}T00:00:00-03:00"
+                            t_max = f"{t_date}T23:59:59-03:00"
+                        else:
+                            t_min = (now_dt - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00-03:00")
+                            t_max = (now_dt + timedelta(days=60)).strftime("%Y-%m-%dT23:59:59-03:00")
+                        async with httpx.AsyncClient() as hc:
+                            hdrs = {"Authorization": f"Bearer {at}"}
+                            sr = await hc.get(
+                                "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                                headers=hdrs,
+                                params={"q": s_term, "timeMin": t_min, "timeMax": t_max,
+                                        "singleEvents": "true", "orderBy": "startTime", "maxResults": "10"}
+                            )
+                            if sr.status_code == 200 and sr.json().get("items"):
+                                evts = [e for e in sr.json()["items"] if "[TEMP]" not in (e.get("description") or "")]
+                                to_del = evts if d_all else evts[:1]
+                                deleted = []
+                                for ev in to_del:
+                                    dr = await hc.delete(f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{ev['id']}", headers=hdrs)
+                                    if dr.status_code == 204:
+                                        deleted.append(ev.get("summary", "Evento"))
+                                t_result = f"Eliminados: {', '.join(deleted)}." if deleted else "No pude eliminar."
+                            else:
+                                t_result = f"No encontre eventos con '{s_term}'."
+                    else:
+                        t_result = "Calendar no configurado."
+                elif t_name == "editar_evento":
+                    s_term = t_input.get("search_term")
+                    target_ev, err = await _find_calendar_event(s_term, phone)
+                    if not target_ev:
+                        t_result = err
+                    else:
+                        ev = dict(target_ev)
+                        ev_id = ev["id"]
+                        ev_name = ev.get("summary", "Evento")
+                        if t_input.get("new_title"):
+                            ev["summary"] = t_input["new_title"]
+                        if t_input.get("new_location"):
+                            ev["location"] = t_input["new_location"]
+                        if t_input.get("new_description"):
+                            ev["description"] = t_input["new_description"]
+                        if t_input.get("new_date") or t_input.get("new_time"):
+                            if "dateTime" in ev.get("start", {}):
+                                old_dt = ev["start"]["dateTime"][:16]
+                                nd = t_input.get("new_date") or old_dt[:10]
+                                nt = t_input.get("new_time") or old_dt[11:16]
+                                ev["start"] = {"dateTime": f"{nd}T{nt}:00", "timeZone": "America/Argentina/Buenos_Aires"}
+                                if "dateTime" in ev.get("end", {}):
+                                    dur = datetime.strptime(ev["end"]["dateTime"][:16], "%Y-%m-%dT%H:%M") - datetime.strptime(old_dt, "%Y-%m-%dT%H:%M")
+                                    new_end = datetime.strptime(f"{nd}T{nt}", "%Y-%m-%dT%H:%M") + dur
+                                    ev["end"] = {"dateTime": new_end.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "America/Argentina/Buenos_Aires"}
+                            elif t_input.get("new_date"):
+                                ev["start"] = {"date": t_input["new_date"]}
+                                ev["end"] = {"date": t_input["new_date"]}
+                        at = await get_gcal_access_token()
+                        async with httpx.AsyncClient() as hc:
+                            ur = await hc.put(
+                                f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{ev_id}",
+                                headers={"Authorization": f"Bearer {at}", "Content-Type": "application/json"},
+                                json=ev
+                            )
+                        if ur.status_code in [200, 201]:
+                            last_event_touched[phone] = {"event_id": ev_id, "summary": ev.get("summary", ev_name)}
+                            t_result = f"Evento '{ev_name}' actualizado."
+                        else:
+                            t_result = "Error actualizando."
+                elif t_name == "consultar_calendario":
+                    dias = t_input.get("dias_adelante", 7)
+                    dias_a = t_input.get("dias_atras", 0)
+                    t_result = await query_calendar(days_ahead=dias, days_back=dias_a) or "No hay eventos."
+            except Exception as e:
+                t_result = f"Error: {str(e)[:100]}"
+            round_results.append({"type": "tool_result", "tool_use_id": block.id, "content": t_result})
+
+        messages = messages + [
+            {"role": "assistant", "content": next_response.content},
+            {"role": "user", "content": round_results}
+        ]
+
+    if not reply:
+        reply = "Listo, revisé tu calendario. ¿Necesitás algo más?"
     except Exception:
         reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "Error procesando").strip()
 
