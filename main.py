@@ -42,6 +42,7 @@ MEETINGS_DB_ID = os.environ.get("NOTION_MEETINGS_DB_ID", "ed5b5023-c17c-46e5-be7
 TASKS_DB_ID         = os.environ.get("NOTION_TASKS_DB_ID", "90b44158-7916-4837-94de-129dde448fc4")
 GEO_REMINDERS_DB_ID = os.environ.get("NOTION_GEO_REMINDERS_DB_ID", "5fe7a531722843a5af93de1c54a14e02")
 CONFIG_DB_ID   = os.environ.get("NOTION_CONFIG_DB_ID", "2f81017d-a20c-426a-aada-88fcf0743338")
+PROJECTS_DB_ID = os.environ.get("NOTION_PROJECTS_DB_ID", "0924aff739194c5b8438d03ed82e9e21")
 WA_TOKEN       = os.environ["WHATSAPP_TOKEN"]
 WA_PHONE_ID    = os.environ["WHATSAPP_PHONE_ID"]
 WA_API         = f"https://graph.facebook.com/v22.0/{WA_PHONE_ID}/messages"
@@ -91,8 +92,8 @@ def is_at_known_place() -> dict | None:
     return None
 
 def is_in_transit() -> bool:
-    """True si el usuario se esta moviendo (velocidad > 5 km/h)."""
-    return current_location.get("velocity", 0) > 5
+    """True si el usuario se esta moviendo (velocidad > 15 km/h)."""
+    return current_location.get("velocity", 0) > 15
 
 async def reverse_geocode(lat: float, lon: float) -> str | None:
     """Devuelve nombre de localidad usando Nominatim. Prueba zooms progresivos para cubrir pueblos chicos."""
@@ -995,6 +996,8 @@ async def create_evento_gcal(data: dict) -> tuple[bool, str]:
         event["description"] = data["description"]
     if data.get("location"):
         event["location"] = data["location"]
+    if data.get("recurrence"):
+        event["recurrence"] = [data["recurrence"]]
     async with httpx.AsyncClient() as http:
         r = await http.post(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
@@ -1124,6 +1127,33 @@ async def find_similar_calendar_events(data: dict) -> list:
                 pass
     return list(found.values())[:3]
 
+# ── Helpers para eventos recurrentes (RRULE) ──────────────────────────────────
+RRULE_DAY_MAP = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+WEEKDAY_TO_RRULE = {0: "MO", 1: "TU", 2: "WE", 3: "TH", 4: "FR", 5: "SA", 6: "SU"}
+
+def next_weekday_date(from_date, target_weekday: int):
+    """Retorna la proxima fecha (inclusive hoy) que caiga en target_weekday (0=lunes)."""
+    days_ahead = target_weekday - from_date.weekday()
+    if days_ahead < 0:
+        days_ahead += 7
+    return from_date + timedelta(days=days_ahead)
+
+def fix_recurring_event_date(event_date_str: str, rrule: str) -> str:
+    """Si el RRULE tiene BYDAY, verifica que la fecha coincida. Si no, la corrige al proximo dia correcto."""
+    if not rrule or "BYDAY=" not in rrule:
+        return event_date_str
+    try:
+        event_date = datetime.strptime(event_date_str, "%Y-%m-%d").date()
+        for part in rrule.split(";"):
+            if "BYDAY=" in part:
+                day_code = part.split("BYDAY=")[1].strip().split(",")[0].strip()
+                target = RRULE_DAY_MAP.get(day_code)
+                if target is not None and event_date.weekday() != target:
+                    fixed = next_weekday_date(event_date, target)
+                    return fixed.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return event_date_str
 # ── HISTORIAL DE CONVERSACION ──────────────────────────────────────────────────
 chat_history: dict[str, list] = {}
 MAX_HISTORY = 10
@@ -1615,6 +1645,22 @@ async def handle_chat(phone: str, text: str) -> str:
                 },
                 "required": []
             }
+        },
+        {
+            "name": "crear_proyecto",
+            "description": "Crea un proyecto, idea o nota de reunion en la base de Proyectos de Notion. Usa cuando el usuario dice 'anota proyecto', 'tengo una idea', 'nuevo proyecto', 'anota como proyecto', o describe una idea/proyecto que quiere guardar.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Nombre del proyecto o idea"},
+                    "entry_type": {"type": "string", "enum": ["Proyecto", "Idea", "Reunion"], "description": "Tipo de entrada"},
+                    "area": {"type": "string", "enum": ["Laboral", "Hobby", "Personal"], "description": "Area a la que pertenece"},
+                    "description": {"type": ["string", "null"], "description": "Descripcion detallada si la hay"},
+                    "priority": {"type": ["string", "null"], "enum": ["Alta", "Media", "Baja", null], "description": "Prioridad"},
+                    "emoji": {"type": "string", "description": "Emoji representativo"}
+                },
+                "required": ["name", "entry_type", "area", "emoji"]
+            }
         }
     ]
 
@@ -1643,7 +1689,19 @@ RAZONAMIENTO IMPORTANTE para preguntas sobre pagos de servicios:
 
 Podes usar varias herramientas en el mismo turno. No respondas hasta tener la informacion necesaria.
 IMPORTANTE: No inventes datos. Si no encontras info en ninguna fuente, decilo claramente.
-CAPACIDADES: Matrics SÍ puede crear, editar y eliminar eventos en Google Calendar. Si el usuario dice que creaste algo, no lo niegues — consultá el calendario para verificarlo."""
+CAPACIDADES COMPLETAS DE MATRICS (no niegues ninguna):
+- Crear, editar y eliminar eventos en Google Calendar (via otro modulo, no esta en tus tools pero Matrics SI lo hace)
+- Registrar gastos e ingresos en Notion (via otro modulo)
+- Crear y gestionar geo-reminders basados en ubicacion (via otro modulo)
+- Acceder a ubicacion GPS via OwnTracks (si esta activo, la info ya esta en tu contexto)
+- Consultar y gestionar lista de compras en Notion (via otro modulo)
+- Gestionar tasks y proyectos en Notion (tenes la tool crear_proyecto)
+- Consultar calendario, finanzas, clima, Gmail (tus tools directas)
+- Buscar en la web
+- Configurar Matrics (horarios, extras, saludo)
+
+Si el usuario dice que hiciste algo o que Matrics hizo algo, NO lo niegues. Consulta el calendario o Notion para verificarlo.
+Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile que SI puede hacerlo y guialo."""
 
     messages = history + [{"role": "user", "content": text}]
 
@@ -1786,6 +1844,38 @@ CAPACIDADES: Matrics SÍ puede crear, editar y eliminar eventos en Google Calend
                     result = "Configuracion actualizada: " + ", ".join(changed)
                 else:
                     result = "No se especifico que cambiar."
+            elif tool_name == "crear_proyecto":
+                proj_name = tool_input.get("name", "Proyecto")
+                entry_type = tool_input.get("entry_type", "Proyecto")
+                area = tool_input.get("area", "Personal")
+                description = tool_input.get("description", "")
+                priority = tool_input.get("priority")
+                emoji = tool_input.get("emoji", "📋")
+                proj_props = {
+                    "Name": {"title": [{"text": {"content": proj_name}}]},
+                    "Entry Type": {"select": {"name": entry_type}},
+                    "Area": {"select": {"name": area}},
+                    "Status": {"status": {"name": "Sin empezar"}},
+                    "Source": {"select": {"name": "Matrics"}},
+                    "Date": {"date": {"start": now.strftime("%Y-%m-%d")}},
+                }
+                if description:
+                    proj_props["Description"] = {"rich_text": [{"text": {"content": description[:2000]}}]}
+                if priority in ["Alta", "Media", "Baja"]:
+                    proj_props["Priority"] = {"select": {"name": priority}}
+                try:
+                    async with httpx.AsyncClient() as http_proj:
+                        r_proj = await http_proj.post(
+                            "https://api.notion.com/v1/pages",
+                            headers=notion_headers(),
+                            json={"parent": {"database_id": PROJECTS_DB_ID.replace("-", "")}, "icon": {"type": "emoji", "emoji": emoji}, "properties": proj_props}
+                        )
+                        if r_proj.status_code == 200:
+                            result = f"Proyecto creado: {emoji} {proj_name} ({entry_type}, {area}). Guardado en Notion."
+                        else:
+                            result = f"Error creando proyecto: {r_proj.text[:100]}"
+                except Exception as e_proj:
+                    result = f"Error: {str(e_proj)[:100]}"
         except Exception as e:
             result = f"Error ejecutando {tool_name}: {str(e)[:100]}"
 
@@ -1839,7 +1929,8 @@ async def handle_evento_agent(phone: str, text: str, image_b64=None, image_type=
                     "duration_minutes": {"type": "integer", "description": "Duracion en minutos, default 60"},
                     "location": {"type": ["string", "null"]},
                     "description": {"type": ["string", "null"]},
-                    "emoji": {"type": "string", "description": "Emoji representativo"}
+                    "emoji": {"type": "string", "description": "Emoji representativo"},
+                    "recurrence": {"type": ["string", "null"], "description": "RRULE string para eventos recurrentes. Ej: RRULE:FREQ=WEEKLY;BYDAY=MO o RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=4. Null si no es recurrente."}
                 },
                 "required": ["summary", "date", "emoji"]
             }
@@ -1897,7 +1988,16 @@ Tu tarea: gestionar eventos del calendario del usuario.
 - Si falta info esencial -> pregunta de forma natural y breve.
 - Podes consultar el calendario primero si necesitas verificar algo.
 - Si el usuario manda una imagen (flyer, screenshot de turno, invitacion), extrae la info y crea el evento.
-IMPORTANTE: No inventes datos. Usa zona horaria Argentina (UTC-3)."""
+IMPORTANTE: No inventes datos. Usa zona horaria Argentina (UTC-3).
+
+EVENTOS RECURRENTES:
+- Si el usuario dice "todos los lunes", "cada martes", etc., usa el campo recurrence con un RRULE valido.
+- El BYDAY del RRULE DEBE coincidir con el dia de la semana de la fecha de inicio.
+- Dias RRULE: MO=lunes, TU=martes, WE=miercoles, TH=jueves, FR=viernes, SA=sabado, SU=domingo.
+- Ejemplo: si pide "todos los lunes a las 17:20", date debe ser el PROXIMO lunes, y recurrence "RRULE:FREQ=WEEKLY;BYDAY=MO".
+- Si dice "durante este mes", agrega COUNT con las semanas restantes del mes.
+- Si no especifica fin, no pongas COUNT ni UNTIL (sera indefinido).
+- NUNCA pongas una fecha que caiga en un dia diferente al BYDAY del RRULE."""
 
     content = []
     if image_b64:
@@ -1934,6 +2034,9 @@ IMPORTANTE: No inventes datos. Usa zona horaria Argentina (UTC-3)."""
                 data = dict(tool_input)
                 if not data.get("duration_minutes"):
                     data["duration_minutes"] = 60
+                # Fix: validar que la fecha coincida con el BYDAY del RRULE
+                if data.get("recurrence"):
+                    data["date"] = fix_recurring_event_date(data["date"], data["recurrence"])
                 guardado, event_id = await create_evento_gcal(data)
                 if guardado and event_id:
                     last_event_touched[phone] = {"event_id": event_id, "summary": data.get("summary", "Evento")}
@@ -2704,6 +2807,7 @@ Responde SOLO JSON valido sin markdown:
   "shop_name": "nombre del comercio si es tipo shop, null si no",
   "address": "direccion si la menciona, null si no",
   "recurrent": true si es algo que se repite cada vez que pasa, false si es una vez,
+  "radius": radio en metros si lo menciona (ej: "a menos de 500m" -> 500, "cuando este muy cerca" -> 150, "en la zona" -> 800). Si no menciona distancia usar 300,
   "needs_location": true si necesitas que el usuario comparta la ubicacion del lugar}}""",
         messages=[{"role": "user", "content": text}]
     )
@@ -2719,6 +2823,7 @@ Responde SOLO JSON valido sin markdown:
     recurrent = data.get("recurrent", False)
     needs_location = data.get("needs_location", False)
     address = data.get("address")
+    radius = int(data.get("radius") or 300)
 
     # Si es tipo shop, crear directamente
     if rtype == "shop" and shop_name:
@@ -2726,11 +2831,12 @@ Responde SOLO JSON valido sin markdown:
             description=description,
             rtype="shop",
             shop_name=shop_name,
+            radius=radius,
             recurrent=recurrent,
         )
         if ok:
             freq = "Cada vez que" if recurrent else "La proxima vez que"
-            return f"📍 *Geo-reminder guardado*\n_{description}_\n{freq} estes cerca de *{shop_name}*, te aviso."
+            return f"📍 *Geo-reminder guardado*\n_{description}_\n{freq} estes cerca de *{shop_name}* (radio: {radius}m), te aviso."
         return "No pude guardar el geo-reminder."
 
     # Si tiene direccion, geocodificar
@@ -2752,11 +2858,12 @@ Responde SOLO JSON valido sin markdown:
                         rtype="place",
                         lat=place_lat,
                         lon=place_lon,
+                        radius=radius,
                         recurrent=recurrent,
                     )
                     if ok:
                         freq = "Cada vez que" if recurrent else "La proxima vez que"
-                        return f"📍 *Geo-reminder guardado*\n_{description}_\nAsumi que el lugar es *{place_name}*.\n{freq} estes a menos de 300m, te aviso.\n\n¿Es correcto o queres ajustar la ubicacion?"
+                        return f"📍 *Geo-reminder guardado*\n_{description}_\nAsumi que el lugar es *{place_name}*.\n{freq} estes a menos de {radius}m, te aviso.\n\n¿Es correcto o queres ajustar la ubicacion?"
         except Exception:
             pass
 
@@ -3315,6 +3422,19 @@ async def send_daily_summary(http, access_token: str, now: datetime):
         if w["hoy_lluvia"] > 0:
             pronostico += f", 🌧️ {w['hoy_lluvia']}mm esperados"
         lines.append(pronostico)
+        # Narrativa del dia generada por Claude
+        try:
+            clima_ctx = f"Temp actual: {w['temp']}C (sensacion {w['sensacion']}C). Max: {w['hoy_max']}C, min: {w['hoy_min']}C. Condicion: {w['desc']}. Viento: {w['viento']}km/h. Lluvia esperada: {w['hoy_lluvia']}mm."
+            narrativa_resp = claude_create(
+                model="claude-sonnet-4-20250514", max_tokens=60,
+                system="Genera UNA sola linea (max 15 palabras) describiendo como va a estar el dia para alguien en Neuquen. Tono casual rioplatense. Sin emoji. Sin repetir datos numericos. Ejemplos: 'Arrancas fresco pero al mediodia pega fuerte. Sin lluvia.' o 'Dia gris y ventoso, lleva campera.' o 'Lindo dia para estar afuera, fresco pero agradable.'",
+                messages=[{"role": "user", "content": clima_ctx}]
+            )
+            narrativa = narrativa_resp.content[0].text.strip()
+            if narrativa:
+                lines.append(f"_{narrativa}_")
+        except Exception:
+            pass
         lines.append("")
     if now.weekday() == 0:
         try:
@@ -3847,7 +3967,7 @@ async def receive_location(request: Request):
         should_check = (
             not is_at_known_place()
             and not is_in_transit()
-            and (not last_check or (now - last_check).total_seconds() > 1800)
+            and (not last_check or (now - last_check).total_seconds() > 600)
             and 9 <= now.hour <= 21
         )
 
