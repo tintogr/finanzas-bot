@@ -1635,6 +1635,57 @@ async def calcular_fecha_con_verificacion(descripcion: str) -> str:
         pass
     return f"Calculado: {resultado_python} (verificado con Python)"
 
+async def search_google_contact(name: str) -> str:
+    """Busca un contacto en Google Contacts por nombre."""
+    access_token = await get_gcal_access_token()
+    if not access_token:
+        return "No hay acceso a Google Contacts."
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.get(
+                "https://people.googleapis.com/v1/people/me/connections",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={
+                    "personFields": "names,addresses,phoneNumbers,emailAddresses",
+                    "pageSize": 100,
+                }
+            )
+            if r.status_code != 200:
+                return f"Error consultando Contacts: {r.text[:100]}"
+            connections = r.json().get("connections", [])
+            if not connections:
+                return "No encontré contactos en tu agenda."
+            name_lower = name.lower()
+            matches = []
+            for person in connections:
+                names = person.get("names", [])
+                display_name = names[0].get("displayName", "") if names else ""
+                if name_lower in display_name.lower():
+                    addresses = person.get("addresses", [])
+                    phones = person.get("phoneNumbers", [])
+                    emails = person.get("emailAddresses", [])
+                    info = [f"*{display_name}*"]
+                    for addr in addresses:
+                        label = addr.get("formattedType", "Dirección")
+                        val = addr.get("formattedValue", "")
+                        if val:
+                            info.append(f"📍 {label}: {val}")
+                    for ph in phones:
+                        label = ph.get("formattedType", "Tel")
+                        val = ph.get("value", "")
+                        if val:
+                            info.append(f"📞 {label}: {val}")
+                    for em in emails:
+                        val = em.get("value", "")
+                        if val:
+                            info.append(f"✉️ {val}")
+                    matches.append("\n".join(info))
+            if not matches:
+                return f"No encontré ningún contacto llamado '{name}'."
+            return "\n\n".join(matches[:3])
+    except Exception as e:
+        return f"Error: {str(e)[:100]}"
+
 async def handle_chat(phone: str, text: str) -> str:
     history = get_history(phone)
     add_to_history(phone, "user", text)
@@ -1746,6 +1797,17 @@ async def handle_chat(phone: str, text: str) -> str:
         {
             "type": "web_search_20250305",
             "name": "web_search"
+        },
+        {
+            "name": "buscar_contacto",
+            "description": "Busca información de un contacto en Google Contacts: dirección, teléfono, email. Usar cuando el usuario pregunta por datos de alguien, dónde vive, cómo contactarlo, etc.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "nombre": {"type": "string", "description": "Nombre o parte del nombre del contacto a buscar"}
+                },
+                "required": ["nombre"]
+            }
         },
         {
             "name": "guardar_lugar_conocido",
@@ -1970,6 +2032,8 @@ Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile q
                         t_result = "No encontre ningun gasto llamado '" + search_term + "' en " + mes + "."
             except Exception as e:
                 t_result = "Error: " + str(e)[:100]
+        elif t_name == "buscar_contacto":
+            t_result = await search_google_contact(t_input.get("nombre", ""))
         elif t_name == "guardar_lugar_conocido":
             nombre = t_input.get("nombre", "")
             direccion = t_input.get("direccion", "")
