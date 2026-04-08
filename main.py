@@ -151,65 +151,67 @@ async def reverse_geocode(lat: float, lon: float) -> str | None:
     return None
 
 async def search_nearby_shops(lat: float, lon: float, radius: int = 500, shop_types: list = None, name_filter: str = None) -> list[dict]:
-    """Busca comercios cercanos usando OpenStreetMap Overpass API (gratis, sin key)."""
-    if shop_types is None:
-        shop_types = ["supermarket", "convenience", "bakery", "hardware", "butcher", "greengrocer"]
-
-    if name_filter:
-        # Busqueda por nombre de comercio especifico
-        query = f"""[out:json][timeout:10];
-(
-  node["name"~"{name_filter}",i](around:{radius},{lat},{lon});
-  way["name"~"{name_filter}",i](around:{radius},{lat},{lon});
-);
-out body;"""
-    else:
-        node_queries = "\n".join(
-            f'  node["shop"="{t}"](around:{radius},{lat},{lon});'
-            for t in shop_types
-        )
-        query = f"""[out:json][timeout:10];
-(
-{node_queries}
-  node["amenity"="pharmacy"](around:{radius},{lat},{lon});
-);
-out body;"""
+    """Busca comercios cercanos usando Google Places API."""
+    api_key = os.environ.get("GOOGLE_PLACES_KEY", "")
+    if not api_key:
+        print("[Places] No hay GOOGLE_PLACES_API_KEY configurada")
+        return []
 
     try:
-        async with httpx.AsyncClient(timeout=12) as http:
-            resp = await http.post(
-                "https://overpass-api.de/api/interpreter",
-                data={"data": query}
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        async with httpx.AsyncClient(timeout=10) as http:
+            if name_filter:
+                # Busqueda por nombre especifico
+                r = await http.get(
+                    "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                    params={
+                        "query": name_filter,
+                        "location": f"{lat},{lon}",
+                        "radius": radius,
+                        "key": api_key,
+                        "language": "es"
+                    }
+                )
+            else:
+                # Busqueda por tipo
+                query_type = "supermarket"
+                if shop_types:
+                    query_type = shop_types[0]
+                r = await http.get(
+                    "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+                    params={
+                        "location": f"{lat},{lon}",
+                        "radius": radius,
+                        "type": query_type,
+                        "key": api_key,
+                        "language": "es"
+                    }
+                )
 
+            if r.status_code != 200:
+                print(f"[Places] Error {r.status_code}: {r.text[:100]}")
+                return []
+
+            results = r.json().get("results", [])
             shops = []
-            for element in data.get("elements", []):
-                tags = element.get("tags", {})
-                name = tags.get("name")
-                if not name:
-                    continue
-                shop_type = tags.get("shop") or tags.get("amenity", "shop")
-                elat = element.get("lat", lat)
-                elon = element.get("lon", lon)
-                dist_m = round(haversine_km(lat, lon, elat, elon) * 1000)
-                # Extraer direccion si está disponible en OSM
-                street = tags.get("addr:street", "")
-                number = tags.get("addr:housenumber", "")
-                address = f"{street} {number}".strip() if street else ""
-                # Horarios de apertura
-                hours = tags.get("opening_hours", "")
-                # Link de Google Maps
-                maps_link = f"https://www.google.com/maps?q={elat},{elon}"
+            for place in results[:10]:
+                plat = place["geometry"]["location"]["lat"]
+                plon = place["geometry"]["location"]["lng"]
+                dist_m = round(haversine_km(lat, lon, plat, plon) * 1000)
+                address = place.get("vicinity", "")
+                maps_link = f"https://www.google.com/maps/place/?q=place_id:{place['place_id']}"
+                opening = ""
+                if place.get("opening_hours", {}).get("open_now") is True:
+                    opening = "Abierto ahora"
+                elif place.get("opening_hours", {}).get("open_now") is False:
+                    opening = "Cerrado ahora"
                 shops.append({
-                    "name": name,
-                    "type": shop_type,
+                    "name": place.get("name", ""),
+                    "type": place.get("types", [""])[0],
                     "distance_m": dist_m,
-                    "lat": elat,
-                    "lon": elon,
+                    "lat": plat,
+                    "lon": plon,
                     "address": address,
-                    "opening_hours": hours,
+                    "opening_hours": opening,
                     "maps_link": maps_link,
                 })
 
@@ -217,7 +219,7 @@ out body;"""
             return shops
 
     except Exception as e:
-        print(f"[Overpass] Error buscando comercios: {e}")
+        print(f"[Places] Error buscando comercios: {e}")
         return []
 
 async def check_shopping_proximity():
