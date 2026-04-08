@@ -1062,14 +1062,18 @@ def fuzzy_match_event(search_term: str, events: list) -> dict | None:
         return best_event
     return events[0]
 
-async def _find_calendar_event(search_term: str = None, phone: str = None) -> tuple[dict | None, str]:
+async def _find_calendar_event(search_term: str = None, phone: str = None, target_date: str = None) -> tuple[dict | None, str]:
     """Busca un evento en Calendar con multiples estrategias."""
     access_token = await get_gcal_access_token()
     if not access_token:
         return None, "Calendar no configurado"
     now = now_argentina()
-    time_min = (now - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00-03:00")
-    time_max = (now + timedelta(days=60)).strftime("%Y-%m-%dT23:59:59-03:00")
+    if target_date:
+        time_min = f"{target_date}T00:00:00-03:00"
+        time_max = f"{target_date}T23:59:59-03:00"
+    else:
+        time_min = (now - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00-03:00")
+        time_max = (now + timedelta(days=60)).strftime("%Y-%m-%dT23:59:59-03:00")
     async with httpx.AsyncClient() as http:
         headers = {"Authorization": f"Bearer {access_token}"}
         if not search_term:
@@ -1693,6 +1697,7 @@ async def handle_chat(phone: str, text: str) -> str:
                 "type": "object",
                 "properties": {
                     "search_term": {"type": ["string", "null"], "description": "Keyword para buscar el evento, o null para el ultimo tocado"},
+                    "target_date": {"type": ["string", "null"], "description": "YYYY-MM-DD de la instancia especifica a editar. Siempre completar si el usuario menciona un dia ('el de mañana', 'el del jueves', etc.)"},
                     "new_title": {"type": ["string", "null"]},
                     "new_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
                     "new_time": {"type": ["string", "null"], "description": "HH:MM"},
@@ -1917,7 +1922,7 @@ Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile q
                 t_result = "Error: " + str(e_proj)[:100]
         elif t_name == "editar_evento":
             search_term = t_input.get("search_term")
-            target_event, err = await _find_calendar_event(search_term, phone)
+            target_event, err = await _find_calendar_event(search_term, phone, target_date=t_input.get("target_date"))
             if not target_event:
                 t_result = err or "No encontre el evento."
             else:
@@ -2059,6 +2064,7 @@ async def handle_evento_agent(phone: str, text: str, image_b64=None, image_type=
                 "type": "object",
                 "properties": {
                     "search_term": {"type": ["string", "null"], "description": "Keyword para buscar el evento, o null para el ultimo tocado"},
+                    "target_date": {"type": ["string", "null"], "description": "YYYY-MM-DD de la instancia especifica a editar. Siempre completar si el usuario menciona un dia ('el de mañana', 'el del jueves', etc.)"},
                     "new_title": {"type": ["string", "null"]},
                     "new_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
                     "new_time": {"type": ["string", "null"], "description": "HH:MM"},
@@ -2169,7 +2175,7 @@ EVENTOS RECURRENTES:
 
         elif t_name == "editar_evento":
             search_term = t_input.get("search_term")
-            target_event, err = await _find_calendar_event(search_term, phone)
+            target_event, err = await _find_calendar_event(search_term, phone, target_date=t_input.get("target_date"))
             if not target_event:
                 t_result = err
             else:
