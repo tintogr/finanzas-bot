@@ -4320,9 +4320,11 @@ async def receive_location(request: Request):
                 if reminder.get("recurrent"):
                     # Recurrente: avisa y listo
                     await send_message(MY_NUMBER, msg)
+                    add_to_history(MY_NUMBER, "assistant", msg)
                 else:
                     # One-time: avisa + pregunta
                     await send_message(MY_NUMBER, msg)
+                    add_to_history(MY_NUMBER, "assistant", msg)
                     pending_state[MY_NUMBER] = {
                         "type": "geo_reminder_fired",
                         "page_id": reminder["page_id"],
