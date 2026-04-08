@@ -1748,6 +1748,19 @@ async def handle_chat(phone: str, text: str) -> str:
             "name": "web_search"
         },
         {
+            "name": "guardar_lugar_conocido",
+            "description": "Guarda una direccion como lugar conocido del usuario (casa, trabajo, gimnasio, etc). Usar cuando el usuario menciona donde vive, donde trabaja, o cualquier lugar de referencia personal.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "nombre": {"type": "string", "description": "Nombre del lugar. Ej: 'Casa', 'Trabajo', 'Gimnasio'"},
+                    "direccion": {"type": "string", "description": "Direccion completa para geocodificar. Ej: 'Islas Malvinas 809, Neuquen'"},
+                    "radio": {"type": "integer", "description": "Radio en metros para considerar que el usuario esta en ese lugar. Default 100."}
+                },
+                "required": ["nombre", "direccion"]
+            }
+        },
+        {
             "name": "consultar_geo_reminders",
             "description": "Lista los geo-reminders activos del usuario. Usar cuando pregunta que recordatorios de ubicacion tiene, cuales tiene activos, o quiere desactivar alguno.",
             "input_schema": {
@@ -1957,6 +1970,33 @@ Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile q
                         t_result = "No encontre ningun gasto llamado '" + search_term + "' en " + mes + "."
             except Exception as e:
                 t_result = "Error: " + str(e)[:100]
+        elif t_name == "guardar_lugar_conocido":
+            nombre = t_input.get("nombre", "")
+            direccion = t_input.get("direccion", "")
+            radio = t_input.get("radio", 100)
+            try:
+                async with httpx.AsyncClient(timeout=5) as http:
+                    api_key = os.environ.get("GOOGLE_PLACES_KEY", "")
+                    r = await http.get(
+                        "https://maps.googleapis.com/maps/api/geocode/json",
+                        params={"address": direccion, "key": api_key, "language": "es"}
+                    )
+                    if r.status_code == 200 and r.json().get("results"):
+                        result = r.json()["results"][0]
+                        place_lat = result["geometry"]["location"]["lat"]
+                        place_lon = result["geometry"]["location"]["lng"]
+                        formatted = result.get("formatted_address", direccion)
+                        places = user_prefs.get("known_places", [])
+                        # Reemplazar si ya existe el mismo nombre
+                        places = [p for p in places if p["name"].lower() != nombre.lower()]
+                        places.append({"name": nombre, "lat": place_lat, "lon": place_lon, "radius": radio})
+                        user_prefs["known_places"] = places
+                        await save_user_config(MY_NUMBER)
+                        t_result = f"Guardado: {nombre} → {formatted} (radio {radio}m)."
+                    else:
+                        t_result = f"No pude geocodificar '{direccion}'. Intenta con una direccion mas completa."
+            except Exception as e:
+                t_result = f"Error: {str(e)[:100]}"
         elif t_name == "editar_geo_reminder":
             import unicodedata
             def strip_accents(s):
