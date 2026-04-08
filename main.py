@@ -1685,6 +1685,22 @@ async def handle_chat(phone: str, text: str) -> str:
                 },
                 "required": ["name", "entry_type", "area", "emoji"]
             }
+        },
+        {
+            "name": "editar_evento",
+            "description": "Edita un evento existente en Google Calendar. Usa cuando el usuario quiere cambiar la hora, fecha, titulo o ubicacion de un evento ya creado.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": ["string", "null"], "description": "Keyword para buscar el evento, o null para el ultimo tocado"},
+                    "new_title": {"type": ["string", "null"]},
+                    "new_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+                    "new_time": {"type": ["string", "null"], "description": "HH:MM"},
+                    "new_location": {"type": ["string", "null"]},
+                    "new_description": {"type": ["string", "null"]}
+                },
+                "required": []
+            }
         }
     ]
 
@@ -1692,6 +1708,7 @@ async def handle_chat(phone: str, text: str) -> str:
 Hoy: {hoy_str(now)}.
 Calendario de referencia: {semana_str(now)}.
 REGLA CRITICA: cuando el usuario menciona un dia de la semana, usa EXACTAMENTE la fecha de la tabla de arriba. NO calcules fechas mentalmente.
+REGLA CRITICA 2: para calculos de fechas, dias de la semana, "que dia cae", "dentro de X dias", NO uses web_search. Calculalo directamente con la tabla de referencia o con aritmetica simple.
 {user_context}
 Si el usuario pregunta algo que ya sabes por su configuracion, responde directamente sin usar herramientas.
 
@@ -1898,6 +1915,50 @@ Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile q
                         t_result = "Error creando proyecto: " + r_proj.text[:100]
             except Exception as e_proj:
                 t_result = "Error: " + str(e_proj)[:100]
+        elif t_name == "editar_evento":
+            search_term = t_input.get("search_term")
+            target_event, err = await _find_calendar_event(search_term, phone)
+            if not target_event:
+                t_result = err or "No encontre el evento."
+            else:
+                event_id = target_event["id"]
+                event_name = target_event.get("summary", "Evento")
+                patch_body = {}
+                if t_input.get("new_title"):
+                    patch_body["summary"] = t_input["new_title"]
+                if t_input.get("new_location"):
+                    patch_body["location"] = t_input["new_location"]
+                if t_input.get("new_description"):
+                    patch_body["description"] = t_input["new_description"]
+                if t_input.get("new_date") or t_input.get("new_time"):
+                    if "dateTime" in target_event.get("start", {}):
+                        old_dt = target_event["start"]["dateTime"][:16]
+                        new_date = t_input.get("new_date") or old_dt[:10]
+                        new_time = t_input.get("new_time") or old_dt[11:16]
+                        patch_body["start"] = {"dateTime": f"{new_date}T{new_time}:00", "timeZone": "America/Argentina/Buenos_Aires"}
+                        if "dateTime" in target_event.get("end", {}):
+                            dur = datetime.strptime(target_event["end"]["dateTime"][:16], "%Y-%m-%dT%H:%M") - datetime.strptime(old_dt, "%Y-%m-%dT%H:%M")
+                            new_end = datetime.strptime(f"{new_date}T{new_time}", "%Y-%m-%dT%H:%M") + dur
+                            patch_body["end"] = {"dateTime": new_end.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "America/Argentina/Buenos_Aires"}
+                    elif t_input.get("new_date"):
+                        patch_body["start"] = {"date": t_input["new_date"]}
+                        patch_body["end"] = {"date": t_input["new_date"]}
+                if not patch_body:
+                    t_result = "No entendi que campo cambiar."
+                else:
+                    access_token = await get_gcal_access_token()
+                    async with httpx.AsyncClient() as http:
+                        update_r = await http.patch(
+                            f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}",
+                            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                            json=patch_body
+                        )
+                    if update_r.status_code == 200:
+                        new_summary = patch_body.get("summary", event_name)
+                        last_event_touched[phone] = {"event_id": event_id, "summary": new_summary}
+                        t_result = "Evento '" + event_name + "' actualizado correctamente."
+                    else:
+                        t_result = "Error actualizando: " + update_r.text[:100]
         return t_result
 
     # ── Primera ronda de tools ────────────────────────────────────────────
@@ -4033,6 +4094,8 @@ async def check_geo_reminders(lat: float, lon: float) -> list[dict]:
 _last_proximity_check: dict[str, datetime] = {}
 _last_proximity_store: dict[str, str] = {}
 _last_location_save: datetime | None = None
+_geo_reminder_cooldowns: dict[str, datetime] = {}
+GEO_REMINDER_COOLDOWN_SECONDS = 600
 
 async def save_location_to_notion(lat: float, lon: float, loc_name: str = None):
     """Persiste la ubicacion en Notion Config para sobrevivir reinicios."""
@@ -4092,6 +4155,11 @@ async def receive_location(request: Request):
         if not is_in_transit() and 9 <= now.hour <= 22:
             triggered = await check_geo_reminders(float(lat), float(lon))
             for reminder in triggered:
+                r_id = reminder["page_id"]
+                last_fire = _geo_reminder_cooldowns.get(r_id)
+                if last_fire and (now - last_fire).total_seconds() < GEO_REMINDER_COOLDOWN_SECONDS:
+                    continue
+                _geo_reminder_cooldowns[r_id] = now
                 shop = reminder.get("_matched_shop")
                 if shop:
                     shop_info = f"*{shop['name']}* a {shop['distance_m']}m"
