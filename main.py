@@ -1748,6 +1748,15 @@ async def handle_chat(phone: str, text: str) -> str:
             "name": "web_search"
         },
         {
+            "name": "consultar_geo_reminders",
+            "description": "Lista los geo-reminders activos del usuario. Usar cuando pregunta que recordatorios de ubicacion tiene, cuales tiene activos, o quiere desactivar alguno.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
             "name": "buscar_comercios_cercanos",
             "description": "Busca comercios, negocios o locales cerca de la ubicacion actual del usuario usando Google Places. Usar cuando el usuario pregunta si hay algun negocio cerca, si tiene alguna tienda a mano, donde queda tal comercio, etc.",
             "input_schema": {
@@ -1933,6 +1942,21 @@ Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile q
                         t_result = "No encontre ningun gasto llamado '" + search_term + "' en " + mes + "."
             except Exception as e:
                 t_result = "Error: " + str(e)[:100]
+        elif t_name == "consultar_geo_reminders":
+            if geo_reminders_cache:
+                lines = []
+                for r in geo_reminders_cache:
+                    tipo = "🔁 Recurrente" if r.get("recurrent") else "1️⃣ Una vez"
+                    if r.get("type") == "shop" and r.get("shop_name"):
+                        lugar = f"cerca de {r['shop_name']}"
+                    elif r.get("lat") and r.get("lon"):
+                        lugar = f"en coordenadas {r['lat']:.4f}, {r['lon']:.4f} (radio {r.get('radius', 300)}m)"
+                    else:
+                        lugar = "ubicacion no especificada"
+                    lines.append(f"- {r['name']} — {lugar} — {tipo}")
+                t_result = "Geo-reminders activos:\n" + "\n".join(lines)
+            else:
+                t_result = "No hay geo-reminders activos."
         elif t_name == "buscar_comercios_cercanos":
             lat, lon = get_current_location()
             nombre = t_input.get("nombre", "")
