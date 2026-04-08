@@ -1734,6 +1734,18 @@ async def handle_chat(phone: str, text: str) -> str:
             "name": "web_search"
         },
         {
+            "name": "buscar_comercios_cercanos",
+            "description": "Busca comercios, negocios o locales cerca de la ubicacion actual del usuario usando Google Places. Usar cuando el usuario pregunta si hay algun negocio cerca, si tiene alguna tienda a mano, donde queda tal comercio, etc.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "nombre": {"type": "string", "description": "Nombre del comercio o tipo de negocio. Ej: 'La Anonima', 'farmacia', 'panaderia', 'Panipunto'"},
+                    "radio_metros": {"type": "integer", "description": "Radio de busqueda en metros. Default 1000."}
+                },
+                "required": ["nombre"]
+            }
+        },
+        {
             "name": "calcular_fecha",
             "description": "Calcula fechas exactas a partir de descripciones como 'el segundo sabado de septiembre', 'el ultimo viernes de octubre', 'dentro de 15 dias'. Usar SIEMPRE antes de crear o editar un evento cuando la fecha viene de una descripcion relativa.",
             "input_schema": {
@@ -1907,6 +1919,24 @@ Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile q
                         t_result = "No encontre ningun gasto llamado '" + search_term + "' en " + mes + "."
             except Exception as e:
                 t_result = "Error: " + str(e)[:100]
+        elif t_name == "buscar_comercios_cercanos":
+            lat, lon = get_current_location()
+            nombre = t_input.get("nombre", "")
+            radio = t_input.get("radio_metros", 1000)
+            shops = await search_nearby_shops(lat, lon, radius=radio, name_filter=nombre)
+            if shops:
+                lines = []
+                for s in shops[:5]:
+                    line = f"- {s['name']} a {s['distance_m']}m"
+                    if s.get("address"):
+                        line += f" ({s['address']})"
+                    if s.get("opening_hours"):
+                        line += f" — {s['opening_hours']}"
+                    line += f" — {s['maps_link']}"
+                    lines.append(line)
+                t_result = "\n".join(lines)
+            else:
+                t_result = f"No encontre '{nombre}' en un radio de {radio}m."
         elif t_name == "calcular_fecha":
             t_result = calcular_fecha_exacta(t_input.get("descripcion", ""))
         elif t_name == "buscar_gastos":
