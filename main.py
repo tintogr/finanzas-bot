@@ -120,7 +120,23 @@ def is_in_transit() -> bool:
     return current_location.get("velocity", 0) > 15
 
 async def reverse_geocode(lat: float, lon: float) -> str | None:
-    """Devuelve nombre de localidad usando Nominatim. Prueba zooms progresivos para cubrir pueblos chicos."""
+    """Devuelve direccion completa usando Google Geocoding API, con fallback a Nominatim."""
+    api_key = os.environ.get("GOOGLE_PLACES_KEY", "")
+    if api_key:
+        try:
+            async with httpx.AsyncClient(timeout=5) as http:
+                r = await http.get(
+                    "https://maps.googleapis.com/maps/api/geocode/json",
+                    params={"latlng": f"{lat},{lon}", "key": api_key, "language": "es"}
+                )
+                if r.status_code == 200:
+                    results = r.json().get("results", [])
+                    if results:
+                        # El primer resultado es el más específico (calle + número)
+                        return results[0].get("formatted_address", "")
+        except Exception:
+            pass
+    # Fallback a Nominatim si no hay key o falla Google
     try:
         async with httpx.AsyncClient(timeout=5) as http:
             for zoom in [14, 12, 10, 8, 6]:
@@ -140,10 +156,8 @@ async def reverse_geocode(lat: float, lon: float) -> str | None:
                         if state and state.lower() not in val.lower():
                             return f"{val}, {state}"
                         return val
-                # Fallback: usar el display_name recortado
                 display = data.get("display_name", "")
                 if display:
-                    # Tomar las primeras 2 partes del display_name (ej: "Villa Ventana, Tornquist")
                     parts = [p.strip() for p in display.split(",")[:2]]
                     return ", ".join(parts)
     except Exception:
