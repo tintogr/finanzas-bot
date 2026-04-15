@@ -164,6 +164,28 @@ async def reverse_geocode(lat: float, lon: float) -> str | None:
         pass
     return None
 
+async def extract_coords_from_maps_url(url: str) -> tuple[float, float] | None:
+    """Extrae coordenadas de un link de Google Maps (maps.app.goo.gl, etc)."""
+    import re
+    m = re.search(r'@(-?\d{1,3}\.\d{4,}),(-?\d{1,3}\.\d{4,})', url)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as http:
+            r = await http.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            final_url = str(r.url)
+            for pattern in [
+                r'@(-?\d{1,3}\.\d{4,}),(-?\d{1,3}\.\d{4,})',
+                r'[?&]q=(-?\d{1,3}\.\d{4,}),(-?\d{1,3}\.\d{4,})',
+                r'/place/[^@]+@(-?\d{1,3}\.\d{4,}),(-?\d{1,3}\.\d{4,})',
+            ]:
+                m = re.search(pattern, final_url)
+                if m:
+                    return float(m.group(1)), float(m.group(2))
+    except Exception:
+        pass
+    return None
+
 async def search_nearby_shops(lat: float, lon: float, radius: int = 500, shop_types: list = None, name_filter: str = None) -> list[dict]:
     """Busca comercios cercanos usando Google Places API."""
     api_key = os.environ.get("GOOGLE_PLACES_KEY", "")
@@ -1726,19 +1748,20 @@ async def handle_chat(phone: str, text: str) -> str:
     _ulat = float(current_location.get("lat") or USER_LAT)
     _ulon = float(current_location.get("lon") or USER_LON)
     _uloc = current_location.get("location_name")
-    if current_location.get("source") == "owntracks":
-        place = is_at_known_place()
-        if place:
-            user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): {place['name']} ({_ulat:.5f}, {_ulon:.5f}).")
-        elif _uloc:
-            user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): {_uloc} ({_ulat:.5f}, {_ulon:.5f}).")
-        else:
-            user_context_parts.append(f"Ubicacion GPS actual (OwnTracks): coordenadas {_ulat:.5f}, {_ulon:.5f}. Nombre no resuelto.")
+    _upd = current_location.get("updated_at")
+    _src = current_location.get("source", "default")
+    if _src == "owntracks":
+        _age = int((now - _upd).total_seconds() / 60) if _upd else None
+        _age_str = f" (hace {_age} min)" if _age is not None else ""
+        _place = is_at_known_place()
+        _loc_label = _place["name"] if _place else (_uloc or f"{_ulat:.5f}, {_ulon:.5f}")
+        user_context_parts.append(f"Ubicacion GPS (OwnTracks){_age_str}: {_loc_label} ({_ulat:.5f}, {_ulon:.5f}).")
+    elif _upd:
+        _age = int((now - _upd).total_seconds() / 60)
+        _loc_label = _uloc or f"{_ulat:.5f}, {_ulon:.5f}"
+        user_context_parts.append(f"Ultima ubicacion conocida: {_loc_label} ({_ulat:.5f}, {_ulon:.5f}), hace {_age} minutos — OwnTracks inactivo. Si el usuario pregunta donde esta, informale la ultima ubicacion registrada y sugeríle que abra OwnTracks para actualizar.")
     else:
-        if _uloc:
-            user_context_parts.append(f"Ubicacion aproximada: {_uloc} ({_ulat:.5f}, {_ulon:.5f}) — sin GPS activo.")
-        else:
-            user_context_parts.append(f"Ubicacion aproximada: Neuquen ({_ulat:.5f}, {_ulon:.5f}) — sin GPS activo, puede ser impreciso.")
+        user_context_parts.append(f"Ubicacion aproximada: Neuquen ({_ulat:.5f}, {_ulon:.5f}) — OwnTracks sin datos.")
     user_context = "\n".join(user_context_parts)
 
     tools = [
@@ -1836,6 +1859,15 @@ async def handle_chat(phone: str, text: str) -> str:
                     "radio": {"type": "integer", "description": "Radio en metros para considerar que el usuario esta en ese lugar. Default 100."}
                 },
                 "required": ["nombre", "direccion"]
+            }
+        },
+        {
+            "name": "consultar_lugares_conocidos",
+            "description": "Lista los lugares conocidos guardados del usuario (casa, trabajo, gimnasio, etc). Usar cuando el usuario pregunta que lugares tiene guardados, donde queda su trabajo o casa, o si quiere verificar si un lugar esta guardado.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
             }
         },
         {
@@ -1979,7 +2011,8 @@ CAPACIDADES COMPLETAS DE MATRICS (no niegues ninguna):
 - Configurar Matrics (horarios, extras, saludo)
 
 Si el usuario dice que hiciste algo o que Matrics hizo algo, NO lo niegues. Consulta el calendario o Notion para verificarlo.
-Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile que SI puede hacerlo y guialo."""
+Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile que SI puede hacerlo y guialo.
+CRITICO: si guardar_lugar_conocido devuelve error o dice "NO fue guardado", informale al usuario que el lugar NO quedo guardado y sugeríle compartir la ubicacion por WhatsApp. NUNCA confirmes que se guardo algo cuando la tool fallo."""
 
     messages = history + [{"role": "user", "content": text}]
 
@@ -2057,26 +2090,32 @@ Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile q
             try:
                 async with httpx.AsyncClient(timeout=5) as http:
                     api_key = os.environ.get("GOOGLE_PLACES_KEY", "")
-                    r = await http.get(
-                        "https://maps.googleapis.com/maps/api/geocode/json",
-                        params={"address": direccion, "key": api_key, "language": "es"}
-                    )
-                    if r.status_code == 200 and r.json().get("results"):
-                        result = r.json()["results"][0]
-                        place_lat = result["geometry"]["location"]["lat"]
-                        place_lon = result["geometry"]["location"]["lng"]
-                        formatted = result.get("formatted_address", direccion)
+                    _attempts = [direccion]
+                    if not any(k in direccion.lower() for k in ["argentina", "neuquen", "neuquén"]):
+                        _attempts.append(f"{direccion}, Neuquén, Argentina")
+                    _geo_result = None
+                    for _addr in _attempts:
+                        r = await http.get(
+                            "https://maps.googleapis.com/maps/api/geocode/json",
+                            params={"address": _addr, "key": api_key, "language": "es"}
+                        )
+                        if r.status_code == 200 and r.json().get("results"):
+                            _geo_result = r.json()["results"][0]
+                            break
+                    if _geo_result:
+                        place_lat = _geo_result["geometry"]["location"]["lat"]
+                        place_lon = _geo_result["geometry"]["location"]["lng"]
+                        formatted = _geo_result.get("formatted_address", direccion)
                         places = user_prefs.get("known_places", [])
-                        # Reemplazar si ya existe el mismo nombre
                         places = [p for p in places if p["name"].lower() != nombre.lower()]
                         places.append({"name": nombre, "lat": place_lat, "lon": place_lon, "radius": radio})
                         user_prefs["known_places"] = places
                         await save_user_config(MY_NUMBER)
-                        t_result = f"Guardado: {nombre} → {formatted} (radio {radio}m)."
+                        t_result = f"Guardado: {nombre} en {formatted} (radio {radio}m)."
                     else:
-                        t_result = f"No pude geocodificar '{direccion}'. Intenta con una direccion mas completa."
+                        t_result = f"No pude ubicar '{direccion}'. El lugar NO fue guardado. Informale al usuario y sugeríle que comparta la ubicacion directamente desde WhatsApp (adjuntar → ubicacion)."
             except Exception as e:
-                t_result = f"Error: {str(e)[:100]}"
+                t_result = f"Error: {str(e)[:100]}. El lugar NO fue guardado."
         elif t_name == "editar_geo_reminder":
             import unicodedata
             def strip_accents(s):
@@ -2128,6 +2167,17 @@ Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile q
                         t_result = f"Error actualizando en Notion: {r.text[:100]}"
                 except Exception as e:
                     t_result = f"Error: {str(e)[:100]}"
+        elif t_name == "consultar_lugares_conocidos":
+            places = user_prefs.get("known_places", [])
+            if places:
+                lines = []
+                for p in places:
+                    lat_s = f"{float(p['lat']):.5f}" if p.get("lat") is not None else "?"
+                    lon_s = f"{float(p['lon']):.5f}" if p.get("lon") is not None else "?"
+                    lines.append(f"- {p['name']}: {lat_s}, {lon_s} (radio {p.get('radius', 200)}m)")
+                t_result = "Lugares conocidos:\n" + "\n".join(lines)
+            else:
+                t_result = "No hay lugares conocidos guardados todavia."
         elif t_name == "consultar_geo_reminders":
             if geo_reminders_cache:
                 lines = []
@@ -3264,8 +3314,23 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
         description = state.get("description", "Recordatorio")
         recurrent = state.get("recurrent", False)
         del pending_state[phone]
-        # Intentar extraer coordenadas del texto antes de geocodificar
+        # Intentar extraer link de Maps o coordenadas del texto
         import re
+        _maps_match = re.search(r'https?://(?:maps\.app\.goo\.gl|goo\.gl/maps|maps\.google\.com)\S*', text)
+        if _maps_match:
+            _maps_coords = await extract_coords_from_maps_url(_maps_match.group(0))
+            if _maps_coords:
+                _lat, _lon = _maps_coords
+                ok, _ = await create_geo_reminder(
+                    description=description, rtype="place",
+                    lat=_lat, lon=_lon, recurrent=recurrent,
+                )
+                if ok:
+                    freq = "Cada vez que" if recurrent else "La proxima vez que"
+                    await send_message(phone, f"Geo-reminder guardado\n_{description}_\nCoordenadas del link: {_lat:.5f}, {_lon:.5f}\n{freq} estes cerca, te aviso.")
+                else:
+                    await send_message(phone, "No pude guardar el geo-reminder.")
+                return True
         _coord = re.search(r'(-\d{2,3}\.\d{4,})[,\s]+(-\d{2,3}\.\d{4,})', text)
         if _coord:
             _lat = float(_coord.group(1))
@@ -3406,8 +3471,22 @@ Responde SOLO JSON valido sin markdown:
     address = data.get("address")
     radius = int(data.get("radius") or 300)
 
-    # Detectar coordenadas directamente en el texto original
+    # Detectar link de Google Maps en el texto
     import re
+    _maps_match = re.search(r'https?://(?:maps\.app\.goo\.gl|goo\.gl/maps|maps\.google\.com)\S*', text)
+    if _maps_match and not (rtype == "shop" and shop_name):
+        _maps_coords = await extract_coords_from_maps_url(_maps_match.group(0))
+        if _maps_coords:
+            _lat, _lon = _maps_coords
+            ok, _ = await create_geo_reminder(
+                description=description, rtype="place",
+                lat=_lat, lon=_lon, radius=radius, recurrent=recurrent,
+            )
+            if ok:
+                freq = "Cada vez que" if recurrent else "La proxima vez que"
+                return f"Geo-reminder guardado\n_{description}_\nSaque las coordenadas del link: {_lat:.5f}, {_lon:.5f} (radio: {radius}m)\n{freq} estes cerca, te aviso."
+            return "No pude guardar el geo-reminder."
+    # Detectar coordenadas directamente en el texto original
     _coord = re.search(r'(-\d{2,3}\.\d{4,})[,\s]+(-\d{2,3}\.\d{4,})', text)
     if _coord and not (rtype == "shop" and shop_name):
         _lat = float(_coord.group(1))
@@ -3783,11 +3862,16 @@ async def cron_job():
     effective_minute = user_prefs.get("daily_summary_minute")
     if effective_hour is None:   effective_hour   = DAILY_SUMMARY_HOUR
     if effective_minute is None: effective_minute = 0
-    if now.hour == effective_hour and now.minute == effective_minute:
+    _sched_min = effective_hour * 60 + effective_minute
+    _curr_min = now.hour * 60 + now.minute
+    _last_daily = _last_summary_sent.get("daily")
+    _sent_today = bool(_last_daily and _last_daily.date() == now.date())
+    if 0 <= (_curr_min - _sched_min) <= 29 and not _sent_today:
         try:
             access_token_summary = await get_gcal_access_token()
             async with httpx.AsyncClient() as http_summary:
                 await send_daily_summary(http_summary, access_token_summary, now)
+            _last_summary_sent["daily"] = now
             fired.append("DAILY_SUMMARY")
         except Exception as e:
             fired.append(f"DAILY_SUMMARY_ERROR: {str(e)[:60]}")
@@ -4500,6 +4584,7 @@ async def check_geo_reminders(lat: float, lon: float) -> list[dict]:
 _last_proximity_check: dict[str, datetime] = {}
 _last_proximity_store: dict[str, str] = {}
 _last_location_save: datetime | None = None
+_last_summary_sent: dict[str, datetime | None] = {"daily": None, "nocturno": None}
 _geo_reminder_cooldowns: dict[str, datetime] = {}
 GEO_REMINDER_COOLDOWN_SECONDS = 600
 _geo_reminders_in_range: set[str] = set()
