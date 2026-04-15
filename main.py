@@ -728,42 +728,26 @@ Emoji: elegi el mas especifico segun el contexto real."""
 async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, str]:
     if not data.get("value_ars") or not data.get("in_out"):
         return False, "No se pudo interpretar"
-    normalized_in_out = normalize_in_out(data["in_out"])
-    props = {
-        "Name":          {"title": [{"text": {"content": data["name"]}}]},
-        "In - Out":      {"select": {"name": normalized_in_out}},
-        "Value (ars)":   {"number": float(data["value_ars"])},
-        "Exchange Rate": {"number": exchange_rate},
-        "Method":        {"select": {"name": data.get("metodo", "Payment")}},
-    }
-    if data.get("categoria"):
-        props["Category"] = {"multi_select": [{"name": c} for c in data["categoria"]]}
-    if data.get("date"):
-        if data.get("time"):
-            props["Date"] = {"date": {"start": f"{data['date']}T{data['time']}:00", "time_zone": "America/Argentina/Buenos_Aires"}}
-        else:
-            props["Date"] = {"date": {"start": data["date"]}}
-    if data.get("client"):
-        props["Client"] = {"multi_select": [{"name": c} for c in data["client"]]}
-    if data.get("litros") is not None:
-        props["Liters"] = {"number": float(data["litros"])}
-    if data.get("consumo_kwh") is not None:
-        props["Consumption (kWh)"] = {"number": float(data["consumo_kwh"])}
-    if data.get("notas"):
-        props["Notes"] = {"rich_text": [{"text": {"content": data["notas"]}}]}
-    emoji = data.get("emoji") or "\U0001f4b8"
-    db_id = NOTION_DB_ID.replace("-", "")
-    async with httpx.AsyncClient() as http:
-        r = await http.post("https://api.notion.com/v1/pages",
-            headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
-            json={"parent": {"database_id": db_id}, "icon": {"type": "emoji", "emoji": emoji}, "properties": props}
-        )
-        if r.status_code == 200:
-            page_id = r.json().get("id", "")
-            last_touched[MY_NUMBER] = {"page_id": page_id, "name": data["name"]}
-            return True, page_id
-        return False, r.text
-
+    try:
+        entry = await _ds.create_expense({
+            "name":         data["name"],
+            "in_out":       data["in_out"],
+            "value_ars":    data["value_ars"],
+            "exchange_rate": exchange_rate,
+            "categories":   data.get("categoria"),
+            "method":       data.get("metodo", "Payment"),
+            "date":         data.get("date"),
+            "time":         data.get("time"),
+            "client":       data.get("client"),
+            "liters":       data.get("litros"),
+            "consumo_kwh":  data.get("consumo_kwh"),
+            "notes":        data.get("notas"),
+            "emoji":        data.get("emoji"),
+        })
+        last_touched[MY_NUMBER] = {"page_id": entry.id, "name": data["name"]}
+        return True, entry.id
+    except Exception as e:
+        return False, str(e)
 async def check_and_apply_category(name: str, predicted_cats: list[str]) -> tuple[list[str], str | None]:
     name_lower = name.lower()
     for keyword, saved_cats in category_overrides.items():
