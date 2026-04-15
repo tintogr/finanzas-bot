@@ -3791,9 +3791,9 @@ Responde:
         except Exception:
             pass
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health():
-    return {"status": "ok", "bot": "matrics"}
+    return {"status": "ok", "bot": "knot"}
 
 # ── MODULO RECORDATORIOS ───────────────────────────────────────────────────────
 async def parse_recordatorio(text: str) -> dict:
