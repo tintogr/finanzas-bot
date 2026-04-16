@@ -3799,7 +3799,7 @@ async def process_message(message: dict):
             respuesta = await handle_chat(from_number, text)
             if respuesta:
                 await send_message(from_number, respuesta)
-            if "Ingredientes:" in respuesta and "Preparacion:" in respuesta:
+                if "Ingredientes:" in respuesta and "Preparacion:" in respuesta:
                 try:
                     ext_response = claude_create(
                         model="claude-sonnet-4-20250514", max_tokens=400,
@@ -4146,9 +4146,17 @@ async def mark_factura_task_paid(page_id: str) -> bool:
         return False
 
 async def send_daily_summary(http, access_token: str, now: datetime):
+    _hora = now.hour
+    if _hora < 12:
+        _saludo_tiempo = "Buenos días"
+    elif _hora < 19:
+        _saludo_tiempo = "Buenas tardes"
+    else:
+        _saludo_tiempo = "Buenas noches"
     events = []
     try:
-        r = await http.get(
+        async with httpx.AsyncClient(timeout=10) as _cal_http:
+            r = await _cal_http.get(
             "https://www.googleapis.com/calendar/v3/calendars/primary/events",
             headers={"Authorization": f"Bearer {access_token}"},
             params={
@@ -4163,7 +4171,7 @@ async def send_daily_summary(http, access_token: str, now: datetime):
         pass
     w = await get_weather()
     await load_user_config(MY_NUMBER)
-    greeting = user_prefs.get("greeting_name") or "Buenos dias"
+    greeting = user_prefs.get("greeting_name") or _saludo_tiempo
     lines = [f"*{greeting}!*", ""]
     if w:
         lines.append(f"🌡️ {w['temp']}C (sensacion {w['sensacion']}C) -- {w['emoji']} {w['desc']}")
@@ -4288,10 +4296,11 @@ Mostrar SOLO las facturas sin pago registrado claro. Si todas estan pagas, respo
             try:
                 tasks_resp = claude_create(
                     model="claude-sonnet-4-20250514", max_tokens=400,
-                    system="Extraé las facturas pendientes del texto. Responde SOLO array JSON sin markdown.",
-                    messages=[{"role": "user", "content": f"""Texto con facturas pendientes:
+                    system="Extraé SOLO las facturas que NO tienen pago registrado confirmado. Ignora cualquier factura que el texto marque como pagada, pagada exacta, o con pago registrado. Responde SOLO array JSON sin markdown. Si no hay facturas pendientes reales, responde array vacio [].",
+                messages=[{"role": "user", "content": f"""Texto de facturas:
 {filtered_gmail}
-Extraé cada factura. Responde SOLO:
+Extraé SOLO las facturas sin pago registrado claro. NO incluyas las que digan "pagada", "pago registrado", "pagada exacta" o similar.
+Responde SOLO:
 [{{"provider": "nombre empresa", "amount": numero o null, "due_date": "YYYY-MM-DD o null", "period": "Mes YYYY"}}]"""}]
                 )
                 raw_inv = tasks_resp.content[0].text.strip().strip("`").lstrip("json").strip()
