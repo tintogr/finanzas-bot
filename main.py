@@ -3809,17 +3809,17 @@ Texto: {respuesta[:2000]}
 Responde:
 {{"name": "nombre de la receta",
   "ingredients": ["ingrediente1", "ingrediente2", ...]}}"""}]
-                    )
-                    raw_ext = ext_response.content[0].text.strip()
-                    if raw_ext.startswith("```"):
-                        raw_ext = raw_ext.strip("`").lstrip("json").strip()
-                    extracted = json.loads(raw_ext)
-                    recipe_name_chat = extracted.get("name", "Receta")
-                    ingredient_list_chat = extracted.get("ingredients", [])
-                    enriched_chat = await enrich_items_with_claude(ingredient_list_chat) if ingredient_list_chat else []
-                except Exception:
-                    recipe_name_chat = "Receta"
-                    enriched_chat = []
+                        )
+                        raw_ext = ext_response.content[0].text.strip()
+                        if raw_ext.startswith("```"):
+                            raw_ext = raw_ext.strip("`").lstrip("json").strip()
+                        extracted = json.loads(raw_ext)
+                        recipe_name_chat = extracted.get("name", "Receta")
+                        ingredient_list_chat = extracted.get("ingredients", [])
+                        enriched_chat = await enrich_items_with_claude(ingredient_list_chat) if ingredient_list_chat else []
+                    except Exception:
+                        recipe_name_chat = "Receta"
+                        enriched_chat = []
                 pending_state[from_number] = {
                     "type": "recipe_save_confirm",
                     "recipe_name": recipe_name_chat,
