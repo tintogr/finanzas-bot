@@ -1,4 +1,4 @@
-# 🤖 Bot de Finanzas — Telegram → Notion
+# 🤖 KNOT — ASISTENTE PERSONAL
 
 Bot que interpreta mensajes de texto e imágenes con Claude y los guarda automáticamente en tu base de datos Notion, con el tipo de cambio del día incluido.
 
