@@ -3227,9 +3227,11 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
         t = text.strip().lower()
         minutes = reminder_map.get(text.strip(), "unknown")
         if minutes == "unknown":
-            # Parseo de lenguaje natural
-            if any(x in t for x in ["no ", "nah", "paso", "sin aviso", "no gracias"]) or t == "no":
+            # Parseo de lenguaje natural — solo mensajes cortos y claros
+            if t in ["no", "nah", "paso", "no gracias", "sin aviso", "sin recordatorio", "no por favor"]:
                 minutes = None
+            elif t.startswith("no") and len(t.split()) <= 2:
+                minutes = None  # "no gracias", "no igual" pero NO "no tengo el domingo"
             elif "1 hora" in t or "una hora" in t or "60 min" in t:
                 minutes = 60
             elif "30 min" in t or "media hora" in t:
