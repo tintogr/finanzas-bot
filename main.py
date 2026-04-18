@@ -2679,6 +2679,7 @@ EVENTOS RECURRENTES:
     # ── Ejecutar primera ronda de tools ───────────────────────────────────
     evento_creado = None
     eventos_creados_count = 0
+    eventos_tocados = []  # todos los creados/editados con hora, para ofrecer recordatorios
 
     async def _execute_evento_tool(t_name, t_input):
         nonlocal evento_creado, eventos_creados_count
@@ -2694,6 +2695,8 @@ EVENTOS RECURRENTES:
                 last_event_touched[phone] = {"event_id": event_id, "summary": data.get("summary", "Evento")}
                 evento_creado = {"data": data, "event_id": event_id}
                 eventos_creados_count += 1
+                if data.get("time"):
+                    eventos_tocados.append({"summary": data.get("summary", "Evento"), "date": data["date"], "time": data["time"]})
                 hora = f" a las {data['time']}" if data.get("time") else ""
                 try:
                     fecha = datetime.strptime(data["date"], "%Y-%m-%d").strftime("%d/%m/%Y")
@@ -2748,6 +2751,10 @@ EVENTOS RECURRENTES:
                         new_summary = patch_body.get("summary", event_name)
                         last_event_touched[phone] = {"event_id": event_id, "summary": new_summary}
                         t_result = "Evento '" + event_name + "' actualizado correctamente."
+                        new_time = t_input.get("new_time") or (target_event.get("start", {}).get("dateTime", "")[:16][11:] if "dateTime" in target_event.get("start", {}) else None)
+                        new_date = t_input.get("new_date") or (target_event.get("start", {}).get("dateTime", "")[:10] if "dateTime" in target_event.get("start", {}) else None)
+                        if new_time and new_date:
+                            eventos_tocados.append({"summary": new_summary, "date": new_date, "time": new_time})
                     else:
                         t_result = "Error actualizando: " + update_r.text[:100]
         elif t_name == "eliminar_evento":
@@ -2860,12 +2867,12 @@ EVENTOS RECURRENTES:
     if not reply:
         reply = "Listo, revise tu calendario. Necesitas algo mas?"
 
-    if evento_creado and eventos_creados_count == 1 and evento_creado["data"].get("time"):
-        data = evento_creado["data"]
-        event_dt = f"{data['date']}T{data['time']}"
-        is_recurring = bool(data.get("recurrence"))
+    # Ofrecer recordatorio si hay eventos con hora (creados o editados)
+    if eventos_tocados:
         await send_message(phone, reply)
-        if is_recurring:
+        # Caso evento recurrente unico
+        if eventos_creados_count == 1 and evento_creado and evento_creado["data"].get("recurrence"):
+            data = evento_creado["data"]
             pending_state[phone] = {
                 "type": "recurring_event_reminder",
                 "event_id": evento_creado["event_id"],
@@ -2873,15 +2880,24 @@ EVENTOS RECURRENTES:
             }
             await send_message(phone, "Queres que te avise antes de cada " + data.get("summary", "sesion") + "? Decime con cuanta anticipacion (ej: '30 min', '1 hora', 'la noche anterior'). Podes elegir hasta 2 recordatorios.\n\nSi no queres recordatorio, manda 'no'.")
         else:
+            # Construir descripcion de eventos con fecha y hora
+            lineas = []
+            for ev in eventos_tocados:
+                try:
+                    fecha_fmt = datetime.strptime(ev["date"], "%Y-%m-%d")
+                    dia = DIAS_SEMANA[fecha_fmt.weekday()]
+                    fecha_label = f"{dia} {fecha_fmt.strftime('%d/%m')} {ev['time']}"
+                except Exception:
+                    fecha_label = f"{ev['date']} {ev['time']}"
+                lineas.append(f"_{ev['summary']}_ — {fecha_label}")
+            eventos_str = "\n".join(lineas)
             pending_state[phone] = {
                 "type": "event_reminder",
-                "event_id": evento_creado["event_id"],
-                "summary": data.get("summary", "Evento"),
-                "event_datetime": event_dt
+                "events": [{"summary": ev["summary"], "event_datetime": f"{ev['date']}T{ev['time']}"} for ev in eventos_tocados],
             }
             await send_interactive_buttons(
                 phone,
-                "Queres que te avise antes?",
+                f"Queres que te avise antes?\n{eventos_str}",
                 [
                     {"id": "rem_15", "title": "15 min antes"},
                     {"id": "rem_60", "title": "1 hora antes"},
@@ -3226,25 +3242,29 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
                 return False
         del pending_state[phone]
         if minutes is None:
-            await send_message(phone, "Sin recordatorio adicional")
+            await send_message(phone, "Sin recordatorio")
             return True
-        event_summary = state.get("summary", "Evento")
-        event_datetime = state.get("event_datetime")
-        if event_datetime:
+        # Soporte para lista de eventos o evento unico (backward compat)
+        events = state.get("events") or [{"summary": state.get("summary", "Evento"), "event_datetime": state.get("event_datetime")}]
+        label = "1 dia" if minutes == 1440 else f"{minutes} min"
+        resultados = []
+        now_naive = now_argentina().replace(tzinfo=None)
+        for ev in events:
+            ev_summary = ev.get("summary", "Evento")
+            ev_dt_str = ev.get("event_datetime")
+            if not ev_dt_str:
+                continue
             try:
-                fire_dt = datetime.strptime(event_datetime, "%Y-%m-%dT%H:%M") - timedelta(minutes=minutes)
-                if fire_dt > now_argentina().replace(tzinfo=None):
-                    event_data = {
-                        "summary": f"🔔 {event_summary}",
-                        "fire_at": fire_dt.strftime("%Y-%m-%dT%H:%M")
-                    }
-                    success, _ = await create_recordatorio(event_data)
-                    label = "1 dia" if minutes == 1440 else f"{minutes} minutos"
-                    await send_message(phone, f"Te aviso {label} antes de _{event_summary}_" if success else "No pude crear el recordatorio")
+                fire_dt = datetime.strptime(ev_dt_str, "%Y-%m-%dT%H:%M") - timedelta(minutes=minutes)
+                if fire_dt > now_naive:
+                    success, _ = await create_recordatorio({"summary": f"🔔 {ev_summary}", "fire_at": fire_dt.strftime("%Y-%m-%dT%H:%M")})
+                    resultados.append(f"_{ev_summary}_" if success else f"Error en _{ev_summary}_")
                 else:
-                    await send_message(phone, "Ese momento ya paso, no puedo crear el recordatorio")
+                    resultados.append(f"_{ev_summary}_ ya paso")
             except Exception:
-                await send_message(phone, "Error creando el recordatorio")
+                resultados.append(f"Error en _{ev_summary}_")
+        if resultados:
+            await send_message(phone, f"Te aviso {label} antes de: " + ", ".join(resultados))
         return True
 
     if state_type == "recurring_event_reminder":
