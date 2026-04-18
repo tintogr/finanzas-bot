@@ -1403,10 +1403,21 @@ async def query_calendar(days_ahead: int = 2, days_back: int = 0) -> str | None:
             start = e.get("start", {})
             loc_str = f" -- 📍{e.get('location', '')}" if e.get("location") else ""
             if "dateTime" in start:
-                dt = datetime.strptime(start["dateTime"][:16], "%Y-%m-%dT%H:%M")
-                lines.append(f"- {dt.strftime('%d/%m')} {dt.strftime('%H:%M')} -- {e.get('summary', 'Evento')}{loc_str}")
+                dt_str = start["dateTime"]
+                if dt_str.endswith("Z"):
+                    dt = datetime.strptime(dt_str[:16], "%Y-%m-%dT%H:%M") - timedelta(hours=3)
+                else:
+                    dt = datetime.strptime(dt_str[:16], "%Y-%m-%dT%H:%M")
+                dia = DIAS_SEMANA[dt.weekday()]
+                lines.append(f"- {dia} {dt.strftime('%d/%m')} {dt.strftime('%H:%M')} -- {e.get('summary', 'Evento')}{loc_str}")
             else:
-                lines.append(f"- {start.get('date', '')} -- {e.get('summary', 'Evento')} (todo el dia){loc_str}")
+                date_str = start.get("date", "")
+                if date_str:
+                    d = datetime.strptime(date_str, "%Y-%m-%d")
+                    dia = DIAS_SEMANA[d.weekday()]
+                    lines.append(f"- {dia} {d.strftime('%d/%m')} -- {e.get('summary', 'Evento')} (todo el dia){loc_str}")
+                else:
+                    lines.append(f"- {date_str} -- {e.get('summary', 'Evento')} (todo el dia){loc_str}")
         return "\n".join(lines)
 
 async def infer_service_providers() -> dict:
