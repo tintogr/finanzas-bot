@@ -908,20 +908,14 @@ async def eliminar_shopping(text: str) -> tuple[bool, str]:
     search_term = json.loads(raw).get("search_term", "")
     if not search_term:
         return False, "No entendi que item queres eliminar"
-    existing = await search_shopping_item(search_term)
-    if not existing:
+    results = await _ds.search_shopping_item(search_term)
+    if not results:
         return False, f"No encontre ningun item llamado _{search_term}_ en la lista"
-    page_id = existing[0]["id"]
-    item_name = existing[0]["properties"]["Name"]["title"][0]["plain_text"] if existing[0]["properties"]["Name"]["title"] else search_term
-    async with httpx.AsyncClient() as http:
-        r = await http.patch(
-            f"https://api.notion.com/v1/pages/{page_id}",
-            headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
-            json={"archived": True}
-        )
-        if r.status_code == 200:
-            return True, f"*{item_name}* eliminado de la lista de compras"
-        return False, f"Error eliminando el item: {r.text[:100]}"
+    item = results[0]
+    ok = await _ds.archive_shopping_item(item.id)
+    if ok:
+        return True, f"*{item.name}* eliminado de la lista de compras"
+    return False, "Error eliminando el item"
 
 # ── MODULO PLANTAS ─────────────────────────────────────────────────────────────
 PLANTA_SYSTEM = """Extrae info de una planta y genera recomendaciones de cuidado.
@@ -3806,16 +3800,16 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
             results_text = []
             for item in ingredients:
                 item_name = item.get("name", "")
-                existing = await search_shopping_item(item_name)
+                existing = await _ds.search_shopping_item(item_name)
                 if existing:
-                    async with httpx.AsyncClient() as http:
-                        await http.patch(f"https://api.notion.com/v1/pages/{existing[0]['id']}",
-                                         headers=notion_headers(),
-                                         json={"properties": {"Stock": {"checkbox": False}}})
+                    await _ds.update_shopping_item(existing[0].id, {"in_stock": False})
                     results_text.append(f"_{item_name}_ ya estaba, aparece como faltante")
                 else:
-                    ok, err = await add_shopping_item(item)
-                    results_text.append(f"_{item_name}_ agregado" if ok else f"Error: {err[:50]}")
+                    try:
+                        await _ds.add_shopping_item(item)
+                        results_text.append(f"_{item_name}_ agregado")
+                    except Exception as e:
+                        results_text.append(f"Error: {str(e)[:50]}")
             await send_message(phone, "\n".join(results_text) + "\n\nLista actualizada en Notion")
         else:
             await send_message(phone, f"_{recipe_name.capitalize()}_ guardada. Ingredientes no agregados a la lista de compras.")
@@ -5738,31 +5732,21 @@ Responde SOLO este JSON:
                 ing_name = ing_item.get("name", "").strip()
                 if not ing_name:
                     continue
-                results = await search_shopping_item(ing_name)
+                results = await _ds.search_shopping_item(ing_name)
                 if results:
-                    relation_ids.append({"id": results[0]["id"]})
+                    relation_ids.append({"id": results[0].id})
                 else:
-                    emoji = ing_item.get("emoji", "🛒")
-                    ing_props = {
-                        "Name":  {"title": [{"text": {"content": ing_name}}]},
-                        "Stock": {"checkbox": True},
-                    }
-                    if ing_item.get("category") in SHOPPING_CATEGORIES:
-                        ing_props["Category"] = {"select": {"name": ing_item["category"]}}
-                    if ing_item.get("store"):
-                        ing_props["Store"] = {"multi_select": [{"name": ing_item["store"]}]}
-                    if ing_item.get("frequency") in SHOPPING_FREQUENCY:
-                        ing_props["Frequency"] = {"status": {"name": ing_item["frequency"]}}
-                    async with httpx.AsyncClient() as http:
-                        r = await http.post(
-                            "https://api.notion.com/v1/pages",
-                            headers=notion_headers(),
-                            json={"parent": {"database_id": SHOPPING_DB_ID}, "icon": {"type": "emoji", "emoji": emoji}, "properties": ing_props}
-                        )
-                        if r.status_code == 200:
-                            relation_ids.append({"id": r.json()["id"]})
-                        else:
-                            return False, f"Error creando ingrediente '{ing_name}': {r.text[:100]}"
+                    try:
+                        new_item = await _ds.add_shopping_item({
+                            "name": ing_name,
+                            "emoji": ing_item.get("emoji", "🛒"),
+                            "category": ing_item.get("category", ""),
+                            "store": ing_item.get("store", ""),
+                            "frequency": ing_item.get("frequency", "One time"),
+                        })
+                        relation_ids.append({"id": new_item.id})
+                    except Exception as e:
+                        return False, f"Error creando ingrediente '{ing_name}': {str(e)[:100]}"
 
         props = {
             "Name": {"title": [{"text": {"content": recipe_name.capitalize()}}]},
@@ -5868,48 +5852,6 @@ Responde:
 GENERIC_WORDS = {"salsa", "crema", "pasta", "sopa", "caldo", "jugo",
                   "queso", "pan", "leche", "aceite", "harina", "arroz"}
 
-async def search_shopping_item(name: str) -> list:
-    name = name.strip()
-    candidates = [name]
-    if name.endswith("s") and len(name) > 3:
-        candidates.append(name[:-1])
-    first_word = name.split()[0].lower()
-    if len(name.split()) > 1 and len(first_word) > 5 and first_word not in GENERIC_WORDS:
-        candidates.append(name.split()[0])
-    async with httpx.AsyncClient() as http:
-        for candidate in candidates:
-            r = await http.post(
-                f"https://api.notion.com/v1/databases/{SHOPPING_DB_ID}/query",
-                headers=notion_headers(),
-                json={"filter": {"property": "Name", "title": {"contains": candidate[:25]}}}
-            )
-            results = r.json().get("results", []) if r.status_code == 200 else []
-            if results:
-                return results
-    return []
-
-async def add_shopping_item(item: dict) -> tuple[bool, str]:
-    name  = item.get("name", "").strip()
-    emoji = item.get("emoji", "🛒")
-    freq  = item.get("frequency", "One time")
-    store = item.get("store", "")
-    props = {
-        "Name":  {"title": [{"text": {"content": name}}]},
-        "Stock": {"checkbox": False},
-    }
-    if item.get("category") in SHOPPING_CATEGORIES:
-        props["Category"] = {"select": {"name": item["category"]}}
-    if store:
-        props["Store"] = {"multi_select": [{"name": store}]}
-    if freq in SHOPPING_FREQUENCY:
-        props["Frequency"] = {"status": {"name": freq}}
-    async with httpx.AsyncClient() as http:
-        r = await http.post(
-            "https://api.notion.com/v1/pages",
-            headers=notion_headers(),
-            json={"parent": {"database_id": SHOPPING_DB_ID}, "icon": {"type": "emoji", "emoji": emoji}, "properties": props}
-        )
-        return r.status_code == 200, r.text[:150] if r.status_code != 200 else ""
 
 async def handle_shopping(text: str, phone: str = None) -> str:
     try:
@@ -6051,16 +5993,16 @@ async def handle_shopping(text: str, phone: str = None) -> str:
         results_text = []
         for item in enriched:
             item_name = item.get("name", "")
-            existing = await search_shopping_item(item_name)
+            existing = await _ds.search_shopping_item(item_name)
             if existing:
-                async with httpx.AsyncClient() as http:
-                    await http.patch(f"https://api.notion.com/v1/pages/{existing[0]['id']}",
-                                     headers=notion_headers(),
-                                     json={"properties": {"Stock": {"checkbox": False}}})
+                await _ds.update_shopping_item(existing[0].id, {"in_stock": False})
                 results_text.append(f"{item.get('emoji','🛒')} _{item_name}_ ya estaba, aparece como faltante")
             else:
-                ok, err = await add_shopping_item(item)
-                results_text.append(f"{item.get('emoji','🛒')} _{item_name}_ agregado" if ok else f"Error agregando _{item_name}_: {err}")
+                try:
+                    await _ds.add_shopping_item(item)
+                    results_text.append(f"{item.get('emoji','🛒')} _{item_name}_ agregado")
+                except Exception as e:
+                    results_text.append(f"Error agregando _{item_name}_: {str(e)[:50]}")
         # Actualizar perfil de supermercado en background
         added_names = [i.get("name", "") for i in enriched if i.get("name")]
         if added_names:
@@ -6077,12 +6019,9 @@ async def handle_shopping(text: str, phone: str = None) -> str:
     for item_name in items:
         display  = item_name.capitalize()
         in_stock = action == "in_stock"
-        existing = await search_shopping_item(item_name)
+        existing = await _ds.search_shopping_item(item_name)
         if existing:
-            async with httpx.AsyncClient() as http:
-                await http.patch(f"https://api.notion.com/v1/pages/{existing[0]['id']}",
-                                 headers=notion_headers(),
-                                 json={"properties": {"Stock": {"checkbox": in_stock}}})
+            await _ds.update_shopping_item(existing[0].id, {"in_stock": in_stock})
             results_text.append(f"_{display}_ marcado como en stock" if in_stock else f"_{display}_ agregado a la lista")
             # Trackear compras: si in_stock significa que lo compró
             if in_stock:
@@ -6102,8 +6041,11 @@ async def handle_shopping(text: str, phone: str = None) -> str:
                     item_data = enriched[0] if enriched else {"name": display, "emoji": "🛒", "category": "", "store": "", "frequency": "One time"}
                 except Exception:
                     item_data = {"name": display, "emoji": "🛒", "category": "", "store": "", "frequency": "One time"}
-                ok, _ = await add_shopping_item(item_data)
-                results_text.append(f"{item_data.get('emoji','🛒')} _{display}_ agregado como faltante" if ok else f"Error agregando _{display}_")
+                try:
+                    await _ds.add_shopping_item(item_data)
+                    results_text.append(f"{item_data.get('emoji','🛒')} _{display}_ agregado como faltante")
+                except Exception:
+                    results_text.append(f"Error agregando _{display}_")
             else:
                 results_text.append(f"_{display}_ no esta en la lista")
 
