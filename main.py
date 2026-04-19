@@ -1325,7 +1325,7 @@ async def classify(text: str, has_image: bool, image_b64: str = None, image_type
     content.append({"type": "text", "text": history_ctx + "\n" + prompt_text if history_ctx else prompt_text})
     response = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=10,
-        system="""Responde SOLO una palabra: GASTO, CORREGIR_GASTO, PLANTA, EVENTO, EDITAR_EVENTO, ELIMINAR_EVENTO, RECORDATORIO, SHOPPING, REUNION, CONFIGURAR o CHAT.
+        system="""Responde SOLO una palabra: GASTO, CORREGIR_GASTO, PLANTA, EVENTO, EDITAR_EVENTO, ELIMINAR_EVENTO, RECORDATORIO, SHOPPING, REUNION, SALUD, CONFIGURAR o CHAT.
 
 GASTO: registrar un pago, compra o ingreso concreto con monto. Tambien cuando el mensaje menciona una compra o gasto SIN monto (ej: "compre en la verduleria", "fui al super") -- Matrics pedira el monto. EXCEPCION: si el mensaje menciona "lista de compras" o "todo lo que habia en la lista" -> SHOPPING.
 CORREGIR_GASTO: corregir un gasto ya registrado.
@@ -1343,11 +1343,14 @@ CHAT: cualquier pregunta, consulta o conversacion. Si tiene "?" o pide informaci
 
 REGLA: si el mensaje PREGUNTA algo -> siempre CHAT, nunca GASTO.
 
+SALUD: registrar o consultar informacion medica personal. Analisis de sangre, resultados de laboratorio, resumen de consulta medica, diagnosticos, medicaciones. "me hice un analisis", "fui al medico", "me recetaron X", "empece a tomar X", "como me fue con el colesterol", "que pastillas tomo". También imágenes de documentos médicos.
+
 IMAGENES SIN TEXTO:
 - Factura, ticket, recibo -> GASTO
 - Invitacion, flyer, screenshot de turno/evento -> EVENTO
 - Foto de receta, lista de ingredientes -> SHOPPING
 - Pizarron, apuntes de reunion -> REUNION
+- Analisis de sangre, resultado de laboratorio, documento medico -> SALUD
 - Documento de texto generico -> CHAT""",
         messages=[{"role": "user", "content": content}]
     )
@@ -1358,6 +1361,7 @@ IMAGENES SIN TEXTO:
     if "ELIMINAR_GASTO" in r:     return "ELIMINAR_GASTO"
     if "CORREGIR_GASTO" in r:     return "CORREGIR_GASTO"
     if "GEO_REMINDER" in r:       return "GEO_REMINDER"
+    if "SALUD" in r:              return "SALUD"
     if "SHOPPING" in r:           return "SHOPPING"
     if "REUNION" in r:            return "REUNION"
     if "CONFIGURAR" in r:         return "CONFIGURAR"
@@ -3408,6 +3412,334 @@ async def handle_reunion(text: str, image_b64: str = None, image_type: str = Non
     ))
     return f"*{nombre}* guardada en Meetings{cal_str}\n{fecha_fmt}{con_str}\n\nNotas guardadas en Notion"
 
+# ── MODULO SALUD ──────────────────────────────────────────────────────────────
+
+async def create_health_record(data: dict) -> tuple[bool, str]:
+    props = {
+        "Name": {"title": [{"text": {"content": data.get("name", "Registro de salud")}}]},
+    }
+    if data.get("type"):
+        props["Type"] = {"select": {"name": data["type"]}}
+    if data.get("date"):
+        props["Date"] = {"date": {"start": data["date"]}}
+    if data.get("specialty"):
+        props["Specialty"] = {"select": {"name": data["specialty"]}}
+    if data.get("doctor"):
+        props["Doctor"] = {"rich_text": [{"text": {"content": data["doctor"][:200]}}]}
+    if data.get("summary"):
+        props["Summary"] = {"rich_text": [{"text": {"content": data["summary"][:2000]}}]}
+    if data.get("key_values"):
+        kv = data["key_values"] if isinstance(data["key_values"], str) else json.dumps(data["key_values"], ensure_ascii=False)
+        props["Key Values"] = {"rich_text": [{"text": {"content": kv[:2000]}}]}
+    if data.get("notes"):
+        props["Notes"] = {"rich_text": [{"text": {"content": data["notes"][:2000]}}]}
+    async with httpx.AsyncClient() as http:
+        r = await http.post(
+            "https://api.notion.com/v1/pages",
+            headers=notion_headers(),
+            json={"parent": {"database_id": HEALTH_RECORDS_DB_ID}, "properties": props}
+        )
+        return (True, r.json()["id"]) if r.status_code in (200, 201) else (False, r.text[:200])
+
+
+async def query_health_records(type_filter: str = None, specialty_filter: str = None, limit: int = 5) -> list[dict]:
+    filters = []
+    if type_filter:
+        filters.append({"property": "Type", "select": {"equals": type_filter}})
+    if specialty_filter:
+        filters.append({"property": "Specialty", "select": {"equals": specialty_filter}})
+    body = {
+        "page_size": limit,
+        "sorts": [{"property": "Date", "direction": "descending"}],
+    }
+    if len(filters) > 1:
+        body["filter"] = {"and": filters}
+    elif filters:
+        body["filter"] = filters[0]
+    async with httpx.AsyncClient() as http:
+        r = await http.post(
+            f"https://api.notion.com/v1/databases/{HEALTH_RECORDS_DB_ID}/query",
+            headers=notion_headers(), json=body
+        )
+        if r.status_code != 200:
+            return []
+        results = []
+        for page in r.json().get("results", []):
+            p = page.get("properties", {})
+            def gtxt(k): rt = p.get(k, {}).get("rich_text", []); return rt[0]["plain_text"] if rt else ""
+            def gsel(k): s = p.get(k, {}).get("select"); return s["name"] if s else ""
+            def gdate(k): d = p.get(k, {}).get("date"); return d["start"][:10] if d and d.get("start") else ""
+            def gtitle(): t = p.get("Name", {}).get("title", []); return t[0]["plain_text"] if t else ""
+            results.append({
+                "id": page["id"], "name": gtitle(), "type": gsel("Type"),
+                "date": gdate("Date"), "specialty": gsel("Specialty"),
+                "doctor": gtxt("Doctor"), "summary": gtxt("Summary"),
+                "key_values": gtxt("Key Values"), "notes": gtxt("Notes"),
+            })
+        return results
+
+
+async def create_medication(data: dict) -> tuple[bool, str]:
+    props = {
+        "Name": {"title": [{"text": {"content": data.get("name", "Medicación")}}]},
+        "Active": {"checkbox": data.get("active", True)},
+    }
+    for field, key in [("Dose","dose"),("Frequency","frequency"),("Prescribed By","prescribed_by"),("Condition","condition"),("Notes","notes")]:
+        if data.get(key):
+            props[field] = {"rich_text": [{"text": {"content": str(data[key])[:500]}}]}
+    if data.get("start_date"):
+        props["Start Date"] = {"date": {"start": data["start_date"]}}
+    if data.get("end_date"):
+        props["End Date"] = {"date": {"start": data["end_date"]}}
+    async with httpx.AsyncClient() as http:
+        r = await http.post(
+            "https://api.notion.com/v1/pages",
+            headers=notion_headers(),
+            json={"parent": {"database_id": MEDICATIONS_DB_ID}, "properties": props}
+        )
+        return (True, r.json()["id"]) if r.status_code in (200, 201) else (False, r.text[:200])
+
+
+async def query_medications(only_active: bool = False) -> list[dict]:
+    body: dict = {"page_size": 50}
+    if only_active:
+        body["filter"] = {"property": "Active", "checkbox": {"equals": True}}
+    async with httpx.AsyncClient() as http:
+        r = await http.post(
+            f"https://api.notion.com/v1/databases/{MEDICATIONS_DB_ID}/query",
+            headers=notion_headers(), json=body
+        )
+        if r.status_code != 200:
+            return []
+        results = []
+        for page in r.json().get("results", []):
+            p = page.get("properties", {})
+            def gtxt(k): rt = p.get(k, {}).get("rich_text", []); return rt[0]["plain_text"] if rt else ""
+            def gdate(k): d = p.get(k, {}).get("date"); return d["start"][:10] if d and d.get("start") else ""
+            def gtitle(): t = p.get("Name", {}).get("title", []); return t[0]["plain_text"] if t else ""
+            results.append({
+                "id": page["id"], "name": gtitle(),
+                "active": p.get("Active", {}).get("checkbox", False),
+                "dose": gtxt("Dose"), "frequency": gtxt("Frequency"),
+                "prescribed_by": gtxt("Prescribed By"), "condition": gtxt("Condition"),
+                "start_date": gdate("Start Date"), "end_date": gdate("End Date"),
+                "notes": gtxt("Notes"),
+            })
+        return results
+
+
+async def update_medication(page_id: str, updates: dict) -> bool:
+    props = {}
+    if "active" in updates and updates["active"] is not None:
+        props["Active"] = {"checkbox": updates["active"]}
+    for field, key in [("Dose","dose"),("Frequency","frequency"),("Notes","notes")]:
+        if updates.get(key):
+            props[field] = {"rich_text": [{"text": {"content": updates[key]}}]}
+    if updates.get("end_date"):
+        props["End Date"] = {"date": {"start": updates["end_date"]}}
+    if not props:
+        return True
+    async with httpx.AsyncClient() as http:
+        r = await http.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=notion_headers(), json={"properties": props})
+        return r.status_code == 200
+
+
+async def handle_salud_agent(phone: str, text: str, image_b64: str = None, image_type: str = None) -> str:
+    now = now_argentina()
+    tools = [
+        {
+            "name": "guardar_registro_salud",
+            "description": "Guarda un registro médico en Notion: análisis de sangre, consulta, diagnóstico, vacuna, etc. Si hay imagen de un documento médico, extraé todos los datos vos mismo.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name":       {"type": "string", "description": "Nombre descriptivo. Ej: 'Análisis de sangre — abr 2026'"},
+                    "type":       {"type": "string", "enum": ["Análisis", "Consulta", "Diagnóstico", "Vacuna", "Cirugía", "Otro"]},
+                    "date":       {"type": "string", "description": "YYYY-MM-DD"},
+                    "specialty":  {"type": "string", "enum": ["Clínica General", "Odontología", "Oncología", "Psicología", "Cardiología", "Kinesiología", "Nutrición", "Oftalmología", "Traumatología", "Ginecología", "Urología", "Dermatología", "Otra"]},
+                    "doctor":     {"type": ["string", "null"]},
+                    "summary":    {"type": "string", "description": "Resumen completo del contenido del documento"},
+                    "key_values": {"type": ["string", "null"], "description": "JSON con valores numéricos clave. Ej: '{\"colesterol_total\": 185, \"glucosa\": 92, \"unidad\": \"mg/dL\"}'"},
+                    "notes":      {"type": ["string", "null"]},
+                },
+                "required": ["name", "type", "date", "summary"]
+            }
+        },
+        {
+            "name": "guardar_medicacion",
+            "description": "Guarda un medicamento que el usuario toma o tomó.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name":          {"type": "string"},
+                    "dose":          {"type": ["string", "null"], "description": "Ej: '500mg'"},
+                    "frequency":     {"type": ["string", "null"], "description": "Ej: '1 vez por día con las comidas'"},
+                    "prescribed_by": {"type": ["string", "null"]},
+                    "start_date":    {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+                    "end_date":      {"type": ["string", "null"], "description": "YYYY-MM-DD si ya terminó"},
+                    "condition":     {"type": ["string", "null"], "description": "Para qué lo toma"},
+                    "active":        {"type": "boolean"},
+                    "notes":         {"type": ["string", "null"]},
+                },
+                "required": ["name", "active"]
+            }
+        },
+        {
+            "name": "consultar_registros_salud",
+            "description": "Consulta registros médicos guardados para responder preguntas del usuario.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "type_filter":      {"type": ["string", "null"]},
+                    "specialty_filter": {"type": ["string", "null"]},
+                    "limit":            {"type": "integer", "description": "Default 5, max 20"},
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "consultar_medicaciones",
+            "description": "Consulta medicamentos registrados.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "solo_activas": {"type": "boolean"},
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "actualizar_medicacion",
+            "description": "Actualiza una medicación: marcarla como inactiva, cambiar dosis, etc. Obtené el id de consultar_medicaciones.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "medication_id": {"type": "string"},
+                    "active":        {"type": ["boolean", "null"]},
+                    "dose":          {"type": ["string", "null"]},
+                    "frequency":     {"type": ["string", "null"]},
+                    "end_date":      {"type": ["string", "null"]},
+                    "notes":         {"type": ["string", "null"]},
+                },
+                "required": ["medication_id"]
+            }
+        },
+    ]
+
+    content = []
+    if image_b64:
+        content.append({"type": "image", "source": {"type": "base64", "media_type": image_type or "image/jpeg", "data": image_b64}})
+    content.append({"type": "text", "text": text or "(ver imagen adjunta)"})
+
+    system = f"""Sos Knot, asistente personal en WhatsApp. Hablas en espanol rioplatense, natural y conciso.
+Hoy: {now.strftime('%d/%m/%Y')}.
+
+Tu tarea: ayudar al usuario a organizar su informacion medica personal. Podes guardar analisis, consultas, diagnosticos, medicaciones, y responder preguntas sobre el historial.
+
+REGLAS:
+- Nunca diagnosticas ni opinas si algo es grave.
+- Nunca recomendas ni modificas tratamientos medicos.
+- Si el usuario pregunta si un valor es preocupante o que deberia hacer, decile que esa pregunta es para su medico. Vos solo organizas la info.
+- Si hay imagen de un analisis o documento: extraé todos los datos vos mismo, no le pidas al usuario que los dicte.
+- Para analisis de sangre u otros examenes: extraé los valores numericos en key_values como JSON."""
+
+    response = await claude_create(
+        model="claude-sonnet-4-20250514", max_tokens=1500,
+        system=system,
+        messages=get_history(phone) + [{"role": "user", "content": content}],
+        tools=tools
+    )
+
+    if response.stop_reason == "end_turn":
+        reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "").strip()
+        add_to_history(phone, "user", text)
+        add_to_history(phone, "assistant", reply)
+        return reply
+
+    tool_results = []
+    for block in response.content:
+        if block.type != "tool_use":
+            continue
+        inp = dict(block.input)
+        tr = ""
+
+        if block.name == "guardar_registro_salud":
+            ok, pid = await create_health_record(inp)
+            if ok:
+                tr = f"Guardado. ID: {pid}"
+                asyncio.create_task(update_domain_profile_bg(
+                    "salud",
+                    f"Nuevo registro: {inp.get('name')}, tipo: {inp.get('type')}, especialidad: {inp.get('specialty','')}, fecha: {inp.get('date','')}, resumen: {inp.get('summary','')[:200]}"
+                ))
+            else:
+                tr = f"Error: {pid}"
+
+        elif block.name == "guardar_medicacion":
+            ok, pid = await create_medication(inp)
+            if ok:
+                tr = f"Medicación guardada. ID: {pid}"
+                asyncio.create_task(update_domain_profile_bg(
+                    "salud",
+                    f"Medicación {'activa' if inp.get('active') else 'finalizada'}: {inp.get('name')}, dosis: {inp.get('dose','-')}, frecuencia: {inp.get('frequency','-')}, para: {inp.get('condition','-')}"
+                ))
+            else:
+                tr = f"Error: {pid}"
+
+        elif block.name == "consultar_registros_salud":
+            records = await query_health_records(
+                type_filter=inp.get("type_filter"),
+                specialty_filter=inp.get("specialty_filter"),
+                limit=min(inp.get("limit", 5), 20)
+            )
+            if not records:
+                tr = "No hay registros con esos filtros."
+            else:
+                lines = []
+                for rec in records:
+                    kv = f"\n  Valores: {rec['key_values']}" if rec.get("key_values") else ""
+                    lines.append(f"- {rec['date']} | {rec['type']} | {rec['name']}\n  {rec['summary'][:300]}{kv}")
+                tr = "\n".join(lines)
+
+        elif block.name == "consultar_medicaciones":
+            meds = await query_medications(only_active=inp.get("solo_activas", False))
+            if not meds:
+                tr = "No hay medicaciones registradas."
+            else:
+                lines = []
+                for m in meds:
+                    estado = "activa" if m["active"] else "inactiva"
+                    cond = f", para {m['condition']}" if m.get("condition") else ""
+                    lines.append(f"- {m['name']} {m.get('dose','')} — {m.get('frequency','')} ({estado}{cond})")
+                tr = "\n".join(lines)
+
+        elif block.name == "actualizar_medicacion":
+            mid = inp.pop("medication_id")
+            ok = await update_medication(mid, inp)
+            tr = "Actualizada." if ok else "Error actualizando."
+
+        tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": tr})
+
+    if not tool_results:
+        reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "").strip()
+        add_to_history(phone, "user", text)
+        add_to_history(phone, "assistant", reply)
+        return reply
+
+    final = await claude_create(
+        model="claude-sonnet-4-20250514", max_tokens=600,
+        system=system,
+        messages=get_history(phone) + [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": response.content},
+            {"role": "user", "content": tool_results},
+        ],
+        tools=tools
+    )
+    reply = next((b.text for b in final.content if hasattr(b, "text") and b.text), "").strip()
+    add_to_history(phone, "user", text)
+    add_to_history(phone, "assistant", reply)
+    return reply
+
 # ── PENDING STATE HANDLER ──────────────────────────────────────────────────────
 async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
     state_type = state.get("type")
@@ -4300,6 +4632,11 @@ async def process_single_item(phone: str, item: dict):
         elif tipo == "CONFIGURAR":
             respuesta = await handle_chat(phone, text)
             await send_message(phone, respuesta)
+
+        elif tipo == "SALUD":
+            reply = await handle_salud_agent(phone, text, image_b64, image_type)
+            if reply:
+                await send_message(phone, reply)
 
         elif tipo == "REUNION":
             respuesta = await handle_reunion(text, image_b64, image_type)
