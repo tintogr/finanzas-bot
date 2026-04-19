@@ -4326,20 +4326,20 @@ Responde:
                     except Exception:
                         recipe_name_chat = "Receta"
                         enriched_chat = []
-                pending_state[phone] = {
-                    "type": "recipe_save_confirm",
-                    "recipe_name": recipe_name_chat,
-                    "recipe_text": respuesta,
-                    "ingredients": enriched_chat,
-                }
-                await send_interactive_buttons(
-                    phone,
-                    f"Guardamos *{recipe_name_chat.capitalize()}* en tus Recetas de Notion?",
-                    [
-                        {"id": "recipe_save_yes", "title": "Si, guardar"},
-                        {"id": "recipe_save_no",  "title": "No gracias"},
-                    ]
-                )
+                    pending_state[phone] = {
+                        "type": "recipe_save_confirm",
+                        "recipe_name": recipe_name_chat,
+                        "recipe_text": respuesta,
+                        "ingredients": enriched_chat,
+                    }
+                    await send_interactive_buttons(
+                        phone,
+                        f"Guardamos *{recipe_name_chat.capitalize()}* en tus Recetas de Notion?",
+                        [
+                            {"id": "recipe_save_yes", "title": "Si, guardar"},
+                            {"id": "recipe_save_no",  "title": "No gracias"},
+                        ]
+                    )
 
     except json.JSONDecodeError:
         pass
