@@ -356,6 +356,13 @@ user_prefs: dict = {
     "service_providers": {},
     "known_places": [],
     "_config_page_id": None,
+    "domain_profiles": {
+        "actividad_fisica": "",
+        "dieta": "",
+        "supermercado": "",
+        "gastos": "",
+    },
+    "purchase_counts": {},  # {"leche con lactosa": 4, ...} — cuantas veces se compro cada item
 }
 
 # ── Ubicacion en tiempo real ──────────────────────────────────────────────────
@@ -624,10 +631,12 @@ async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=N
 
     history = get_history(phone)
 
+    profile_gastos = get_domain_profile("gastos")
+    profile_gastos_ctx = f"\nPerfil de gastos del usuario: {profile_gastos}\n" if profile_gastos else ""
     system = f"""Sos Matrics, asistente personal por WhatsApp. Hablas en espanol rioplatense, natural y conciso.
 Hoy: {hoy_str(now)}. Calendario: {semana_str(now)}.
 Tasa dolar blue
-
+{profile_gastos_ctx}
 Tu tarea: registrar gastos e ingresos del usuario.
 - Si el mensaje tiene descripcion Y monto -> usa la tool registrar_gasto directamente.
 - Si hay una imagen (ticket, screenshot de pedido, factura) -> lee TODOS los items, suma los montos vos mismo, y registra el total. No le pidas al usuario que sume.
@@ -683,6 +692,10 @@ Emoji: elegi el mas especifico segun el contexto real."""
             if cat_note:
                 tr += f" {cat_note}"
             created_entries.append((result_i, data, True))
+            asyncio.create_task(update_domain_profile_bg(
+                "gastos",
+                f"Registró: {data['name']}, ${data['value_ars']:,.0f} ARS, categoría: {', '.join(data['categoria'])}, fecha: {data['date']}"
+            ))
         else:
             tr = f"Error al guardar en Notion: {result_i[:200]}"
             created_entries.append((None, data, False))
@@ -1433,6 +1446,86 @@ def get_activities_context() -> str:
         line = f"- {name.capitalize()}: {days}" + (f" a las {time}" if time else "")
         lines.append(line)
     return "Actividades recurrentes del usuario:\n" + "\n".join(lines)
+
+
+def get_domain_profile(domain: str) -> str:
+    return user_prefs.get("domain_profiles", {}).get(domain, "")
+
+
+async def save_domain_profile_direct(domain: str, text: str):
+    """Guarda un campo de perfil de dominio directamente en la config page de Notion."""
+    page_id = user_prefs.get("_config_page_id")
+    if not page_id:
+        return
+    field_map = {
+        "actividad_fisica": "Profile Actividad Fisica",
+        "dieta": "Profile Dieta",
+        "supermercado": "Profile Supermercado",
+        "gastos": "Profile Gastos",
+    }
+    notion_field = field_map.get(domain)
+    if not notion_field:
+        return
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers=notion_headers(),
+                json={"properties": {notion_field: {"rich_text": [{"text": {"content": text[:2000]}}]}}}
+            )
+    except Exception:
+        pass
+
+
+async def save_purchase_counts_direct():
+    page_id = user_prefs.get("_config_page_id")
+    if not page_id:
+        return
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers=notion_headers(),
+                json={"properties": {"Purchase Counts": {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("purchase_counts", {}), ensure_ascii=False)[:2000]}}]}}}
+            )
+    except Exception:
+        pass
+
+
+async def update_domain_profile_bg(domain: str, event_description: str):
+    """Fire-and-forget: usa Haiku para actualizar el perfil narrativo de un dominio si detecta patron relevante."""
+    try:
+        current = get_domain_profile(domain)
+        resp = await claude_create(
+            model="claude-haiku-4-5-20251001", max_tokens=300,
+            system="""Sos un analizador de patrones de comportamiento de un usuario.
+Se te da el perfil actual en un dominio y un evento reciente.
+Si el evento aporta informacion nueva, confirma un patron o muestra un cambio de habito: devuelve el perfil actualizado (texto natural y conciso, max 150 palabras).
+Si el evento no agrega nada relevante al perfil: responde exactamente NO_CAMBIO.
+Responde SOLO el texto del perfil actualizado, o NO_CAMBIO.""",
+            messages=[{"role": "user", "content": f"Dominio: {domain}\nPerfil actual: {current or '(sin datos todavia)'}\nEvento reciente: {event_description}"}]
+        )
+        new_text = resp.content[0].text.strip()
+        if new_text and new_text != "NO_CAMBIO":
+            user_prefs.setdefault("domain_profiles", {})[domain] = new_text
+            await save_domain_profile_direct(domain, new_text)
+    except Exception:
+        pass
+
+
+async def check_and_notify_deviation(phone: str, items: list, supermercado_profile: str):
+    """Fire-and-forget: detecta desviaciones del perfil de supermercado y notifica al usuario."""
+    try:
+        resp = await claude_create(
+            model="claude-haiku-4-5-20251001", max_tokens=100,
+            system="Detecta si los items representan una desviacion significativa de los patrones del usuario (ej: siempre compra X, ahora pide Y que contradice X). Si hay desviacion clara, describe en 1 oracion en espanol rioplatense informal. Si no hay desviacion, responde exactamente: NO",
+            messages=[{"role": "user", "content": f"Perfil: {supermercado_profile}\nItems agregados ahora: {', '.join(str(i) for i in items)}"}]
+        )
+        result = resp.content[0].text.strip()
+        if result and result.upper() != "NO":
+            await send_message(phone, f"💡 {result}")
+    except Exception:
+        pass
 
 
 async def query_calendar_date(fecha: str) -> str | None:
@@ -3034,6 +3127,24 @@ async def load_user_config(wa_number: str):
                     user_prefs["activities"] = json.loads(activities)
                 except Exception:
                     user_prefs["activities"] = {}
+
+            for dom, field in [
+                ("actividad_fisica", "Profile Actividad Fisica"),
+                ("dieta",            "Profile Dieta"),
+                ("supermercado",     "Profile Supermercado"),
+                ("gastos",           "Profile Gastos"),
+            ]:
+                val = get_txt(field)
+                if val:
+                    user_prefs.setdefault("domain_profiles", {})[dom] = val
+
+            counts_raw = get_txt("Purchase Counts")
+            if counts_raw:
+                try:
+                    user_prefs["purchase_counts"] = json.loads(counts_raw)
+                except Exception:
+                    user_prefs["purchase_counts"] = {}
+
             user_prefs["_config_page_id"] = page["id"]
 
             # Restaurar ubicacion si hay coordenadas guardadas y OwnTracks no mando nada aun
@@ -3066,6 +3177,11 @@ async def save_user_config(wa_number: str):
             "Service Providers": {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("service_providers", {}), ensure_ascii=False)}}]},
             "Known Places":      {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("known_places", []), ensure_ascii=False)}}]},
             "Activities":        {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("activities", {}), ensure_ascii=False)}}]},
+            "Profile Actividad Fisica": {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("actividad_fisica", "")[:2000]}}]},
+            "Profile Dieta":            {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("dieta", "")[:2000]}}]},
+            "Profile Supermercado":     {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("supermercado", "")[:2000]}}]},
+            "Profile Gastos":           {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("gastos", "")[:2000]}}]},
+            "Purchase Counts":          {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("purchase_counts", {}), ensure_ascii=False)[:2000]}}]},
         }
         if user_prefs.get("daily_summary_hour") is not None:
             props["Resumen Hour"]   = {"number": user_prefs["daily_summary_hour"]}
@@ -5653,6 +5769,16 @@ async def handle_shopping(text: str, phone: str = None) -> str:
             else:
                 ok, err = await add_shopping_item(item)
                 results_text.append(f"{item.get('emoji','🛒')} _{item_name}_ agregado" if ok else f"Error agregando _{item_name}_: {err}")
+        # Actualizar perfil de supermercado en background
+        added_names = [i.get("name", "") for i in enriched if i.get("name")]
+        if added_names:
+            asyncio.create_task(update_domain_profile_bg(
+                "supermercado",
+                f"Agregó a la lista de compras: {', '.join(added_names)}"
+            ))
+            supermercado_profile = get_domain_profile("supermercado")
+            if supermercado_profile and phone:
+                asyncio.create_task(check_and_notify_deviation(phone, added_names, supermercado_profile))
         return recipe_note + "\n".join(results_text) + "\n\nLista actualizada en Notion"
 
     results_text = []
@@ -5666,6 +5792,17 @@ async def handle_shopping(text: str, phone: str = None) -> str:
                                  headers=notion_headers(),
                                  json={"properties": {"Stock": {"checkbox": in_stock}}})
             results_text.append(f"_{display}_ marcado como en stock" if in_stock else f"_{display}_ agregado a la lista")
+            # Trackear compras: si in_stock significa que lo compró
+            if in_stock:
+                item_key = item_name.lower().strip()
+                counts = user_prefs.setdefault("purchase_counts", {})
+                counts[item_key] = counts.get(item_key, 0) + 1
+                asyncio.create_task(save_purchase_counts_direct())
+                if counts[item_key] >= 3:
+                    asyncio.create_task(update_domain_profile_bg(
+                        "supermercado",
+                        f"Compra frecuente confirmada: '{item_name}' ({counts[item_key]} veces marcado como comprado)"
+                    ))
         else:
             if not in_stock:
                 try:
