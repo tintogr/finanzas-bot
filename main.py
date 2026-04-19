@@ -2841,10 +2841,22 @@ EVENTOS RECURRENTES:
                             user_prefs["activities"] = {}
                         user_prefs["activities"][name_key] = {"days": days_list, "time": data["time"]}
                         await save_user_config(phone)
-                asyncio.create_task(update_domain_profile_bg(
-                    "actividad_fisica",
-                    f"Evento creado: '{data.get('summary', '')}', fecha: {data.get('date', '')}, hora: {data.get('time', '')}{', recurrente' if data.get('recurrence') else ''}"
-                ))
+                event_summary = data.get("summary", "")
+                event_desc_bg = f"Evento creado: '{event_summary}', fecha: {data.get('date', '')}, hora: {data.get('time', '')}{', recurrente' if data.get('recurrence') else ''}"
+                asyncio.create_task(update_domain_profile_bg("actividad_fisica", event_desc_bg))
+                _SALUD_KEYWORDS = {"medico", "médico", "doctor", "doctora", "clinica", "clínica",
+                                   "hospital", "turno", "cita", "consulta", "dentista", "odontologo",
+                                   "odontólogo", "psicologo", "psicólogo", "psiquiatra", "kinesiolog",
+                                   "nutricionista", "oftalmologo", "oftalmólogo", "dermatologo",
+                                   "traumatólogo", "traumatologo", "cardiologo", "cardiólogo",
+                                   "ginecolog", "urologo", "urólogo", "analisis", "análisis",
+                                   "laboratorio", "ecografia", "ecografía", "radiografia"}
+                summary_lower = event_summary.lower()
+                if any(k in summary_lower for k in _SALUD_KEYWORDS):
+                    asyncio.create_task(update_domain_profile_bg(
+                        "salud",
+                        f"Cita médica en calendario: '{event_summary}', fecha: {data.get('date', '')}"
+                    ))
                 hora = f" a las {data['time']}" if data.get("time") else ""
                 try:
                     fecha = datetime.strptime(data["date"], "%Y-%m-%d").strftime("%d/%m/%Y")
