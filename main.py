@@ -308,28 +308,17 @@ async def check_shopping_proximity():
     }
     # Buscar items pendientes agrupados por store
     try:
-        async with httpx.AsyncClient() as http:
-            r = await http.post(
-                f"https://api.notion.com/v1/databases/{SHOPPING_DB_ID}/query",
-                headers=notion_headers(),
-                json={"filter": {"property": "Stock", "checkbox": {"equals": False}}, "page_size": 50}
-            )
-            if r.status_code != 200:
-                return None
-            items = r.json().get("results", [])
-            if not items:
-                return None
-            by_store = {}
-            for item in items:
-                stores = item["properties"].get("Store", {}).get("multi_select", [])
-                name = item["properties"]["Name"]["title"][0]["plain_text"] if item["properties"]["Name"]["title"] else ""
-                for s in stores:
-                    store_name = s["name"]
-                    if store_name not in by_store:
-                        by_store[store_name] = []
-                    by_store[store_name].append(name)
-            if not by_store:
-                return None
+        shopping_items = await _ds.get_shopping_list(only_missing=True)
+        if not shopping_items:
+            return None
+        by_store = {}
+        for item in shopping_items:
+            for store_name in (item.stores or []):
+                if store_name not in by_store:
+                    by_store[store_name] = []
+                by_store[store_name].append(item.name)
+        if not by_store:
+            return None
             lat, lon = get_current_location()
             for store_type, item_names in by_store.items():
                 osm_types = store_type_map.get(store_type, ["supermarket"])
@@ -1415,30 +1404,16 @@ async def save_domain_profile_direct(domain: str, text: str):
     notion_field = field_map.get(domain)
     if not notion_field:
         return
-    try:
-        async with httpx.AsyncClient() as http:
-            await http.patch(
-                f"https://api.notion.com/v1/pages/{page_id}",
-                headers=notion_headers(),
-                json={"properties": {notion_field: {"rich_text": [{"text": {"content": text[:2000]}}]}}}
-            )
-    except Exception:
-        pass
+    await _ds.update_config_fields(page_id, {notion_field: text})
 
 
 async def save_purchase_counts_direct():
     page_id = user_prefs.get("_config_page_id")
     if not page_id:
         return
-    try:
-        async with httpx.AsyncClient() as http:
-            await http.patch(
-                f"https://api.notion.com/v1/pages/{page_id}",
-                headers=notion_headers(),
-                json={"properties": {"Purchase Counts": {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("purchase_counts", {}), ensure_ascii=False)[:2000]}}]}}}
-            )
-    except Exception:
-        pass
+    await _ds.update_config_fields(page_id, {
+        "Purchase Counts": json.dumps(user_prefs.get("purchase_counts", {}), ensure_ascii=False)
+    })
 
 
 async def update_domain_profile_bg(domain: str, event_description: str):
@@ -2168,36 +2143,13 @@ CRITICO: si guardar_lugar_conocido devuelve error o dice "NO fue guardado", info
             from calendar import monthrange as mr
             last_day = mr(year_c, mon_c)[1]
             try:
-                async with httpx.AsyncClient() as http:
-                    r = await http.post(
-                        f"https://api.notion.com/v1/databases/{NOTION_DB_ID.replace('-','')}/query",
-                        headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
-                        json={
-                            "filter": {"and": [
-                                {"property": "Date", "date": {"on_or_after": mes + "-01"}},
-                                {"property": "Date", "date": {"on_or_before": f"{mes}-{last_day:02d}"}},
-                                {"property": "Name", "title": {"contains": search_term[:30]}}
-                            ]},
-                            "sorts": [{"property": "Date", "direction": "descending"}],
-                            "page_size": 1
-                        }
-                    )
-                    if r.status_code == 200 and r.json().get("results"):
-                        page = r.json()["results"][0]
-                        page_id = page["id"]
-                        old_name = page["properties"]["Name"]["title"][0]["plain_text"] if page["properties"]["Name"]["title"] else search_term
-                        old_value = page["properties"].get("Value (ars)", {}).get("number", 0) or 0
-                        upd = await http.patch(
-                            f"https://api.notion.com/v1/pages/{page_id}",
-                            headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
-                            json={"properties": {"Value (ars)": {"number": float(new_value)}}}
-                        )
-                        if upd.status_code == 200:
-                            t_result = "Correccion exitosa: '" + old_name + "' actualizado de $" + f"{old_value:,.0f}" + " a $" + f"{new_value:,.0f}" + " ARS."
-                        else:
-                            t_result = "Error actualizando en Notion: " + upd.text[:100]
-                    else:
-                        t_result = "No encontre ningun gasto llamado '" + search_term + "' en " + mes + "."
+                results = await _ds.search_expenses(search_term, mes)
+                if results:
+                    entry = results[0]
+                    await _ds.update_expense(entry.id, {"value_ars": float(new_value)})
+                    t_result = f"Correccion exitosa: '{entry.name}' actualizado de ${entry.value_ars:,.0f} a ${float(new_value):,.0f} ARS."
+                else:
+                    t_result = f"No encontre ningun gasto llamado '{search_term}' en {mes}."
             except Exception as e:
                 t_result = "Error: " + str(e)[:100]
         elif t_name == "buscar_contacto":
@@ -2263,27 +2215,28 @@ CRITICO: si guardar_lugar_conocido devuelve error o dice "NO fue guardado", info
                     props["Name"] = {"title": [{"text": {"content": new_name}}]}
                     reminder["name"] = new_name
                 try:
-                    async with httpx.AsyncClient() as http:
-                        r = await http.patch(
-                            f"https://api.notion.com/v1/pages/{page_id}",
-                            headers=notion_headers(),
-                            json={"properties": props}
-                        )
-                    if r.status_code == 200:
-                        if deactivate:
-                            geo_reminders_cache.remove(reminder)
-                            t_result = f"Geo-reminder '{reminder['name']}' desactivado."
-                        else:
-                            changes = []
-                            if new_name:
-                                changes.append(f"nombre -> '{new_name}'")
-                            if new_radius is not None:
-                                changes.append(f"radio -> {new_radius}m")
-                            if new_recurrent is not None:
-                                changes.append("recurrente" if new_recurrent else "solo una vez")
-                            t_result = f"'{reminder['name']}' actualizado: {', '.join(changes)}."
+                    updates = {}
+                    if deactivate:
+                        updates["active"] = False
+                    if new_radius is not None:
+                        updates["radius"] = new_radius
+                    if new_recurrent is not None:
+                        updates["recurrent"] = new_recurrent
+                    if new_name:
+                        updates["name"] = new_name
+                    await _ds.update_geo_reminder(page_id, updates)
+                    if deactivate:
+                        geo_reminders_cache.remove(reminder)
+                        t_result = f"Geo-reminder '{reminder['name']}' desactivado."
                     else:
-                        t_result = f"Error actualizando en Notion: {r.text[:100]}"
+                        changes = []
+                        if new_name:
+                            changes.append(f"nombre -> '{new_name}'")
+                        if new_radius is not None:
+                            changes.append(f"radio -> {new_radius}m")
+                        if new_recurrent is not None:
+                            changes.append("recurrente" if new_recurrent else "solo una vez")
+                        t_result = f"'{reminder['name']}' actualizado: {', '.join(changes)}."
                 except Exception as e:
                     t_result = f"Error: {str(e)[:100]}"
         elif t_name == "marcar_factura_pagada":

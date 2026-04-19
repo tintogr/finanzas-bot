@@ -1336,3 +1336,17 @@ class NotionDataStore:
             return True
         except Exception:
             return False
+
+    async def update_config_fields(self, page_id: str, fields: dict) -> bool:
+        """Update arbitrary rich_text fields on the config page. fields = {notion_field_name: text_value}."""
+        if not page_id:
+            return False
+        props = {
+            k: {"rich_text": [{"text": {"content": str(v)[:2000]}}]}
+            for k, v in fields.items()
+        }
+        try:
+            await self._update_page(page_id, props)
+            return True
+        except Exception:
+            return False
