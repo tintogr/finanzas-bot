@@ -434,6 +434,26 @@ async def send_interactive_buttons(to: str, body: str, buttons: list[dict], head
             "Content-Type": "application/json"
         }, json=payload)
 
+async def send_reaction(to: str, message_id: str, emoji: str):
+    async with httpx.AsyncClient() as http:
+        await http.post(WA_API, headers={
+            "Authorization": f"Bearer {WA_TOKEN}",
+            "Content-Type": "application/json"
+        }, json={
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "reaction",
+            "reaction": {"message_id": message_id, "emoji": emoji}
+        })
+
+def error_servicio(servicio: str) -> str:
+    msgs = {
+        "notion":   "No pude conectarme a Notion para guardar/consultar. Intentá en unos minutos.",
+        "calendar": "No pude acceder a tu calendario de Google. Intentá en unos minutos.",
+        "gmail":    "No pude consultar tu Gmail. Intentá en unos minutos.",
+    }
+    return msgs.get(servicio.lower(), "Tuve un problema técnico al procesar tu mensaje. Intentá en unos minutos.")
+
 async def get_media_base64(media_id: str) -> tuple[str, str]:
     async with httpx.AsyncClient() as http:
         r = await http.get(
@@ -764,6 +784,22 @@ Emoji: elegi el mas especifico segun el contexto real."""
                             "provider_name": impaga.name,
                         }
                         reply += f"\n\n💡 Tenés registrado *{impaga.name}* por ${inv_amount:,.0f} pero pagaste ${paid_amount:,.0f}. ¿Querés agregar una nota?"
+                else:
+                    expires_at = (now_argentina() + timedelta(seconds=60)).replace(tzinfo=None).isoformat()
+                    pending_state[phone] = {
+                        "type": "undo_window", "action": "expense",
+                        "page_id": page_id, "name": data.get("name", "gasto"),
+                        "expires_at": expires_at,
+                    }
+                    reply += "\n\n_Si algo no quedó bien, avisame._"
+            else:
+                expires_at = (now_argentina() + timedelta(seconds=60)).replace(tzinfo=None).isoformat()
+                pending_state[phone] = {
+                    "type": "undo_window", "action": "expense",
+                    "page_id": page_id, "name": data.get("name", "gasto"),
+                    "expires_at": expires_at,
+                }
+                reply += "\n\n_Si algo no quedó bien, avisame._"
 
     add_to_history(phone, "user", text)
     add_to_history(phone, "assistant", reply)
@@ -879,7 +915,7 @@ Responde:
         changes.append(f"Nombre -> _{intent['new_name']}_")
     return True, f"*{old_name}* corregido\n" + "\n".join(changes) + "\n\nActualizado en Notion"
 
-async def eliminar_gasto(text: str) -> tuple[bool, str]:
+async def eliminar_gasto(text: str, phone: str = None) -> tuple[bool, str]:
     response = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=100,
         system="Extrae el nombre de la entrada de Notion a eliminar. Responde SOLO JSON.",
@@ -896,9 +932,19 @@ async def eliminar_gasto(text: str) -> tuple[bool, str]:
     if not results:
         return False, f"No encontre ninguna entrada llamada _{search_term}_"
     entry = results[0]
+    if phone:
+        expires_at = (now_argentina() + timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+        pending_state[phone] = {
+            "type": "confirm_delete", "action": "expense",
+            "page_id": entry.id, "name": entry.name, "expires_at": expires_at,
+        }
+        await send_interactive_buttons(phone, f"¿Eliminás *{entry.name}*?", [
+            {"id": "confirm_delete_yes", "title": "Sí, eliminalo"},
+            {"id": "confirm_delete_no", "title": "No, cancelar"},
+        ])
+        return True, ""
     ok = await _ds.archive_expense(entry.id)
-    if ok:
-        return True, f"*{entry.name}* eliminado de Notion"
+    return (True, f"*{entry.name}* eliminado de Notion") if ok else (False, "Error al eliminar")
 
 async def eliminar_shopping(text: str) -> tuple[bool, str]:
     response = await claude_create(
@@ -1041,7 +1087,7 @@ Responde:
 
 async def create_planta(data: dict) -> tuple[bool, str]:
     try:
-        await _ds.create_plant({
+        plant = await _ds.create_plant({
             "name":          data.get("name"),
             "species":       data.get("especie"),
             "purchase_date": data.get("fecha_compra"),
@@ -1057,9 +1103,9 @@ async def create_planta(data: dict) -> tuple[bool, str]:
             "hogar",
             f"Nueva planta: {data.get('name')}, especie: {data.get('especie') or 'desconocida'}, ubicación: {data.get('ubicacion') or '-'}"
         ))
-        return True, ""
+        return True, plant.id
     except Exception as e:
-        return False, str(e)
+        return False, error_servicio("notion")
 
 def format_planta(data: dict) -> str:
     emoji = data.get("emoji", "\U0001f33f")
@@ -1110,7 +1156,7 @@ async def editar_planta(text: str) -> tuple[bool, str]:
     return True, f"*{plant.name}* actualizada: {changes}"
 
 
-async def eliminar_planta(text: str) -> tuple[bool, str]:
+async def eliminar_planta(text: str, phone: str = None) -> tuple[bool, str]:
     response = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=100,
         system="Extrae el nombre de la planta a eliminar. Responde SOLO JSON.",
@@ -1126,10 +1172,19 @@ async def eliminar_planta(text: str) -> tuple[bool, str]:
     if not results:
         return False, f"No encontré ninguna planta llamada _{search_term}_"
     plant = results[0]
+    if phone:
+        expires_at = (now_argentina() + timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+        pending_state[phone] = {
+            "type": "confirm_delete", "action": "plant",
+            "page_id": plant.id, "name": plant.name, "expires_at": expires_at,
+        }
+        await send_interactive_buttons(phone, f"¿Eliminás *{plant.name}*?", [
+            {"id": "confirm_delete_yes", "title": "Sí, eliminala"},
+            {"id": "confirm_delete_no", "title": "No, cancelar"},
+        ])
+        return True, ""
     ok = await _ds.archive_plant(plant.id)
-    if ok:
-        return True, f"*{plant.name}* eliminada de Notion"
-    return False, "Error eliminando la planta"
+    return (True, f"*{plant.name}* eliminada de Notion") if ok else (False, "Error eliminando la planta")
 
 
 # ── MODULO EVENTOS ─────────────────────────────────────────────────────────────
@@ -3083,18 +3138,20 @@ EVENTOS RECURRENTES:
                             high_impact_pending = {"action": "delete_recurring", "events": [{"id": e["id"], "summary": e.get("summary","Evento")} for e in to_delete], "descripcion": descripcion}
                             t_result = f"CONFIRMACION_REQUERIDA: {descripcion}"
                         else:
-                            deleted = []
-                            for ev in to_delete:
-                                del_r = await http.delete(
-                                    f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{ev['id']}",
-                                    headers=headers
-                                )
-                                if del_r.status_code == 204:
-                                    deleted.append(ev.get("summary", "Evento"))
-                            if deleted:
-                                t_result = "Eliminados: " + ", ".join(deleted) + "."
-                            else:
-                                t_result = "No pude eliminar los eventos."
+                            ev = to_delete[0]
+                            ev_name = ev.get("summary", "Evento")
+                            expires_at = (now_argentina() + timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+                            pending_state[phone] = {
+                                "type": "confirm_delete", "action": "event",
+                                "page_id": ev["id"], "name": ev_name,
+                                "expires_at": expires_at,
+                                "extra_events": [{"id": e["id"], "summary": e.get("summary", "Evento")} for e in to_delete[1:]],
+                            }
+                            await send_interactive_buttons(phone, f"¿Eliminás *{ev_name}*?", [
+                                {"id": "confirm_delete_yes", "title": "Sí, eliminalo"},
+                                {"id": "confirm_delete_no", "title": "No, cancelar"},
+                            ])
+                            t_result = f"Pedí confirmación al usuario para eliminar {ev_name}."
 
         elif t_name == "calcular_fecha":
             t_result = calcular_fecha_exacta(t_input.get("descripcion", ""))
@@ -3220,6 +3277,10 @@ EVENTOS RECURRENTES:
             )
         add_to_history(phone, "user", text)
         add_to_history(phone, "assistant", reply)
+        return None
+
+    if pending_state.get(phone, {}).get("type") == "confirm_delete":
+        add_to_history(phone, "user", text)
         return None
 
     add_to_history(phone, "user", text)
@@ -3437,7 +3498,7 @@ Responde:
     return f"Dale! Que queres modificar del Resumen Diario?\n\n{estado}\n\nPodes pedirme cosas como cambiar el horario, agregar que te cuente el clima de manana, una frase del dia, o lo que se te ocurra."
 
 # ── MODULO REUNIONES ──────────────────────────────────────────────────────────
-async def handle_reunion(text: str, image_b64: str = None, image_type: str = None) -> str:
+async def handle_reunion(text: str, image_b64: str = None, image_type: str = None, phone: str = None) -> str:
     now = now_argentina()
     content_parts = []
     if image_b64:
@@ -3492,12 +3553,12 @@ async def handle_reunion(text: str, image_b64: str = None, image_type: str = Non
             pass
 
     try:
-        await _ds.create_meeting({
+        meeting = await _ds.create_meeting({
             "name": nombre, "with_whom": con_quien, "date": fecha,
             "notes": notas, "calendar_link": cal_link,
         })
     except Exception as e:
-        return f"Error guardando la reunion: {str(e)[:100]}"
+        return error_servicio("notion")
 
     try:
         fecha_fmt = datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y")
@@ -3509,7 +3570,15 @@ async def handle_reunion(text: str, image_b64: str = None, image_type: str = Non
         "social",
         f"Reunión guardada: '{nombre}'{f', con {con_quien}' if con_quien else ''}, fecha: {fecha}"
     ))
-    return f"*{nombre}* guardada en Meetings{cal_str}\n{fecha_fmt}{con_str}\n\nNotas guardadas en Notion"
+    reply = f"*{nombre}* guardada en Meetings{cal_str}\n{fecha_fmt}{con_str}\n\nNotas guardadas en Notion"
+    if phone:
+        expires_at = (now_argentina() + timedelta(seconds=60)).replace(tzinfo=None).isoformat()
+        pending_state[phone] = {
+            "type": "undo_window", "action": "meeting",
+            "page_id": meeting.id, "name": nombre, "expires_at": expires_at,
+        }
+        reply += "\n\n_Si algo no quedó bien, avisame._"
+    return reply
 
 
 async def editar_reunion(text: str) -> tuple[bool, str]:
@@ -3543,7 +3612,7 @@ async def editar_reunion(text: str) -> tuple[bool, str]:
     return True, f"*{meeting.name}* actualizada: {changes}"
 
 
-async def eliminar_reunion(text: str) -> tuple[bool, str]:
+async def eliminar_reunion(text: str, phone: str = None) -> tuple[bool, str]:
     response = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=100,
         system="Extrae el nombre de la reunión a eliminar. Responde SOLO JSON.",
@@ -3559,10 +3628,19 @@ async def eliminar_reunion(text: str) -> tuple[bool, str]:
     if not results:
         return False, f"No encontré ninguna reunión llamada _{search_term}_"
     meeting = results[0]
+    if phone:
+        expires_at = (now_argentina() + timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+        pending_state[phone] = {
+            "type": "confirm_delete", "action": "meeting",
+            "page_id": meeting.id, "name": meeting.name, "expires_at": expires_at,
+        }
+        await send_interactive_buttons(phone, f"¿Eliminás *{meeting.name}*?", [
+            {"id": "confirm_delete_yes", "title": "Sí, eliminala"},
+            {"id": "confirm_delete_no", "title": "No, cancelar"},
+        ])
+        return True, ""
     ok = await _ds.archive_meeting(meeting.id)
-    if ok:
-        return True, f"*{meeting.name}* eliminada de Notion"
-    return False, "Error eliminando la reunión"
+    return (True, f"*{meeting.name}* eliminada de Notion") if ok else (False, "Error eliminando la reunión")
 
 
 # ── MODULO SALUD ──────────────────────────────────────────────────────────────
@@ -3793,8 +3871,16 @@ REGLAS:
 
         elif block.name == "eliminar_registro_salud":
             rid = inp.get("record_id")
-            ok = await _ds.archive_health_record(rid)
-            tr = "Registro eliminado." if ok else "Error eliminando el registro."
+            expires_at = (now_argentina() + timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+            pending_state[phone] = {
+                "type": "confirm_delete", "action": "health_record",
+                "page_id": rid, "name": "este registro médico", "expires_at": expires_at,
+            }
+            await send_interactive_buttons(phone, "¿Eliminás este registro médico?", [
+                {"id": "confirm_delete_yes", "title": "Sí, eliminarlo"},
+                {"id": "confirm_delete_no", "title": "No, cancelar"},
+            ])
+            tr = "Pedí confirmación al usuario para eliminar el registro."
 
         tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": tr})
 
@@ -3803,6 +3889,10 @@ REGLAS:
         add_to_history(phone, "user", text)
         add_to_history(phone, "assistant", reply)
         return reply
+
+    if pending_state.get(phone, {}).get("type") == "confirm_delete":
+        add_to_history(phone, "user", text)
+        return None
 
     final = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=600,
@@ -3822,6 +3912,104 @@ REGLAS:
 # ── PENDING STATE HANDLER ──────────────────────────────────────────────────────
 async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
     state_type = state.get("type")
+
+    if state_type == "confirm_delete":
+        expires_at = state.get("expires_at")
+        if expires_at:
+            try:
+                exp = datetime.fromisoformat(expires_at)
+                if now_argentina().replace(tzinfo=None) > exp.replace(tzinfo=None):
+                    del pending_state[phone]
+                    await send_message(phone, f"Tiempo agotado, no se eliminó *{state.get('name', 'el elemento')}*.")
+                    return True
+            except Exception:
+                pass
+
+        if text == "confirm_delete_yes":
+            action = state["action"]
+            page_id = state["page_id"]
+            name = state.get("name", "")
+            del pending_state[phone]
+            if action == "expense":
+                ok = await _ds.archive_expense(page_id)
+                msg = f"*{name}* eliminado." if ok else "No pude eliminar."
+            elif action == "plant":
+                ok = await _ds.archive_plant(page_id)
+                msg = f"*{name}* eliminada." if ok else "No pude eliminar."
+            elif action == "meeting":
+                ok = await _ds.archive_meeting(page_id)
+                msg = f"*{name}* eliminada." if ok else "No pude eliminar."
+            elif action == "event":
+                access_token = await get_gcal_access_token()
+                ok = False
+                if access_token:
+                    async with httpx.AsyncClient() as http:
+                        r = await http.delete(
+                            f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{page_id}",
+                            headers={"Authorization": f"Bearer {access_token}"}
+                        )
+                        ok = r.status_code == 204
+                msg = f"*{name}* eliminado del calendario." if ok else error_servicio("calendar")
+            elif action == "health_record":
+                ok = await _ds.archive_health_record(page_id)
+                msg = "Registro médico eliminado." if ok else "No pude eliminar."
+            elif action == "fitness_entry":
+                ok = await _ds.archive_fitness(page_id)
+                msg = "Actividad eliminada." if ok else "No pude eliminar."
+            else:
+                msg = "Acción no reconocida."
+            await send_message(phone, msg)
+            return True
+        elif text == "confirm_delete_no":
+            del pending_state[phone]
+            await send_message(phone, "Cancelado, no se eliminó nada.")
+            return True
+        else:
+            del pending_state[phone]
+            return False
+
+    if state_type == "undo_window":
+        expires_at = state.get("expires_at")
+        if expires_at:
+            try:
+                exp = datetime.fromisoformat(expires_at)
+                if now_argentina().replace(tzinfo=None) > exp.replace(tzinfo=None):
+                    del pending_state[phone]
+                    return False
+            except Exception:
+                pass
+
+        t_lower = text.lower()
+        undo_signals = ["no era", "borralo", "está mal", "esta mal", "error", "cancelá",
+                        "cancela", "no quería", "no queria", "equivoque", "me equivoque",
+                        "no era eso", "borrá", "deshacer", "undo", "no corresponde",
+                        "esta mal", "estaba mal", "no es correcto", "incorrecto"]
+        is_undo = any(s in t_lower for s in undo_signals)
+
+        if not is_undo:
+            del pending_state[phone]
+            return False
+
+        action = state["action"]
+        page_id = state["page_id"]
+        name = state.get("name", "el último ítem")
+        del pending_state[phone]
+
+        ok = False
+        if action == "expense":
+            ok = await _ds.archive_expense(page_id)
+        elif action == "plant":
+            ok = await _ds.archive_plant(page_id)
+        elif action == "meeting":
+            ok = await _ds.archive_meeting(page_id)
+        elif action == "finance_invoice":
+            ok = await _ds.archive_expense(page_id)
+
+        if ok:
+            await send_message(phone, f"Deshecho. *{name}* eliminado.")
+        else:
+            await send_message(phone, "No pude deshacer la acción.")
+        return True
 
     if state_type == "litros_followup":
         page_id = state["page_id"]
@@ -4401,6 +4589,9 @@ async def enqueue_message(message: dict):
         text = ""
         image_b64 = image_type = None
 
+        if msg_type != "reaction" and msg_id:
+            asyncio.create_task(send_reaction(phone, msg_id, "✅"))
+
         if msg_type == "text":
             text = message["text"]["body"]
         elif msg_type == "interactive":
@@ -4673,8 +4864,9 @@ async def process_single_item(phone: str, item: dict):
             await send_message(phone, msg if success else msg)
 
         elif tipo == "ELIMINAR_GASTO":
-            success, msg = await eliminar_gasto(text)
-            await send_message(phone, msg if success else msg)
+            success, msg = await eliminar_gasto(text, phone)
+            if msg:
+                await send_message(phone, msg)
 
         elif tipo == "CORREGIR_GASTO":
             success, msg = await corregir_gasto(text, phone=phone)
@@ -4682,19 +4874,28 @@ async def process_single_item(phone: str, item: dict):
 
         elif tipo == "PLANTA":
             parsed = await parse_planta(text, exchange_rate)
-            success, error = await create_planta(parsed)
+            success, plant_id = await create_planta(parsed)
             if success:
-                await send_message(phone, format_planta(parsed))
+                reply = format_planta(parsed)
+                expires_at = (now_argentina() + timedelta(seconds=60)).replace(tzinfo=None).isoformat()
+                pending_state[phone] = {
+                    "type": "undo_window", "action": "plant",
+                    "page_id": plant_id, "name": parsed.get("name", "planta"),
+                    "expires_at": expires_at,
+                }
+                reply += "\n\n_Si algo no quedó bien, avisame._"
+                await send_message(phone, reply)
             else:
-                await send_message(phone, f"Error guardando planta: {error[:200]}")
+                await send_message(phone, plant_id)
 
         elif tipo == "EDITAR_PLANTA":
             success, msg = await editar_planta(text)
             await send_message(phone, msg)
 
         elif tipo == "ELIMINAR_PLANTA":
-            success, msg = await eliminar_planta(text)
-            await send_message(phone, msg)
+            success, msg = await eliminar_planta(text, phone)
+            if msg:
+                await send_message(phone, msg)
 
         elif tipo in ("EVENTO", "EDITAR_EVENTO", "ELIMINAR_EVENTO"):
             reply = await handle_evento_agent(phone, text, image_b64, image_type)
@@ -4753,7 +4954,7 @@ async def process_single_item(phone: str, item: dict):
                 await send_message(phone, reply)
 
         elif tipo == "REUNION":
-            respuesta = await handle_reunion(text, image_b64, image_type)
+            respuesta = await handle_reunion(text, image_b64, image_type, phone=phone)
             await send_message(phone, respuesta)
 
         elif tipo == "EDITAR_REUNION":
@@ -4761,8 +4962,9 @@ async def process_single_item(phone: str, item: dict):
             await send_message(phone, msg)
 
         elif tipo == "ELIMINAR_REUNION":
-            success, msg = await eliminar_reunion(text)
-            await send_message(phone, msg)
+            success, msg = await eliminar_reunion(text, phone)
+            if msg:
+                await send_message(phone, msg)
 
         elif tipo == "CORREGIR_SHOPPING":
             success, msg = await corregir_shopping(text)
@@ -5021,8 +5223,16 @@ REGLAS:
             tr = "Actualizado." if ok else "Error actualizando."
 
         elif block.name == "eliminar_actividad":
-            ok = await _ds.archive_fitness(inp["entry_id"])
-            tr = "Eliminado." if ok else "Error eliminando."
+            expires_at = (now_argentina() + timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+            pending_state[phone] = {
+                "type": "confirm_delete", "action": "fitness_entry",
+                "page_id": inp["entry_id"], "name": "esta actividad", "expires_at": expires_at,
+            }
+            await send_interactive_buttons(phone, "¿Eliminás esta actividad?", [
+                {"id": "confirm_delete_yes", "title": "Sí, eliminarla"},
+                {"id": "confirm_delete_no", "title": "No, cancelar"},
+            ])
+            tr = "Pedí confirmación al usuario para eliminar la actividad."
 
         tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": tr})
 
@@ -5031,6 +5241,10 @@ REGLAS:
         add_to_history(phone, "user", text or "")
         add_to_history(phone, "assistant", reply)
         return reply
+
+    if pending_state.get(phone, {}).get("type") == "confirm_delete":
+        add_to_history(phone, "user", text or "")
+        return None
 
     final = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=800,
@@ -5205,7 +5419,13 @@ async def handle_deuda_agent(phone: str, text: str) -> str:
     task_ok, _ = await create_factura_task(provider, amount, "", period, finance_page_id=page_id if ok else None)
     if ok or task_ok:
         monto_str = f"${amount:,.0f}" if amount else "monto a confirmar"
-        return f"✅ Deuda registrada: *{provider}* — {monto_str}. Te voy a recordar hasta que la marques como pagada."
+        if ok and page_id:
+            expires_at = (now_argentina() + timedelta(seconds=60)).replace(tzinfo=None).isoformat()
+            pending_state[phone] = {
+                "type": "undo_window", "action": "finance_invoice",
+                "page_id": page_id, "name": f"Deuda {provider}", "expires_at": expires_at,
+            }
+        return f"✅ Deuda registrada: *{provider}* — {monto_str}. Te voy a recordar hasta que la marques como pagada.\n\n_Si algo no quedó bien, avisame._"
     return "No pude registrar la deuda. Intenta de nuevo."
 
 async def send_daily_summary(http, access_token: str, now: datetime):
