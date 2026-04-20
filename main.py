@@ -447,8 +447,7 @@ async def send_reaction(to: str, message_id: str, emoji: str):
                 "type": "reaction",
                 "reaction": {"message_id": message_id, "emoji": emoji}
             })
-            if r.status_code not in (200, 201):
-                await send_message(MY_NUMBER, f"[debug reaction] {r.status_code}: {r.text[:200]}")
+            await send_message(MY_NUMBER, f"[debug reaction] status={r.status_code} msg_id={message_id[:30]} body={r.text[:200]}")
     except Exception as e:
         await send_message(MY_NUMBER, f"[debug reaction] exception: {str(e)[:200]}")
 
@@ -4596,7 +4595,7 @@ async def enqueue_message(message: dict):
         image_b64 = image_type = None
 
         if msg_type != "reaction" and msg_id:
-            asyncio.create_task(send_reaction(phone, msg_id, "✅"))
+            await send_reaction(phone, msg_id, "✅")
 
         if msg_type == "text":
             text = message["text"]["body"]
