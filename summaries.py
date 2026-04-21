@@ -406,7 +406,7 @@ async def send_daily_summary(http, access_token: str, now: datetime):
             try:
                 extract_resp = await claude_create(
                     model="claude-haiku-4-5-20251001", max_tokens=400,
-                    system="Extrae facturas/servicios del resumen de Gmail. Responde SOLO JSON array. Si no hay facturas, responde []. Formato: [{\"provider\": \"nombre\", \"amount\": numero_o_null, \"due_date\": \"YYYY-MM-DD_o_null\", \"period\": \"Mes YYYY\", \"category\": \"Servicios\"}]",
+                    system="Extrae facturas/servicios del resumen de Gmail. Responde SOLO JSON array. Si no hay facturas, responde []. Formato: [{\"provider\": \"nombre\", \"amount\": numero_o_null, \"due_date\": \"YYYY-MM-DD_o_null\", \"period\": \"Mes YYYY\", \"category\": \"Recurrente\"}]",
                     messages=[{"role": "user", "content": gmail_summary}]
                 )
                 raw = extract_resp.content[0].text.strip().strip("`").lstrip("json").strip()
@@ -435,7 +435,7 @@ async def send_daily_summary(http, access_token: str, now: datetime):
                             pago_dudoso = h
                 if ya_pagada:
                     continue
-                ok, page_id = await _ds.create_finance_invoice(provider, amount, period, due_date, inv.get("category", "Servicios"))
+                ok, page_id = await _ds.create_finance_invoice(provider, amount, period, due_date, inv.get("category", "Recurrente"))
                 if ok:
                     await _ds.create_factura_task(provider, amount, due_date, period, finance_page_id=page_id)
                 if pago_dudoso and amount and page_id:

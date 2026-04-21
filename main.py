@@ -422,8 +422,8 @@ Tu tarea: registrar gastos e ingresos del usuario.
 - Si falta el monto Y no hay imagen de donde sacarlo -> pregunta de forma natural y breve.
 - Si hay ambiguedad (ej: "compre algo" sin monto ni imagen) -> pregunta que fue y cuanto.
 
-Categorias disponibles: Supermercado, Sueldo, Servicios, Transporte, Vianda, Salud, Salud Mental, Salida, Birra, Ocio, Compras, Depto, Plantas, Viajes, Venta.
-Servicios = pagos recurrentes (alquiler, luz, gas, internet, streaming, gimnasio). Depto = compras fisicas para el depto (muebles, materiales, herramientas).
+Categorias disponibles: Supermercado, Sueldo, Recurrente, Transporte, Vianda, Salud, Salud Mental, Salida, Birra, Ocio, Compras, Depto, Plantas, Viajes, Venta.
+Recurrente = pagos recurrentes (alquiler, luz, gas, internet, streaming, gimnasio). Depto = compras fisicas para el depto (muebles, materiales, herramientas).
 Si in_out es INGRESO -> categoria solo puede ser Sueldo o Venta.
 Clientes posibles: LBL, OPERA, ALPATACO, Juan Martin, Depto, Work, Santi Vales, Jorge, Barbara, Vanguardia, Alejo, Dinamo, Paula Diaz, Labti, PlanA, JGA, ATE.
 Emoji: elegi el mas especifico segun el contexto real."""
@@ -4976,14 +4976,14 @@ async def _cron_job_inner():
 
 
 async def query_servicios_mes(month: str = None) -> str:
-    """Devuelve entradas individuales de categoria Servicios del mes para cruzar con facturas."""
+    """Devuelve entradas individuales de categoria Recurrente del mes para cruzar con facturas."""
     if not month:
         month = now_argentina().strftime("%Y-%m")
     try:
         entries = await _ds.get_services_summary(month)
         if not entries:
-            return f"Sin pagos de Servicios en {month}."
-        lines = [f"Pagos Servicios {month}:"]
+            return f"Sin pagos de Recurrente en {month}."
+        lines = [f"Pagos Recurrente {month}:"]
         for e in entries:
             lines.append(f"- {str(e.date) if e.date else ''} -- {e.name}: ${e.value_ars:,.0f}")
         return "\n".join(lines)
@@ -5011,7 +5011,7 @@ async def handle_deuda_agent(phone: str, text: str) -> str:
     now = now_argentina()
     response = await claude_create(
         model="claude-haiku-4-5-20251001", max_tokens=200,
-        system=f"Hoy: {now.strftime('%Y-%m-%d')}. Extrae la deuda del mensaje. Responde SOLO JSON valido: {{\"provider\": \"nombre de la persona o servicio\", \"amount\": monto numerico o null, \"categoria\": \"categoria (ej: Personal, Servicios, Depto)\", \"notes\": \"detalle si hay\"}}",
+        system=f"Hoy: {now.strftime('%Y-%m-%d')}. Extrae la deuda del mensaje. Responde SOLO JSON valido: {{\"provider\": \"nombre de la persona o servicio\", \"amount\": monto numerico o null, \"categoria\": \"categoria (ej: Personal, Recurrente, Depto)\", \"notes\": \"detalle si hay\"}}",
         messages=[{"role": "user", "content": text}]
     )
     try:

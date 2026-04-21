@@ -564,7 +564,7 @@ class NotionDataStore:
         ))
 
     async def get_services_summary(self, month: str = None) -> list[EntryResult]:
-        """Expense entries in the 'Servicios' category for the month. Replaces query_servicios_mes()."""
+        """Expense entries in the 'Recurrente' category for the month. Replaces query_servicios_mes()."""
         if not month:
             from datetime import timezone
             now = datetime.now(timezone.utc) - timedelta(hours=3)
@@ -575,7 +575,7 @@ class NotionDataStore:
 
         return await self.query_expenses(QueryFilter(
             date_range=DateRange(start=date(year, mon, 1), end=date(year, mon, last_day)),
-            category="Servicios",
+            category="Recurrente",
             limit=30,
         ))
 
@@ -1099,7 +1099,7 @@ class NotionDataStore:
             return False
 
     async def create_finance_invoice(
-        self, provider: str, amount: float, period: str, due_date: str = "", category: str = "Servicios"
+        self, provider: str, amount: float, period: str, due_date: str = "", category: str = "Recurrente"
     ) -> tuple[bool, str]:
         """Create an Impaga finance entry. Returns (success, page_id). Deduplicates by provider+period."""
         import re
