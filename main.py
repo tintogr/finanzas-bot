@@ -1407,15 +1407,17 @@ async def handle_chat(phone: str, text: str) -> str:
         },
         {
             "name": "guardar_lugar_conocido",
-            "description": "Guarda una direccion como lugar conocido del usuario (casa, trabajo, gimnasio, etc). Usar cuando el usuario menciona donde vive, donde trabaja, o cualquier lugar de referencia personal.",
+            "description": "Guarda una direccion como lugar conocido del usuario (casa, trabajo, gimnasio, etc). Usar cuando el usuario menciona donde vive, donde trabaja, o cualquier lugar de referencia personal. Si el usuario acaba de compartir su ubicacion (lat/lon disponibles), pasar lat y lon directamente en vez de direccion.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "nombre": {"type": "string", "description": "Nombre del lugar. Ej: 'Casa', 'Trabajo', 'Gimnasio'"},
-                    "direccion": {"type": "string", "description": "Direccion completa para geocodificar. Ej: 'Islas Malvinas 809, Neuquen'"},
+                    "direccion": {"type": "string", "description": "Direccion completa para geocodificar. Ej: 'Islas Malvinas 809, Neuquen'. Omitir si se pasan lat/lon."},
+                    "lat": {"type": "number", "description": "Latitud exacta si se conoce (del GPS o Maps). Usar en vez de direccion cuando este disponible."},
+                    "lon": {"type": "number", "description": "Longitud exacta si se conoce (del GPS o Maps). Usar en vez de direccion cuando este disponible."},
                     "radio": {"type": "integer", "description": "Radio en metros para considerar que el usuario esta en ese lugar. Default 100."}
                 },
-                "required": ["nombre", "direccion"]
+                "required": ["nombre"]
             }
         },
         {
@@ -1660,33 +1662,53 @@ CRITICO: si guardar_lugar_conocido devuelve error o dice "NO fue guardado", info
             nombre = t_input.get("nombre", "")
             direccion = t_input.get("direccion", "")
             radio = t_input.get("radio", 100)
+            place_lat = t_input.get("lat")
+            place_lon = t_input.get("lon")
+            formatted = direccion or nombre
             try:
-                async with httpx.AsyncClient(timeout=5) as http:
-                    api_key = os.environ.get("GOOGLE_PLACES_KEY", "")
-                    _attempts = [direccion]
-                    if not any(k in direccion.lower() for k in ["argentina", "neuquen", "neuquén"]):
-                        _attempts.append(f"{direccion}, Neuquén, Argentina")
-                    _geo_result = None
-                    for _addr in _attempts:
-                        r = await http.get(
-                            "https://maps.googleapis.com/maps/api/geocode/json",
-                            params={"address": _addr, "key": api_key, "language": "es"}
-                        )
-                        if r.status_code == 200 and r.json().get("results"):
-                            _geo_result = r.json()["results"][0]
-                            break
-                    if _geo_result:
-                        place_lat = _geo_result["geometry"]["location"]["lat"]
-                        place_lon = _geo_result["geometry"]["location"]["lng"]
-                        formatted = _geo_result.get("formatted_address", direccion)
-                        places = user_prefs.get("known_places", [])
-                        places = [p for p in places if p["name"].lower() != nombre.lower()]
-                        places.append({"name": nombre, "lat": place_lat, "lon": place_lon, "radius": radio})
-                        user_prefs["known_places"] = places
-                        await save_user_config(MY_NUMBER)
-                        t_result = f"Guardado: {nombre} en {formatted} (radio {radio}m)."
-                    else:
-                        t_result = f"No pude ubicar '{direccion}'. El lugar NO fue guardado. Informale al usuario y sugeríle que comparta la ubicacion directamente desde WhatsApp (adjuntar → ubicacion)."
+                if place_lat is not None and place_lon is not None:
+                    # Coordenadas exactas provistas directamente
+                    pass
+                elif direccion:
+                    async with httpx.AsyncClient(timeout=5) as http:
+                        api_key = os.environ.get("GOOGLE_PLACES_KEY", "")
+                        _attempts = [direccion]
+                        if not any(k in direccion.lower() for k in ["argentina", "neuquen", "neuquén"]):
+                            _attempts.append(f"{direccion}, Neuquén, Argentina")
+                        _geo_result = None
+                        for _addr in _attempts:
+                            r = await http.get(
+                                "https://maps.googleapis.com/maps/api/geocode/json",
+                                params={"address": _addr, "key": api_key, "language": "es"}
+                            )
+                            if r.status_code == 200 and r.json().get("results"):
+                                _geo_result = r.json()["results"][0]
+                                break
+                        if _geo_result:
+                            place_lat = _geo_result["geometry"]["location"]["lat"]
+                            place_lon = _geo_result["geometry"]["location"]["lng"]
+                            formatted = _geo_result.get("formatted_address", direccion)
+                        elif current_location.get("lat") is not None:
+                            # Fallback: usar la ubicacion actual si el geocoding fallo
+                            place_lat = current_location["lat"]
+                            place_lon = current_location["lon"]
+                            formatted = current_location.get("location_name") or direccion
+                else:
+                    # Sin direccion ni coords: usar ubicacion actual si existe
+                    if current_location.get("lat") is not None:
+                        place_lat = current_location["lat"]
+                        place_lon = current_location["lon"]
+                        formatted = current_location.get("location_name") or nombre
+
+                if place_lat is not None and place_lon is not None:
+                    places = user_prefs.get("known_places", [])
+                    places = [p for p in places if p["name"].lower() != nombre.lower()]
+                    places.append({"name": nombre, "lat": place_lat, "lon": place_lon, "radius": radio})
+                    user_prefs["known_places"] = places
+                    await save_user_config(MY_NUMBER)
+                    t_result = f"Guardado: {nombre} en {formatted} (radio {radio}m)."
+                else:
+                    t_result = f"No pude ubicar '{direccion or nombre}'. El lugar NO fue guardado. Informale al usuario y sugeríle que comparta la ubicacion directamente desde WhatsApp (adjuntar → ubicacion)."
             except Exception as e:
                 t_result = f"Error: {str(e)[:100]}. El lugar NO fue guardado."
         elif t_name == "editar_geo_reminder":
@@ -3711,6 +3733,41 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
         await send_message(phone, msg)
         return True
 
+    if state_type == "save_location_confirm":
+        lat = state.get("lat")
+        lon = state.get("lon")
+        loc_name = state.get("loc_name") or f"{lat:.4f}, {lon:.4f}"
+        del pending_state[phone]
+        affirmative = text.strip().lower() in ["si", "sí", "dale", "ok", "yes", "s", "guardar"]
+        if not affirmative:
+            await send_message(phone, "Ok, no guardé el lugar.")
+            return True
+        # Pedir el nombre del lugar
+        pending_state[phone] = {
+            "type": "save_location_name",
+            "lat": lat, "lon": lon, "loc_name": loc_name,
+            "expires_at": (now_argentina() + timedelta(minutes=10)).replace(tzinfo=None).isoformat(),
+        }
+        await send_message(phone, f"📍 _{loc_name}_\n¿Cómo querés que se llame este lugar? (ej: Trabajo, Casa, Gym)")
+        return True
+
+    if state_type == "save_location_name":
+        lat = state.get("lat")
+        lon = state.get("lon")
+        loc_name = state.get("loc_name") or ""
+        del pending_state[phone]
+        nombre = text.strip().capitalize()
+        if not nombre:
+            await send_message(phone, "No entendí el nombre. No guardé el lugar.")
+            return True
+        places = user_prefs.get("known_places", [])
+        places = [p for p in places if p["name"].lower() != nombre.lower()]
+        places.append({"name": nombre, "lat": lat, "lon": lon, "radius": 150})
+        user_prefs["known_places"] = places
+        await save_user_config(MY_NUMBER)
+        await send_message(phone, f"✅ *{nombre}* guardado como lugar conocido.")
+        return True
+
     if state_type == "confirm_service_providers":
         proposed = state.get("proposed", {})
         del pending_state[phone]
@@ -3907,6 +3964,13 @@ async def enqueue_message(message: dict):
                 if place:
                     await send_message(phone, f"📍 Ubicacion actualizada: *{place['name']}*")
                 else:
+                    pending_state[phone] = {
+                        "type": "save_location_confirm",
+                        "lat": float(lat),
+                        "lon": float(lon),
+                        "loc_name": loc_name,
+                        "expires_at": (now_argentina() + timedelta(minutes=10)).replace(tzinfo=None).isoformat(),
+                    }
                     await send_message(phone, "📍 Ubicacion actualizada. No reconozco este lugar, queres que lo guarde?")
             return
         else:
