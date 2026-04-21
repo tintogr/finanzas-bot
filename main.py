@@ -3871,6 +3871,11 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
         last4 = state.get("last4", "")
         del pending_state[phone]
         skip_words = {"no", "n", "nope", "omitir", "skip", "no gracias"}
+        if not text.strip():
+            # texto vacío (imagen sola) — re-preguntar sin consumir el estado
+            pending_state[phone] = state
+            await send_message(phone, f"💳 Tengo una tarjeta terminada en *{last4}* sin registrar. ¿De qué banco es y es débito o crédito?")
+            return True
         if text.strip().lower() in skip_words:
             return True
         response_ai = await claude_create(
@@ -4382,11 +4387,17 @@ async def process_single_item(phone: str, item: dict):
     indicator_task = asyncio.create_task(_delayed_indicator(phone, _done))
     try:
         if phone in pending_state:
-            _done[0] = True
-            indicator_task.cancel()
-            handled = await handle_pending_state(phone, text, pending_state.get(phone, {}))
-            if handled:
-                return
+            # Si llega una imagen sin texto y el pending state es "soft" (no bloqueante),
+            # lo descartamos y procesamos la imagen como un mensaje nuevo
+            _soft_states = {"unknown_card_register", "unknown_card_owner", "undo_window"}
+            if image_b64 and not text and pending_state.get(phone, {}).get("type") in _soft_states:
+                del pending_state[phone]
+            else:
+                _done[0] = True
+                indicator_task.cancel()
+                handled = await handle_pending_state(phone, text, pending_state.get(phone, {}))
+                if handled:
+                    return
 
         if user_prefs.get("_config_page_id") is None:
             await load_user_config(phone)
