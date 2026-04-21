@@ -3599,35 +3599,6 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
             await send_message(phone, "Quedo como estaba.")
         return True
 
-    if state_type == "geo_reminder_awaiting_recurrent":
-        description = state.get("description", "Recordatorio")
-        rtype = state.get("rtype", "shop")
-        shop_name = state.get("shop_name")
-        address = state.get("address")
-        radius = state.get("radius", 20)
-        user_specified_radius = state.get("user_specified_radius", False)
-        del pending_state[phone]
-        recurrent = text.strip() == "recurrent_always"
-        ok, page_id = await create_geo_reminder(
-            description=description, rtype=rtype,
-            shop_name=shop_name, radius=radius, recurrent=recurrent,
-        )
-        if ok:
-            freq = "Cada vez que" if recurrent else "La próxima vez que"
-            confirm_text = f"📍 *Geo-reminder guardado*\n_{description}_\n{freq} estés a menos de {radius}m de *{shop_name or description}*, te aviso."
-            if not user_specified_radius and page_id:
-                await send_message(phone, confirm_text)
-                pending_state[phone] = {"type": "geo_reminder_radius_confirm", "page_id": page_id, "name": description}
-                await send_interactive_buttons(
-                    phone, "Radio por defecto: 20m. ¿Querés cambiarlo?",
-                    [{"id": "radius_50", "title": "50m"}, {"id": "radius_100", "title": "100m"}, {"id": "radius_300", "title": "300m"}]
-                )
-            else:
-                await send_message(phone, confirm_text)
-        else:
-            await send_message(phone, "No pude guardar el geo-reminder.")
-        return True
-
     if state_type == "geo_reminder_radius_confirm":
         page_id = state.get("page_id")
         name = state.get("name", "Recordatorio")
@@ -4100,7 +4071,6 @@ Responde SOLO JSON valido sin markdown:
   "shop_name": "nombre del comercio si es tipo shop, null si no",
   "address": "direccion si la menciona, null si no",
   "recurrent": SOLO true si el usuario explicitamente pide que se repita siempre ("cada vez que pase", "siempre que este cerca", "recordame siempre"). En todos los demas casos false,
-  "recurrent_unclear": true si no es obvio si quiere que se repita siempre o solo una vez (ej: "comprar X en farmacia" — no queda claro). false si esta claro,
   "radius": radio en metros si lo menciona (ej: "a menos de 500m" -> 500, "cuando este muy cerca" -> 20, "en la zona" -> 300). Si no menciona distancia usar null,
   "needs_location": true si necesitas que el usuario comparta la ubicacion del lugar}}""",
         messages=[{"role": "user", "content": text}]
@@ -4115,7 +4085,6 @@ Responde SOLO JSON valido sin markdown:
     rtype = data.get("type", "place")
     shop_name = data.get("shop_name")
     recurrent = data.get("recurrent", False)
-    recurrent_unclear = data.get("recurrent_unclear", False)
     needs_location = data.get("needs_location", False)
     address = data.get("address")
     radius_raw = data.get("radius")
@@ -4123,24 +4092,6 @@ Responde SOLO JSON valido sin markdown:
     user_specified_radius = radius is not None
     if radius is None:
         radius = 20
-
-    # Si no queda claro si es recurrente, preguntar antes de crear
-    if recurrent_unclear:
-        pending_state[phone] = {
-            "type": "geo_reminder_awaiting_recurrent",
-            "description": description, "rtype": rtype,
-            "shop_name": shop_name, "address": address,
-            "radius": radius, "user_specified_radius": user_specified_radius,
-        }
-        await send_message(phone, f"📍 _{description}_\n¿Querés que te avise solo la próxima vez que pases, o siempre que estés cerca?")
-        await send_interactive_buttons(
-            phone, "¿Con qué frecuencia?",
-            [
-                {"id": "recurrent_once", "title": "Solo una vez"},
-                {"id": "recurrent_always", "title": "Siempre que pase"},
-            ]
-        )
-        return ""
 
     # Detectar link de Google Maps en el texto
     import re
