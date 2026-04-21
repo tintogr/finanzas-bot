@@ -43,6 +43,7 @@ async def startup_event():
     await load_user_config(MY_NUMBER)
     await load_geo_reminders()
     await _ds.ensure_db_select_field("finances", "Estado", ["Impaga", "Pagada"])
+    asyncio.create_task(_cron_loop())
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -3761,9 +3762,10 @@ async def verify_webhook(request: Request):
         return int(params.get("hub.challenge", 0))
     return {"error": "Verification failed"}
 
-async def _delayed_indicator(phone: str):
+async def _delayed_indicator(phone: str, done: list):
     await asyncio.sleep(PROCESSING_INDICATOR_DELAY)
-    await send_message(phone, "⏳ Procesando...")
+    if not done[0]:
+        await send_message(phone, "⏳ Procesando...")
 
 
 async def _classify_group(items: list) -> list[list]:
@@ -4116,9 +4118,11 @@ async def process_single_item(phone: str, item: dict):
     image_type = item.get("image_type")
     extra_images = item.get("extra_images", [])
 
-    indicator_task = asyncio.create_task(_delayed_indicator(phone))
+    _done = [False]
+    indicator_task = asyncio.create_task(_delayed_indicator(phone, _done))
     try:
         if phone in pending_state:
+            _done[0] = True
             indicator_task.cancel()
             handled = await handle_pending_state(phone, text, pending_state.get(phone, {}))
             if handled:
@@ -4298,6 +4302,7 @@ Responde:
         except Exception:
             pass
     finally:
+        _done[0] = True
         indicator_task.cancel()
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -4539,6 +4544,16 @@ REGLAS:
     add_to_history(phone, "assistant", reply)
     return reply
 
+
+async def _cron_loop():
+    """Background loop que ejecuta cron_job cada 60 segundos sin depender de llamadas externas."""
+    await asyncio.sleep(60)  # Espera inicial para que el servidor termine de arrancar
+    while True:
+        try:
+            await cron_job()
+        except Exception:
+            pass
+        await asyncio.sleep(60)
 
 # ── CRON JOB ───────────────────────────────────────────────────────────────────
 @app.get("/cron")
