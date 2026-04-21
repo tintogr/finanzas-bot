@@ -726,6 +726,29 @@ Responde:
             return False, f"No encontre ningun gasto llamado _{search_term}_"
         entries_to_update = results
 
+    # Confirmación obligatoria para cambios masivos (más de 1 entrada)
+    if len(entries_to_update) > 1 and phone:
+        changes_preview = []
+        if intent.get("new_value_ars"):
+            changes_preview.append(f"monto → *${float(intent['new_value_ars']):,.0f} ARS*")
+        if intent.get("new_categoria"):
+            changes_preview.append(f"categoría → _{', '.join(intent['new_categoria'])}_")
+        if intent.get("new_name"):
+            changes_preview.append(f"nombre → _{intent['new_name']}_")
+        if intent.get("new_notes") is not None:
+            changes_preview.append(f"nota → _{intent['new_notes']}_")
+        names_preview = "\n".join(f"  • {e.name} (${e.value_ars:,.0f})" for e in entries_to_update)
+        pending_state[phone] = {
+            "type": "bulk_correction_confirm",
+            "entries": [{"id": e.id, "name": e.name} for e in entries_to_update],
+            "updates": updates,
+            "search_term": search_term,
+        }
+        return True, (
+            f"Voy a modificar *{len(entries_to_update)} entradas* ({', '.join(changes_preview)}):\n"
+            f"{names_preview}\n\n¿Confirmás?"
+        )
+
     errors = []
     updated = 0
     for entry in entries_to_update:
@@ -3988,6 +4011,37 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
             ))
         owner_str = f" — de {owner}" if owner else ""
         await send_message(phone, f"✅ Guardé *{label}* (****{last4}){owner_str} en tus medios de pago.")
+        return True
+
+    if state_type == "bulk_correction_confirm":
+        del pending_state[phone]
+        affirmative = text.strip().lower() in {"si", "sí", "dale", "ok", "yes", "confirmo", "s", "adelante"}
+        if not affirmative:
+            await send_message(phone, "Cancelado, no modifiqué nada.")
+            return True
+        entries = state.get("entries", [])
+        updates = state.get("updates", {})
+        errors = []
+        updated = 0
+        for e in entries:
+            try:
+                await _ds.update_expense(e["id"], updates)
+                updated += 1
+            except Exception as ex:
+                errors.append(str(ex)[:80])
+        if errors and not updated:
+            await send_message(phone, f"Error al actualizar: {errors[0]}")
+        else:
+            changes = []
+            if "value_ars" in updates:
+                changes.append(f"monto → *${float(updates['value_ars']):,.0f} ARS*")
+            if "categories" in updates:
+                changes.append(f"categoría → _{', '.join(updates['categories'])}_")
+            if "name" in updates:
+                changes.append(f"nombre → _{updates['name']}_")
+            if "notes" in updates:
+                changes.append(f"nota → _{updates['notes']}_")
+            await send_message(phone, f"✅ *{updated}* entradas corregidas\n" + "\n".join(changes))
         return True
 
     if state_type == "select_payment_method":
