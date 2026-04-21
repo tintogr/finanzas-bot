@@ -994,7 +994,7 @@ async def classify(text: str, has_image: bool, image_b64: str = None, image_type
     content.append({"type": "text", "text": history_ctx + "\n" + prompt_text if history_ctx else prompt_text})
     response = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=10,
-        system="""Responde SOLO una palabra: GASTO, CORREGIR_GASTO, ELIMINAR_GASTO, PLANTA, EDITAR_PLANTA, ELIMINAR_PLANTA, EVENTO, EDITAR_EVENTO, ELIMINAR_EVENTO, RECORDATORIO, CANCELAR_RECORDATORIO, SHOPPING, CORREGIR_SHOPPING, ELIMINAR_SHOPPING, REUNION, EDITAR_REUNION, ELIMINAR_REUNION, SALUD, ACTIVIDAD_FISICA, GEO_REMINDER, CONFIGURAR o CHAT.
+        system="""Responde SOLO una palabra: GASTO, CORREGIR_GASTO, ELIMINAR_GASTO, PLANTA, EDITAR_PLANTA, ELIMINAR_PLANTA, EVENTO, EDITAR_EVENTO, ELIMINAR_EVENTO, RECORDATORIO, CANCELAR_RECORDATORIO, SHOPPING, CORREGIR_SHOPPING, ELIMINAR_SHOPPING, REUNION, EDITAR_REUNION, ELIMINAR_REUNION, SALUD, ACTIVIDAD_FISICA, GEO_REMINDER, CONFIGURAR, RESUMEN_DIARIO o CHAT.
 
 GASTO: registrar un pago, compra o ingreso concreto con monto. Tambien cuando el mensaje menciona una compra o gasto SIN monto (ej: "compre en la verduleria", "fui al super") -- pedira el monto. EXCEPCION: si el mensaje menciona "lista de compras" -> SHOPPING.
 DEUDA: registrar algo que el usuario TODAVIA NO PAGO pero debe pagar. "le debo X a Y", "me deben X", "tengo que pagar X". Diferente a GASTO que es un pago ya realizado.
@@ -1005,7 +1005,7 @@ EDITAR_PLANTA: modificar datos de una planta existente (estado, riego, ubicacion
 ELIMINAR_PLANTA: eliminar una planta de Notion.
 EDITAR_EVENTO: modificar un evento existente en el calendario.
 ELIMINAR_EVENTO: eliminar o borrar un evento del calendario.
-RECORDATORIO: "recordame en X tiempo", "avisame en X". NUNCA cuando menciona un lugar fisico o comercio.
+RECORDATORIO: el usuario quiere que se le recuerde algo en el futuro. "recordame en X", "avisame en X", "recuerdame que llame a X". NUNCA para pedidos de resumen o informacion. NUNCA cuando menciona un lugar fisico o comercio.
 CANCELAR_RECORDATORIO: cancelar o borrar un recordatorio pendiente.
 GEO_REMINDER: recordatorios basados en ubicacion. "recordame cuando pase cerca de X", "cuando este en/cerca de X avisame que Y". Cualquier recordatorio que involucre un lugar fisico o comercio.
 EVENTO: crear un evento nuevo -- turno, cumple, cita, viaje.
@@ -1018,6 +1018,7 @@ ELIMINAR_REUNION: eliminar una reunion de Notion.
 SALUD: registrar o consultar informacion medica. Analisis, consultas, diagnosticos, medicaciones. También editar o eliminar registros médicos existentes.
 ACTIVIDAD_FISICA: registrar, consultar, editar o eliminar actividad física. "corri 5km", "jugue al futbol", "fui al gym", "cuantos km corri este mes", screenshot de Adidas/Strava/Nike. NUNCA para eventos de calendario relacionados al deporte — esos son EVENTO.
 CONFIGURAR: cambiar configuracion de Knot. Solo cuando el usuario quiere CAMBIAR algo. Nunca cuando pregunta o se queja.
+RESUMEN_DIARIO: el usuario pide que se le envie el resumen del dia ahora mismo. "manda el resumen", "pasame el resumen diario", "dame el resumen de hoy", "manda el buenos dias". NUNCA confundir con RECORDATORIO aunque mencione una hora — si pide el resumen, es RESUMEN_DIARIO.
 CHAT: cualquier pregunta, consulta o conversacion. Si tiene "?" o pide informacion -> CHAT.
 
 REGLA: si el mensaje PREGUNTA algo -> siempre CHAT, nunca GASTO.
@@ -1049,6 +1050,7 @@ IMAGENES SIN TEXTO:
     if "SALUD" in r:                   return "SALUD"
     if "SHOPPING" in r:                return "SHOPPING"
     if "REUNION" in r:                 return "REUNION"
+    if "RESUMEN_DIARIO" in r:          return "RESUMEN_DIARIO"
     if "CONFIGURAR" in r:              return "CONFIGURAR"
     if "RECORDATORIO" in r:            return "RECORDATORIO"
     if "PLANTA" in r:                  return "PLANTA"
@@ -1278,18 +1280,6 @@ async def handle_chat(phone: str, text: str) -> str:
     add_to_history(phone, "user", text)
     now = now_argentina()
 
-    # Detectar pedido explicito de resumen diario
-    _resumen_kw = ["resumen diario", "resumen de hoy", "dame el resumen", "manda el resumen",
-                   "manda resumen", "resumen matutino", "mandame el resumen"]
-    if any(k in text.lower() for k in _resumen_kw):
-        try:
-            _at = await get_gcal_access_token()
-            async with httpx.AsyncClient() as _http:
-                await send_daily_summary(_http, _at, now)
-            add_to_history(phone, "assistant", "[Resumen diario enviado]")
-            return None
-        except Exception as _e:
-            pass  # si falla, cae al chat normal
 
     # Armar contexto del usuario desde su config en Notion
     user_context_parts = []
@@ -4221,6 +4211,15 @@ async def process_single_item(phone: str, item: dict):
                 await send_message(phone, respuesta)
                 add_to_history(phone, "user", text)
                 add_to_history(phone, "assistant", respuesta)
+
+        elif tipo == "RESUMEN_DIARIO":
+            try:
+                _at = await get_gcal_access_token()
+                async with httpx.AsyncClient() as _http:
+                    await send_daily_summary(_http, _at, now_argentina())
+                add_to_history(phone, "assistant", "[Resumen diario enviado]")
+            except Exception as _e:
+                await send_message(phone, f"No pude generar el resumen: {str(_e)[:100]}")
 
         elif tipo == "CONFIGURAR":
             respuesta = await handle_chat(phone, text)
