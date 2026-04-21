@@ -414,7 +414,7 @@ async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=N
     cards_ctx = ("\nMedios de pago del usuario:\n" + "\n".join(pm_ctx_parts) + "\n") if pm_ctx_parts else ""
     system = f"""Sos Knot, asistente personal por WhatsApp. Hablas en espanol rioplatense, natural y conciso.
 Hoy: {hoy_str(now)}. Calendario: {semana_str(now)}.
-Tasa dolar blue
+Tasa dolar blue: ${exchange_rate:,.0f}/USD
 {profile_gastos_ctx}{providers_ctx}{cards_ctx}
 Tu tarea: registrar gastos e ingresos del usuario.
 - Si el mensaje tiene descripcion Y monto -> usa la tool registrar_gasto directamente.
@@ -437,16 +437,17 @@ Emoji: elegi el mas especifico segun el contexto real."""
         tools=tools
     )
 
+    _hist_text = text or "(imagen)"
     if response.stop_reason == "end_turn":
         reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "Error procesando").strip()
-        add_to_history(phone, "user", text)
+        add_to_history(phone, "user", _hist_text)
         add_to_history(phone, "assistant", reply)
         return reply
 
     tool_blocks = [b for b in response.content if b.type == "tool_use"]
     if not tool_blocks:
         reply = next((b.text for b in response.content if hasattr(b, "text") and b.text), "Error procesando").strip()
-        add_to_history(phone, "user", text)
+        add_to_history(phone, "user", _hist_text)
         add_to_history(phone, "assistant", reply)
         return reply
 
@@ -577,7 +578,7 @@ Emoji: elegi el mas especifico segun el contexto real."""
                     pending_state[phone] = {"type": "unknown_card_register", "last4": last4}
                     reply += f"\n\n💳 Vi una tarjeta terminada en *{last4}* que no tengo registrada. ¿De qué banco es y es débito o crédito?"
 
-    add_to_history(phone, "user", text)
+    add_to_history(phone, "user", _hist_text)
     add_to_history(phone, "assistant", reply)
     return reply
 
