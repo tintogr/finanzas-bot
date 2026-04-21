@@ -674,6 +674,7 @@ Mensaje: {text}
 Responde:
 {{"search_term": "nombre del gasto o null si no se menciona uno concreto",
   "all_matching": true si hay que corregir TODOS los que coinciden (ej: 'los 3 de anthropic', 'todos los de hoy'), false si es uno solo,
+  "date_filter": "YYYY-MM-DD" si el usuario menciona 'hoy', 'ayer', una fecha concreta, null si no especifica fecha,
   "new_value_ars": nuevo monto en ARS o null,
   "new_categoria": ["categoria"] o null,
   "new_name": "nuevo nombre" o null,
@@ -686,6 +687,7 @@ Responde:
 
     search_term = intent.get("search_term")
     all_matching = intent.get("all_matching", False)
+    date_filter = intent.get("date_filter")
     page_id_direct = None
 
     if not search_term and phone and phone in last_touched:
@@ -711,7 +713,15 @@ Responde:
         entries_to_update = [type("E", (), {"id": page_id_direct, "name": search_term, "value_ars": 0})()]
     else:
         limit = 20 if all_matching else 1
-        results = await _ds.query_expenses(QueryFilter(name_contains=search_term, limit=limit))
+        qfilter = QueryFilter(name_contains=search_term, limit=limit)
+        if date_filter:
+            from datetime import date as _date
+            try:
+                d = _date.fromisoformat(date_filter)
+                qfilter.date_range = DateRange(start=d, end=d)
+            except Exception:
+                pass
+        results = await _ds.query_expenses(qfilter)
         if not results:
             return False, f"No encontre ningun gasto llamado _{search_term}_"
         entries_to_update = results
@@ -740,8 +750,12 @@ Responde:
     if intent.get("new_notes") is not None:
         changes.append(f"Nota -> _{intent['new_notes']}_")
 
-    label = f"{updated} entradas" if updated > 1 else f"*{entries_to_update[0].name}*"
-    return True, f"{label} corregido{'s' if updated > 1 else ''}\n" + "\n".join(changes)
+    names = list({e.name for e in entries_to_update[:updated]})
+    if updated > 1:
+        label = f"*{updated}* entradas de _{names[0] if len(names)==1 else search_term}_"
+    else:
+        label = f"*{entries_to_update[0].name}*"
+    return True, f"✅ {label} corregida{'s' if updated > 1 else ''}\n" + "\n".join(changes)
 
 async def eliminar_gasto(text: str, phone: str = None) -> tuple[bool, str]:
     response = await claude_create(
