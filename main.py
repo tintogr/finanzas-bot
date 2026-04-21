@@ -1613,7 +1613,8 @@ Si el usuario dice que hiciste algo o que Knot hizo algo, NO lo niegues. Consult
 Si algo no esta en tus tools directas pero es una capacidad de Matrics, decile que SI puede hacerlo y guialo.
 CRITICO: si guardar_lugar_conocido devuelve error o dice "NO fue guardado", informale al usuario que el lugar NO quedo guardado y sugeríle compartir la ubicacion por WhatsApp. NUNCA confirmes que se guardo algo cuando la tool fallo."""
 
-    messages = history + [{"role": "user", "content": text}]
+    history_clean = [h for h in history if h.get("content")]
+    messages = history_clean + [{"role": "user", "content": text}]
 
     try:
         response = await claude_create(
@@ -4172,6 +4173,9 @@ async def process_single_item(phone: str, item: dict):
     image_b64 = item.get("image_b64")
     image_type = item.get("image_type")
     extra_images = item.get("extra_images", [])
+
+    if not text and not image_b64:
+        return
 
     _done = [False]
     indicator_task = asyncio.create_task(_delayed_indicator(phone, _done))

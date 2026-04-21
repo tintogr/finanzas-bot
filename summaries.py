@@ -370,6 +370,32 @@ async def send_daily_summary(http, access_token: str, now: datetime):
                     lines.append(f"- {start['dateTime'][11:16]} -- {e.get('summary', 'Evento')}{loc_str}")
                 else:
                     lines.append(f"- {e.get('summary', 'Evento')} (todo el dia){loc_str}")
+        # Mostrar también eventos de mañana si hay pocos hoy
+        if len(events) <= 2:
+            try:
+                manana = now + timedelta(days=1)
+                async with httpx.AsyncClient(timeout=8) as _cal2:
+                    r2 = await _cal2.get(
+                        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                        headers={"Authorization": f"Bearer {access_token}"},
+                        params={
+                            "timeMin": manana.strftime("%Y-%m-%dT00:00:00-03:00"),
+                            "timeMax": manana.strftime("%Y-%m-%dT23:59:59-03:00"),
+                            "singleEvents": "true", "orderBy": "startTime", "maxResults": "5"
+                        }
+                    )
+                if r2.status_code == 200:
+                    ev_man = [e for e in r2.json().get("items", []) if "[TEMP]" not in (e.get("description") or "")]
+                    if ev_man:
+                        lines.append(f"*Mañana:*")
+                        for e in ev_man[:3]:
+                            s = e.get("start", {})
+                            if "dateTime" in s:
+                                lines.append(f"- {s['dateTime'][11:16]} -- {e.get('summary', 'Evento')}")
+                            else:
+                                lines.append(f"- {e.get('summary', 'Evento')} (todo el día)")
+            except Exception:
+                pass
 
     try:
         gmail_summary = await get_gmail_summary()
@@ -413,20 +439,26 @@ async def send_daily_summary(http, access_token: str, now: datetime):
                     lines.append(f"_⚠️ {provider}: factura ${amount:,.0f} pero último pago registrado ${pago_dudoso.value_ars:,.0f} — revisá si coincide._")
 
         impagas = await _ds.get_impaga_facturas()
-        if impagas:
-            lines.append("")
-            lines.append("*Facturas pendientes:*")
-            for imp in impagas:
+        impaga_lines = []
+        for imp in (impagas or []):
+            try:
                 monto = f"${imp.value_ars:,.0f}" if imp.value_ars else ""
                 if imp.date:
-                    dias = (now.date() - imp.date).days
-                    if dias > 30:
-                        dias_str = f" ⚠️ _({dias} días pendiente)_"
-                    else:
-                        dias_str = f" _({dias} días pendiente)_"
+                    from datetime import date as _date
+                    imp_date = imp.date if isinstance(imp.date, _date) else _date.fromisoformat(str(imp.date)[:10])
+                    dias = (now.date() - imp_date).days
+                    dias_str = f" ⚠️ _({dias}d)_" if dias > 30 else f" _({dias}d)_"
                 else:
                     dias_str = ""
-                lines.append(f"- {imp.name} {monto}{dias_str}".strip())
+                line = f"- {imp.name} {monto}{dias_str}".strip()
+                if line and line != "-":
+                    impaga_lines.append(line)
+            except Exception:
+                pass
+        if impaga_lines:
+            lines.append("")
+            lines.append("*Facturas pendientes:*")
+            lines.extend(impaga_lines)
         else:
             lines.append("")
             lines.append("✅ Facturas al día")
