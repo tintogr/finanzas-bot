@@ -1085,11 +1085,13 @@ class NotionDataStore:
     ) -> tuple[bool, str]:
         """Create an Impaga finance entry. Returns (success, page_id). Deduplicates by provider+period."""
         import re
-        existing = await self.get_impaga_facturas(provider=provider)
         new_digits = set(re.findall(r"\d+", period or ""))
-        for e in existing:
-            if new_digits and new_digits & set(re.findall(r"\d+", e.name)):
-                return False, "duplicate"
+        # Check both impaga AND pagada records — avoid recreating an already-paid invoice
+        for existing in [await self.get_impaga_facturas(provider=provider),
+                         await self.get_finance_history_by_provider(provider, limit=5)]:
+            for e in existing:
+                if new_digits and new_digits & set(re.findall(r"\d+", e.name)):
+                    return False, "duplicate"
         from datetime import timezone
         now = datetime.now(timezone.utc) - timedelta(hours=3)
         entry = await self.create_expense({

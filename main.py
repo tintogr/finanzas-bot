@@ -1017,8 +1017,8 @@ EDITAR_REUNION: editar notas o datos de una reunion ya registrada.
 ELIMINAR_REUNION: eliminar una reunion de Notion.
 SALUD: registrar o consultar informacion medica. Analisis, consultas, diagnosticos, medicaciones. También editar o eliminar registros médicos existentes.
 ACTIVIDAD_FISICA: registrar, consultar, editar o eliminar actividad física. "corri 5km", "jugue al futbol", "fui al gym", "cuantos km corri este mes", screenshot de Adidas/Strava/Nike. NUNCA para eventos de calendario relacionados al deporte — esos son EVENTO.
-CONFIGURAR: cambiar configuracion de Knot. Solo cuando el usuario quiere CAMBIAR algo. Nunca cuando pregunta o se queja.
-RESUMEN_DIARIO: el usuario pide RECIBIR el resumen del dia ahora mismo. Solo cuando usa verbos de accion directa: "manda el resumen", "pasame el resumen diario", "dame el resumen", "enviame el buenos dias". NUNCA si pregunta sobre configuracion ("a que hora esta", "cuando llega", "que horario tiene") → eso es CHAT. NUNCA si menciona una hora futura como objetivo → verificar si es RECORDATORIO o CONFIGURAR.
+CONFIGURAR: cambiar configuracion de Knot. Solo cuando el usuario quiere CAMBIAR algo. Incluye cambiar el horario del resumen diario: "pasame el resumen a las 8", "dime el resumen a las 9", "manda el buenos dias a las 7.30" — cualquier pedido de resumen que incluya una hora especifica implica CAMBIAR el horario. Nunca cuando pregunta o se queja.
+RESUMEN_DIARIO: el usuario pide RECIBIR el resumen ahora, sin especificar un horario nuevo. "manda el resumen", "pasame el resumen diario", "dame el resumen ya", "enviame el buenos dias". NUNCA si incluye una hora especifica ("a las X") — eso es CONFIGURAR. NUNCA si pregunta sobre la configuracion → eso es CHAT.
 CHAT: cualquier pregunta, consulta o conversacion. Si tiene "?" o pide informacion -> CHAT.
 
 REGLA: si el mensaje PREGUNTA algo -> siempre CHAT, nunca GASTO.
