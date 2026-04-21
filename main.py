@@ -3599,6 +3599,20 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
             await send_message(phone, "Quedo como estaba.")
         return True
 
+    if state_type == "geo_reminder_radius_confirm":
+        page_id = state.get("page_id")
+        name = state.get("name", "Recordatorio")
+        del pending_state[phone]
+        radius_map = {"radius_15": 15, "radius_50": 50, "radius_150": 150}
+        new_radius = radius_map.get(text.strip())
+        if new_radius and page_id:
+            await _ds.update_geo_reminder(page_id, {"radius": new_radius})
+            for r in geo_reminders_cache:
+                if r.get("page_id") == page_id:
+                    r["radius"] = new_radius
+            await send_message(phone, f"✅ Radio actualizado a *{new_radius}m*.")
+        return True
+
     if state_type == "geo_reminder_fired":
         page_id = state.get("page_id")
         name = state.get("name", "Recordatorio")
@@ -4056,8 +4070,8 @@ Responde SOLO JSON valido sin markdown:
   "type": "place" o "shop",
   "shop_name": "nombre del comercio si es tipo shop, null si no",
   "address": "direccion si la menciona, null si no",
-  "recurrent": true si es algo que se repite cada vez que pasa, false si es una vez,
-  "radius": radio en metros si lo menciona (ej: "a menos de 500m" -> 500, "cuando este muy cerca" -> 150, "en la zona" -> 800). Si no menciona distancia usar 300,
+  "recurrent": SOLO true si el usuario explicitamente pide que se repita siempre ("cada vez que pase", "siempre que este cerca", "recordame siempre"). En todos los demas casos false,
+  "radius": radio en metros si lo menciona (ej: "a menos de 500m" -> 500, "cuando este muy cerca" -> 30, "en la zona" -> 300). Si no menciona distancia usar null,
   "needs_location": true si necesitas que el usuario comparta la ubicacion del lugar}}""",
         messages=[{"role": "user", "content": text}]
     )
@@ -4073,7 +4087,11 @@ Responde SOLO JSON valido sin markdown:
     recurrent = data.get("recurrent", False)
     needs_location = data.get("needs_location", False)
     address = data.get("address")
-    radius = int(data.get("radius") or 300)
+    radius_raw = data.get("radius")
+    radius = int(radius_raw) if radius_raw is not None else None
+    user_specified_radius = radius is not None
+    if radius is None:
+        radius = 150
 
     # Detectar link de Google Maps en el texto
     import re
@@ -4106,7 +4124,7 @@ Responde SOLO JSON valido sin markdown:
 
     # Si es tipo shop, crear directamente
     if rtype == "shop" and shop_name:
-        ok, _ = await create_geo_reminder(
+        ok, page_id = await create_geo_reminder(
             description=description,
             rtype="shop",
             shop_name=shop_name,
@@ -4115,7 +4133,21 @@ Responde SOLO JSON valido sin markdown:
         )
         if ok:
             freq = "Cada vez que" if recurrent else "La proxima vez que"
-            return f"📍 *Geo-reminder guardado*\n_{description}_\n{freq} estes cerca de *{shop_name}* (radio: {radius}m), te aviso."
+            confirm_text = f"📍 *Geo-reminder guardado*\n_{description}_\n{freq} estes a menos de {radius}m de *{shop_name}*, te aviso."
+            if not user_specified_radius and page_id:
+                await send_message(phone, confirm_text)
+                pending_state[phone] = {"type": "geo_reminder_radius_confirm", "page_id": page_id, "name": description}
+                await send_interactive_buttons(
+                    phone,
+                    "¿A qué distancia querés que te avise?",
+                    [
+                        {"id": "radius_15", "title": "15m (en la puerta)"},
+                        {"id": "radius_50", "title": "50m"},
+                        {"id": "radius_150", "title": "150m (zona)"},
+                    ]
+                )
+                return ""
+            return confirm_text
         return "No pude guardar el geo-reminder."
 
     # Si tiene direccion, geocodificar
@@ -4264,7 +4296,8 @@ async def process_single_item(phone: str, item: dict):
 
         elif tipo == "GEO_REMINDER":
             respuesta = await handle_geo_reminder(phone, text)
-            await send_message(phone, respuesta)
+            if respuesta:
+                await send_message(phone, respuesta)
 
         elif tipo == "RECORDATORIO":
             parsed = await parse_recordatorio(text)
@@ -4863,7 +4896,7 @@ async def load_geo_reminders():
         print(f"[GeoReminders] Error cargando: {e}")
 
 async def create_geo_reminder(description: str, rtype: str, lat: float = None, lon: float = None,
-                               shop_name: str = None, radius: int = 300, recurrent: bool = False) -> tuple[bool, str]:
+                               shop_name: str = None, radius: int = 150, recurrent: bool = False) -> tuple[bool, str]:
     """Crea un geo-reminder en Notion y lo agrega al cache en memoria."""
     try:
         item = await _ds.create_geo_reminder({
@@ -4896,14 +4929,14 @@ async def check_geo_reminders(lat: float, lon: float) -> list[dict]:
         if reminder["type"] == "place":
             if reminder.get("lat") and reminder.get("lon"):
                 dist_m = haversine_km(lat, lon, reminder["lat"], reminder["lon"]) * 1000
-                if dist_m <= reminder.get("radius", 300):
+                if dist_m <= reminder.get("radius", 150):
                     triggered.append(reminder)
         elif reminder["type"] == "shop":
             shop_name = reminder.get("shop_name", "")
             if shop_name:
-                reminder_radius = reminder.get("radius", 300)
-                shops = await search_nearby_shops(lat, lon, radius=reminder_radius, name_filter=shop_name)
-                close_shops = [s for s in shops if s["distance_m"] <= reminder_radius]
+                trigger_radius = reminder.get("radius", 150)
+                shops = await search_nearby_shops(lat, lon, radius=500, name_filter=shop_name)
+                close_shops = [s for s in shops if s["distance_m"] <= trigger_radius]
                 if close_shops:
                     reminder["_matched_shops"] = close_shops[:3]
                     triggered.append(reminder)
@@ -4914,7 +4947,7 @@ _last_proximity_check: dict[str, datetime] = {}
 _last_proximity_store: dict[str, str] = {}
 _last_location_save: datetime | None = None
 _geo_reminder_cooldowns: dict[str, datetime] = {}
-GEO_REMINDER_COOLDOWN_SECONDS = 600
+GEO_REMINDER_COOLDOWN_SECONDS = 4 * 3600  # 4 horas entre disparos del mismo geo-reminder
 _geo_reminders_in_range: set[str] = set()
 
 async def save_location_to_notion(lat: float, lon: float, loc_name: str = None):
@@ -4967,6 +5000,11 @@ async def receive_location(request: Request):
 
             for reminder in triggered:
                 r_id = reminder["page_id"]
+                # No re-disparar si el cooldown no expiró
+                last_fired = _geo_reminder_cooldowns.get(r_id)
+                if last_fired and (now - last_fired).total_seconds() < GEO_REMINDER_COOLDOWN_SECONDS:
+                    _geo_reminders_in_range.add(r_id)
+                    continue
                 # Solo avisar si acaba de entrar al radio (no estaba antes)
                 if r_id in _geo_reminders_in_range:
                     continue
