@@ -10,6 +10,18 @@ from math import radians, sin, cos, sqrt, atan2
 from fastapi import FastAPI, Request, BackgroundTasks
 from anthropic import Anthropic
 
+from state import (
+    _ds, QueryFilter, DateRange,
+    WA_TOKEN, WA_PHONE_ID, WA_API, MY_NUMBER, DAILY_SUMMARY_HOUR,
+    USER_LAT, USER_LON,
+    NOTION_TOKEN, NOTION_DB_ID,
+    DIAS_SEMANA, INGRESO_EXACT, EGRESO_EXACT, MAX_HISTORY,
+    user_prefs, current_location, geo_reminders_cache,
+    last_event_touched, pending_state, message_buffer,
+    chat_history, _last_summary_sent,
+    now_argentina,
+)
+
 app = FastAPI()
 
 @app.on_event("startup")
@@ -39,53 +51,6 @@ async def claude_create(**kwargs):
             raise
     raise last_err
 
-NOTION_TOKEN   = os.environ["NOTION_TOKEN"]
-NOTION_DB_ID   = os.environ["NOTION_DATABASE_ID"]
-PLANTS_DB_ID   = os.environ.get("NOTION_PLANTS_DB_ID", "1ba00dbf2b074e358b296d1d944b914f")
-SHOPPING_DB_ID = os.environ.get("NOTION_SHOPPING_DB_ID", "cb85fdf75d684f61bafea20b5eeb653f")
-RECIPES_DB_ID  = os.environ.get("NOTION_RECIPES_DB_ID", "8fa008a7-0720-475a-9868-7c3ba077bc50")
-MEETINGS_DB_ID = os.environ.get("NOTION_MEETINGS_DB_ID", "4ad838f5-3c0e-4605-8859-18fe7b47ac09")
-TASKS_DB_ID         = os.environ.get("NOTION_TASKS_DB_ID", "90b44158-7916-4837-94de-129dde448fc4")
-GEO_REMINDERS_DB_ID = os.environ.get("NOTION_GEO_REMINDERS_DB_ID", "5fe7a531722843a5af93de1c54a14e02")
-CONFIG_DB_ID   = os.environ.get("NOTION_CONFIG_DB_ID", "2f81017d-a20c-426a-aada-88fcf0743338")
-PROJECTS_DB_ID       = os.environ.get("NOTION_PROJECTS_DB_ID",       "0924aff739194c5b8438d03ed82e9e21")
-HEALTH_RECORDS_DB_ID = os.environ.get("NOTION_HEALTH_RECORDS_DB_ID", "5f9cde7223f346e48a22f54dbc0836f6")
-MEDICATIONS_DB_ID    = os.environ.get("NOTION_MEDICATIONS_DB_ID",    "d16f6826e18d4e4c9e6768a9ebd07507")
-FITNESS_DB_ID        = os.environ.get("NOTION_FITNESS_DB_ID",        "c6eb4ddbfe0245bdb5bfcb2b5e33a6e5")
-# ── DataStore (Fase 1 refactor) ───────────────────────────────────────────────
-from notion_datastore import NotionDataStore, QueryFilter, DateRange
-
-_ds = NotionDataStore(
-    token=NOTION_TOKEN,
-    db_ids={
-        "finances":       NOTION_DB_ID,
-        "shopping":       SHOPPING_DB_ID,
-        "recipes":        RECIPES_DB_ID,
-        "plants":         PLANTS_DB_ID,
-        "meetings":       MEETINGS_DB_ID,
-        "tasks":          TASKS_DB_ID,
-        "config":         CONFIG_DB_ID,
-        "geo_reminders":  GEO_REMINDERS_DB_ID,
-        "projects":       PROJECTS_DB_ID,
-        "health_records": HEALTH_RECORDS_DB_ID,
-        "medications":    MEDICATIONS_DB_ID,
-        "fitness":        FITNESS_DB_ID,
-    },
-)
-WA_TOKEN       = os.environ["WHATSAPP_TOKEN"]
-WA_PHONE_ID    = os.environ["WHATSAPP_PHONE_ID"]
-WA_API         = f"https://graph.facebook.com/v22.0/{WA_PHONE_ID}/messages"
-MY_NUMBER      = os.environ.get("MY_WA_NUMBER", "54298154894334")
-DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "8"))
-
-USER_LAT = os.environ.get("USER_LAT")
-USER_LON = os.environ.get("USER_LON")
-
-def now_argentina() -> datetime:
-    return datetime.now(timezone.utc) - timedelta(hours=3)
-
-DIAS_SEMANA = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
-
 def hoy_str(now: datetime = None) -> str:
     """Retorna 'martes 07/04/2026 08:33' en espanol."""
     if not now:
@@ -109,9 +74,6 @@ def semana_str(now: datetime = None) -> str:
     return " | ".join(lines)
 
 # ── Normalizacion de In-Out ───────────────────────────────────────────────────
-INGRESO_EXACT = "\u2192INGRESO\u2190"
-EGRESO_EXACT  = "\u2190 EGRESO \u2192"
-
 def normalize_in_out(raw: str) -> str:
     """Fuerza el valor exacto de In-Out para que Notion no rompa formulas."""
     if not raw:
@@ -339,62 +301,14 @@ async def check_shopping_proximity():
 # ── Memoria de categorias ──────────────────────────────────────────────────────
 category_overrides: dict[str, list[str]] = {}
 
-# ── Preferencias del usuario ──────────────────────────────────────────────────
-user_prefs: dict = {
-    "daily_summary_hour": None,
-    "daily_summary_minute": None,
-    "greeting_name": None,
-    "activities": {},  # {"funcional": {"days": ["lunes","martes"], "time": "17:00"}}
-    "resumen_extras": [],
-    "resumen_nocturno_hour": 22,
-    "resumen_nocturno_enabled": True,
-    "resumen_semanal_enabled": True,
-    "resumen_semanal_hour": 21,
-    "news_topics": [],
-    "service_providers": {},
-    "known_places": [],
-    "_config_page_id": None,
-    "domain_profiles": {
-        "actividad_fisica": "",
-        "dieta": "",
-        "supermercado": "",
-        "gastos": "",
-        "salud": "",       # Finances Salud/Salud Mental + calendar citas médicas
-        "social": "",      # Meetings DB + Finances Salida/Birra
-        "hogar": "",       # Finances Depto + Plants DB
-        "productividad": "",  # Tasks + Projects DBs
-    },
-    "purchase_counts": {},  # {"leche con lactosa": 4, ...} — cuantas veces se compro cada item
-}
-
-# ── Ubicacion en tiempo real ──────────────────────────────────────────────────
-current_location: dict = {
-    "lat": float(USER_LAT) if USER_LAT else None,
-    "lon": float(USER_LON) if USER_LON else None,
-    "updated_at": None,
-    "velocity": 0,
-    "source": "env" if USER_LAT else "unknown",
-    "location_name": None,
-}
-
-# ── Geo-reminders en memoria (se cargan de Notion al arrancar) ────────────────
-geo_reminders_cache: list[dict] = []
-
 # ── Ultima entrada tocada (gastos) ────────────────────────────────────────────
 last_touched: dict[str, dict] = {}
-
-# ── Ultimo evento tocado (para ediciones contextuales) ────────────────────────
-last_event_touched: dict[str, dict] = {}
-
-# ── Estado pendiente (follow-ups) ────────────────────────────────────────────
-pending_state: dict[str, dict] = {}
 
 # ── Deduplicacion de mensajes ─────────────────────────────────────────────────
 processed_message_ids: set[str] = set()
 MAX_PROCESSED_IDS = 500
 
 # ── Buffer de mensajes (agrupa mensajes relacionados en ventana de tiempo) ────
-message_buffer: dict[str, list] = {}
 buffer_timers: dict[str, asyncio.Task] = {}
 BUFFER_WINDOW_SECS = 4.0
 PROCESSING_INDICATOR_DELAY = 1.0
@@ -1444,9 +1358,6 @@ def fix_recurring_event_date(event_date_str: str, rrule: str) -> str:
         pass
     return event_date_str
 # ── HISTORIAL DE CONVERSACION ──────────────────────────────────────────────────
-chat_history: dict[str, list] = {}
-MAX_HISTORY = 10
-
 def get_history(phone: str) -> list:
     return chat_history.get(phone, [])
 
@@ -6119,7 +6030,6 @@ async def check_geo_reminders(lat: float, lon: float) -> list[dict]:
 _last_proximity_check: dict[str, datetime] = {}
 _last_proximity_store: dict[str, str] = {}
 _last_location_save: datetime | None = None
-_last_summary_sent: dict[str, datetime | None] = {"daily": None, "nocturno": None}
 _geo_reminder_cooldowns: dict[str, datetime] = {}
 GEO_REMINDER_COOLDOWN_SECONDS = 600
 _geo_reminders_in_range: set[str] = set()
@@ -6303,8 +6213,6 @@ async def health_check():
                          "known_place": (is_at_known_place() or {}).get("name")}}
 
 # ── MODULO SHOPPING ────────────────────────────────────────────────────────────
-def notion_headers():
-    return {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
 
 SHOPPING_CATEGORIES = ["Frutas y verduras", "Enlatado", "Infusion", "Lacteo", "Especias",
                        "Limpieza", "Panificado", "Herramienta", "Construccion", "Higiene",
