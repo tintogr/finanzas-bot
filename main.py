@@ -493,7 +493,7 @@ Emoji: elegi el mas especifico segun el contexto real."""
     ]
     final_response = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=400,
-        system=system,
+        system="Confirmá el registro al usuario de forma breve y natural en español rioplatense. Si hubo error mencionalo. No intentes registrar de nuevo ni corrijas el payment_method.",
         messages=messages,
         tools=tools,
         tool_choice={"type": "none"},
