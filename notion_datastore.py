@@ -152,10 +152,15 @@ except ImportError:
         daily_summary_minute: int = None
         resumen_nocturno_enabled: bool = True
         resumen_nocturno_hour: int = 22
+        resumen_semanal_enabled: bool = True
+        resumen_semanal_hour: int = 21
         resumen_extras: list = None
         news_topics: list = None
         service_providers: dict = None
         known_places: list = None
+        activities: dict = None
+        domain_profiles: dict = None
+        purchase_counts: dict = None
         saved_lat: float = None
         saved_lon: float = None
         saved_city: str = None
@@ -1648,8 +1653,37 @@ class NotionDataStore:
         except Exception:
             known = []
 
+        activities_raw = _get_text(props, "Activities")
+        try:
+            activities = json.loads(activities_raw) if activities_raw else {}
+        except Exception:
+            activities = {}
+
+        counts_raw = _get_text(props, "Purchase Counts")
+        try:
+            purchase_counts = json.loads(counts_raw) if counts_raw else {}
+        except Exception:
+            purchase_counts = {}
+
+        domain_profile_fields = [
+            ("actividad_fisica", "Profile Actividad Fisica"),
+            ("dieta",            "Profile Dieta"),
+            ("supermercado",     "Profile Supermercado"),
+            ("gastos",           "Profile Gastos"),
+            ("salud",            "Profile Salud"),
+            ("social",           "Profile Social"),
+            ("hogar",            "Profile Hogar"),
+            ("productividad",    "Profile Productividad"),
+        ]
+        domain_profiles = {}
+        for key, field in domain_profile_fields:
+            val = _get_text(props, field)
+            if val:
+                domain_profiles[key] = val
+
         _hour = _get_number(props, "Resumen Hour")
         _min  = _get_number(props, "Resumen Minute")
+        _sem_h = _get_number(props, "Resumen Semanal Hour")
         config = UserConfig(
             phone=phone or _get_text(props, "WA Number"),
             greeting_name=_get_text(props, "Greeting Name") or None,
@@ -1657,10 +1691,15 @@ class NotionDataStore:
             daily_summary_minute=int(_min) if _min is not None else None,
             resumen_nocturno_enabled=_get_checkbox(props, "Resumen Nocturno Enabled"),
             resumen_nocturno_hour=int(_get_number(props, "Resumen Nocturno Hour") or 22),
+            resumen_semanal_enabled=_get_checkbox(props, "Resumen Semanal Enabled") if props.get("Resumen Semanal Enabled") else True,
+            resumen_semanal_hour=int(_sem_h) if _sem_h is not None else 21,
             resumen_extras=extras,
             news_topics=topics,
             service_providers=providers,
             known_places=known,
+            activities=activities,
+            domain_profiles=domain_profiles,
+            purchase_counts=purchase_counts,
             saved_lat=_get_number(props, "Latitude"),
             saved_lon=_get_number(props, "Longitude"),
             saved_city=_get_text(props, "City") or None,
@@ -1675,15 +1714,29 @@ class NotionDataStore:
         extras_str = " | ".join(config.resumen_extras or [])
         topics_str = ", ".join(config.news_topics or [])
         props = {
-            "Greeting Name": {"rich_text": [{"text": {"content": config.greeting_name or "Buenos dias"}}]},
-            "Resumen Extras": {"rich_text": [{"text": {"content": extras_str}}]},
-            "News Topics": {"rich_text": [{"text": {"content": topics_str}}]},
+            "Greeting Name":     {"rich_text": [{"text": {"content": config.greeting_name or "Buenos dias"}}]},
+            "Resumen Extras":    {"rich_text": [{"text": {"content": extras_str}}]},
+            "News Topics":       {"rich_text": [{"text": {"content": topics_str}}]},
             "Service Providers": {"rich_text": [{"text": {"content": json.dumps(config.service_providers or {}, ensure_ascii=False)}}]},
-            "Known Places": {"rich_text": [{"text": {"content": json.dumps(config.known_places or [], ensure_ascii=False)}}]},
+            "Known Places":      {"rich_text": [{"text": {"content": json.dumps(config.known_places or [], ensure_ascii=False)}}]},
+            "Activities":        {"rich_text": [{"text": {"content": json.dumps(config.activities or {}, ensure_ascii=False)}}]},
+            "Purchase Counts":   {"rich_text": [{"text": {"content": json.dumps(config.purchase_counts or {}, ensure_ascii=False)[:2000]}}]},
             "Resumen Nocturno Enabled": {"checkbox": config.resumen_nocturno_enabled},
         }
+        for key, field in [
+            ("actividad_fisica", "Profile Actividad Fisica"),
+            ("dieta",            "Profile Dieta"),
+            ("supermercado",     "Profile Supermercado"),
+            ("gastos",           "Profile Gastos"),
+            ("salud",            "Profile Salud"),
+            ("social",           "Profile Social"),
+            ("hogar",            "Profile Hogar"),
+            ("productividad",    "Profile Productividad"),
+        ]:
+            val = (config.domain_profiles or {}).get(key, "")
+            props[field] = {"rich_text": [{"text": {"content": val[:2000]}}]}
         if config.daily_summary_hour is not None:
-            props["Resumen Hour"] = {"number": config.daily_summary_hour}
+            props["Resumen Hour"]   = {"number": config.daily_summary_hour}
             props["Resumen Minute"] = {"number": config.daily_summary_minute or 0}
         if config.resumen_nocturno_hour is not None:
             props["Resumen Nocturno Hour"] = {"number": config.resumen_nocturno_hour}

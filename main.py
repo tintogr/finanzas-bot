@@ -3405,97 +3405,42 @@ EVENTOS RECURRENTES:
 # ── Config persistente en Notion ───────────────────────────────────────────────
 async def load_user_config(wa_number: str):
     try:
-        async with httpx.AsyncClient() as http:
-            r = await http.post(
-                f"https://api.notion.com/v1/databases/{CONFIG_DB_ID.replace('-','')}/query",
-                headers=notion_headers(),
-                json={"filter": {"property": "WA Number", "rich_text": {"equals": wa_number}}, "page_size": 1}
-            )
-            if r.status_code != 200 or not r.json().get("results"):
-                return
-            page = r.json()["results"][0]
-            props = page["properties"]
-            def get_num(p): return (props.get(p, {}).get("number") or None)
-            def get_txt(p):
-                rt = props.get(p, {}).get("rich_text", [])
-                return rt[0]["plain_text"] if rt else None
-            def get_chk(p): return props.get(p, {}).get("checkbox", False)
-
-            if get_num("Resumen Hour") is not None:
-                user_prefs["daily_summary_hour"]   = int(get_num("Resumen Hour"))
-            if get_num("Resumen Minute") is not None:
-                user_prefs["daily_summary_minute"] = int(get_num("Resumen Minute"))
-            if get_num("Resumen Nocturno Hour") is not None:
-                user_prefs["resumen_nocturno_hour"] = int(get_num("Resumen Nocturno Hour"))
-            user_prefs["resumen_nocturno_enabled"] = get_chk("Resumen Nocturno Enabled")
-            extras = get_txt("Resumen Extras")
-            if extras:
-                user_prefs["resumen_extras"] = [e.strip() for e in extras.split("|") if e.strip()]
-            greeting = get_txt("Greeting Name")
-            if greeting:
-                user_prefs["greeting_name"] = greeting
-            topics = get_txt("News Topics")
-            if topics:
-                user_prefs["news_topics"] = [t.strip() for t in topics.split(",") if t.strip()]
-            providers = get_txt("Service Providers")
-            if providers:
-                try:
-                    user_prefs["service_providers"] = json.loads(providers)
-                except Exception:
-                    user_prefs["service_providers"] = {}
-            known = get_txt("Known Places")
-            if known:
-                try:
-                    user_prefs["known_places"] = json.loads(known)
-                except Exception:
-                    user_prefs["known_places"] = []
-            activities = get_txt("Activities")
-            if activities:
-                try:
-                    user_prefs["activities"] = json.loads(activities)
-                except Exception:
-                    user_prefs["activities"] = {}
-
-            for dom, field in [
-                ("actividad_fisica", "Profile Actividad Fisica"),
-                ("dieta",            "Profile Dieta"),
-                ("supermercado",     "Profile Supermercado"),
-                ("gastos",           "Profile Gastos"),
-                ("salud",            "Profile Salud"),
-                ("social",           "Profile Social"),
-                ("hogar",            "Profile Hogar"),
-                ("productividad",    "Profile Productividad"),
-            ]:
-                val = get_txt(field)
-                if val:
-                    user_prefs.setdefault("domain_profiles", {})[dom] = val
-
-            counts_raw = get_txt("Purchase Counts")
-            if counts_raw:
-                try:
-                    user_prefs["purchase_counts"] = json.loads(counts_raw)
-                except Exception:
-                    user_prefs["purchase_counts"] = {}
-
-            semanal_enabled = get_chk("Resumen Semanal Enabled")
-            if props.get("Resumen Semanal Enabled"):
-                user_prefs["resumen_semanal_enabled"] = semanal_enabled
-            if get_num("Resumen Semanal Hour") is not None:
-                user_prefs["resumen_semanal_hour"] = int(get_num("Resumen Semanal Hour"))
-
-            user_prefs["_config_page_id"] = page["id"]
-
-            # Restaurar ubicacion si hay coordenadas guardadas y OwnTracks no mando nada aun
-            saved_lat = get_num("Latitude")
-            saved_lon = get_num("Longitude")
-            saved_city = get_txt("City")
-            if saved_lat is not None and saved_lon is not None:
-                if current_location.get("source") in ("default", "env", "unknown"):
-                    current_location["lat"] = float(saved_lat)
-                    current_location["lon"] = float(saved_lon)
-                    current_location["source"] = "restored"
-                    if saved_city:
-                        current_location["location_name"] = saved_city
+        cfg, page_id = await _ds.load_config(wa_number)
+        if not page_id:
+            return
+        if cfg.daily_summary_hour is not None:
+            user_prefs["daily_summary_hour"]   = cfg.daily_summary_hour
+        if cfg.daily_summary_minute is not None:
+            user_prefs["daily_summary_minute"] = cfg.daily_summary_minute
+        user_prefs["resumen_nocturno_hour"]    = cfg.resumen_nocturno_hour
+        user_prefs["resumen_nocturno_enabled"] = cfg.resumen_nocturno_enabled
+        user_prefs["resumen_semanal_enabled"]  = cfg.resumen_semanal_enabled
+        user_prefs["resumen_semanal_hour"]     = cfg.resumen_semanal_hour
+        if cfg.greeting_name:
+            user_prefs["greeting_name"] = cfg.greeting_name
+        if cfg.resumen_extras:
+            user_prefs["resumen_extras"] = cfg.resumen_extras
+        if cfg.news_topics:
+            user_prefs["news_topics"] = cfg.news_topics
+        if cfg.service_providers:
+            user_prefs["service_providers"] = cfg.service_providers
+        if cfg.known_places:
+            user_prefs["known_places"] = cfg.known_places
+        if cfg.activities:
+            user_prefs["activities"] = cfg.activities
+        if cfg.purchase_counts:
+            user_prefs["purchase_counts"] = cfg.purchase_counts
+        if cfg.domain_profiles:
+            user_prefs.setdefault("domain_profiles", {}).update(cfg.domain_profiles)
+        user_prefs["_config_page_id"] = page_id
+        # Restaurar ubicacion si hay coordenadas guardadas y OwnTracks no mando nada aun
+        if cfg.saved_lat is not None and cfg.saved_lon is not None:
+            if current_location.get("source") in ("default", "env", "unknown"):
+                current_location["lat"] = float(cfg.saved_lat)
+                current_location["lon"] = float(cfg.saved_lon)
+                current_location["source"] = "restored"
+                if cfg.saved_city:
+                    current_location["location_name"] = cfg.saved_city
     except Exception:
         pass
     if "payment_methods" not in user_prefs:
@@ -3508,37 +3453,25 @@ async def save_user_config(wa_number: str):
         page_id = user_prefs.get("_config_page_id")
         if not page_id:
             return
-        extras_str = " | ".join(user_prefs.get("resumen_extras", []))
-        topics_str = ", ".join(user_prefs.get("news_topics", []))
-        props = {
-            "Greeting Name":     {"rich_text": [{"text": {"content": user_prefs.get("greeting_name") or "Buenos dias"}}]},
-            "Resumen Extras":    {"rich_text": [{"text": {"content": extras_str}}]},
-            "News Topics":       {"rich_text": [{"text": {"content": topics_str}}]},
-            "Service Providers": {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("service_providers", {}), ensure_ascii=False)}}]},
-            "Known Places":      {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("known_places", []), ensure_ascii=False)}}]},
-            "Activities":        {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("activities", {}), ensure_ascii=False)}}]},
-            "Profile Actividad Fisica": {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("actividad_fisica", "")[:2000]}}]},
-            "Profile Dieta":            {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("dieta", "")[:2000]}}]},
-            "Profile Supermercado":     {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("supermercado", "")[:2000]}}]},
-            "Profile Gastos":           {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("gastos", "")[:2000]}}]},
-            "Profile Salud":            {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("salud", "")[:2000]}}]},
-            "Profile Social":           {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("social", "")[:2000]}}]},
-            "Profile Hogar":            {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("hogar", "")[:2000]}}]},
-            "Profile Productividad":    {"rich_text": [{"text": {"content": user_prefs.get("domain_profiles", {}).get("productividad", "")[:2000]}}]},
-            "Purchase Counts":          {"rich_text": [{"text": {"content": json.dumps(user_prefs.get("purchase_counts", {}), ensure_ascii=False)[:2000]}}]},
-        }
-        if user_prefs.get("daily_summary_hour") is not None:
-            props["Resumen Hour"]   = {"number": user_prefs["daily_summary_hour"]}
-            props["Resumen Minute"] = {"number": user_prefs.get("daily_summary_minute", 0)}
-        if user_prefs.get("resumen_nocturno_hour") is not None:
-            props["Resumen Nocturno Hour"] = {"number": user_prefs["resumen_nocturno_hour"]}
-        props["Resumen Nocturno Enabled"] = {"checkbox": user_prefs.get("resumen_nocturno_enabled", True)}
-        async with httpx.AsyncClient() as http:
-            await http.patch(
-                f"https://api.notion.com/v1/pages/{page_id}",
-                headers=notion_headers(),
-                json={"properties": props}
-            )
+        from notion_datastore import UserConfig as _UserConfig
+        cfg = _UserConfig(
+            phone=wa_number,
+            greeting_name=user_prefs.get("greeting_name"),
+            daily_summary_hour=user_prefs.get("daily_summary_hour"),
+            daily_summary_minute=user_prefs.get("daily_summary_minute"),
+            resumen_nocturno_enabled=user_prefs.get("resumen_nocturno_enabled", True),
+            resumen_nocturno_hour=user_prefs.get("resumen_nocturno_hour", 22),
+            resumen_semanal_enabled=user_prefs.get("resumen_semanal_enabled", True),
+            resumen_semanal_hour=user_prefs.get("resumen_semanal_hour", 21),
+            resumen_extras=user_prefs.get("resumen_extras", []),
+            news_topics=user_prefs.get("news_topics", []),
+            service_providers=user_prefs.get("service_providers", {}),
+            known_places=user_prefs.get("known_places", []),
+            activities=user_prefs.get("activities", {}),
+            domain_profiles=user_prefs.get("domain_profiles", {}),
+            purchase_counts=user_prefs.get("purchase_counts", {}),
+        )
+        await _ds.save_config(page_id, cfg)
     except Exception:
         pass
 
