@@ -45,6 +45,9 @@ async def startup_event():
     await _ds.ensure_db_select_field("finances", "Estado", ["Impaga", "Pagada"])
     await _ds.ensure_db_text_field("config", "Last Summary Date")
     await _ds.ensure_db_text_field("config", "Cards")
+    await _ds.ensure_db_text_field("config", "Banks")
+    await _ds.ensure_db_text_field("config", "Payment Modalities")
+    await _ds.ensure_db_text_field("finances", "Payment Method")
     asyncio.create_task(_cron_loop())
 
 @app.on_event("shutdown")
@@ -391,19 +394,24 @@ async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=N
         prov_lines = [f"  - {k}: {v}" for k, v in providers.items()]
         providers_ctx = "\nProveedores de servicios configurados (usar para resolver nombres):\n" + "\n".join(prov_lines) + "\nSi el gasto menciona un proveedor conocido, usa el nombre canonico (ej: 'electricidad' → 'Electricidad - {nombre proveedor}').\n"
     cards = user_prefs.get("cards") or []
-    cards_ctx = ""
+    banks = user_prefs.get("banks") or []
+    modalities = user_prefs.get("payment_modalities") or []
+    pm_ctx_parts = []
+    if banks:
+        pm_ctx_parts.append(f"Bancos: {', '.join(banks)}")
+    if modalities:
+        pm_ctx_parts.append(f"Modalidades: {', '.join(modalities)}")
     if cards:
         card_lines = []
         for c in cards:
-            label = c.get("label", "")
+            label = c.get("label") or f"{c.get('bank','')} {c.get('type','')}".strip()
             last4 = c.get("last4", "")
             owner = c.get("owner", "")
-            owner_str = f" — de {owner}" if owner else ""
-            if last4:
-                card_lines.append(f"  - {label} (****{last4}){owner_str}")
-            else:
-                card_lines.append(f"  - {label}{owner_str}")
-        cards_ctx = "\nMedios de pago configurados:\n" + "\n".join(card_lines) + "\n"
+            owner_str = f" (de {owner})" if owner else ""
+            suffix = f" ****{last4}" if last4 else ""
+            card_lines.append(f"  - {label}{suffix}{owner_str}")
+        pm_ctx_parts.append("Tarjetas:\n" + "\n".join(card_lines))
+    cards_ctx = ("\nMedios de pago del usuario:\n" + "\n".join(pm_ctx_parts) + "\n") if pm_ctx_parts else ""
     system = f"""Sos Knot, asistente personal por WhatsApp. Hablas en espanol rioplatense, natural y conciso.
 Hoy: {hoy_str(now)}. Calendario: {semana_str(now)}.
 Tasa dolar blue
@@ -578,9 +586,7 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
     if not data.get("value_ars") or not data.get("in_out"):
         return False, "No se pudo interpretar"
     try:
-        notes = data.get("notas") or ""
-        if data.get("payment_method"):
-            notes = f"💳 {data['payment_method']}" + (f" — {notes}" if notes else "")
+        notes = data.get("notas") or None
         entry = await _ds.create_expense({
             "name":         data["name"],
             "in_out":       data["in_out"],
@@ -595,6 +601,7 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
             "consumo_kwh":  data.get("consumo_kwh"),
             "notes":        notes or None,
             "emoji":        data.get("emoji"),
+            "payment_method": data.get("payment_method") or None,
         })
         last_touched[MY_NUMBER] = {"page_id": entry.id, "name": data["name"]}
         return True, entry.id
@@ -3869,14 +3876,16 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
         response_ai = await claude_create(
             model="claude-haiku-4-5-20251001", max_tokens=100,
             system="Extrae banco y tipo de tarjeta. Responde SOLO JSON.",
-            messages=[{"role": "user", "content": f'Mensaje: "{text}". Ultimos 4 digitos: {last4}. Responde: {{"label": "Nombre del banco + Debito/Credito (ej: BBVA Debito)", "last4": "{last4}"}}'}]
+            messages=[{"role": "user", "content": f'Mensaje: "{text}". Ultimos 4 digitos: {last4}. Responde: {{"bank": "nombre del banco (ej: BBVA)", "type": "Debit o Credit", "last4": "{last4}"}}'}]
         )
         raw_ai = response_ai.content[0].text.strip().strip("`").lstrip("json").strip()
         try:
             card_data = json.loads(raw_ai)
-            label = card_data.get("label", "").strip()
-            if label:
-                pending_state[phone] = {"type": "unknown_card_owner", "last4": last4, "label": label}
+            bank = card_data.get("bank", "").strip()
+            ctype = card_data.get("type", "").strip()
+            if bank:
+                label = f"{bank} {ctype}".strip()
+                pending_state[phone] = {"type": "unknown_card_owner", "last4": last4, "bank": bank, "type": ctype, "label": label}
                 await send_message(phone, f"✅ *{label}* (****{last4}). ¿De quién es? (ej: _\"mía\"_, _\"Sofi\"_) o «no» para omitir.")
         except Exception:
             await send_message(phone, f"No pude interpretar. Podés agregarla con: _\"agregá [banco] [débito/crédito] terminada en {last4}\"_")
@@ -3884,6 +3893,8 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
 
     if state_type == "unknown_card_owner":
         last4 = state.get("last4", "")
+        bank = state.get("bank", "")
+        ctype = state.get("type", "")
         label = state.get("label", "")
         del pending_state[phone]
         skip_words = {"no", "n", "nope", "omitir", "skip"}
@@ -3891,10 +3902,16 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
         cards = user_prefs.get("cards") or []
         existing = next((c for c in cards if c.get("last4") == last4), None)
         if existing:
-            existing["label"] = label
+            existing["bank"] = bank
+            existing["type"] = ctype
             existing["owner"] = owner
         else:
-            cards.append({"label": label, "last4": last4, "owner": owner})
+            cards.append({"bank": bank, "type": ctype, "last4": last4, "owner": owner})
+        # Add bank to banks list if not there
+        banks_list = user_prefs.get("banks") or []
+        if bank and bank not in banks_list:
+            banks_list.append(bank)
+            user_prefs["banks"] = banks_list
         user_prefs["cards"] = cards
         await save_user_config(MY_NUMBER)
         owner_str = f" — de {owner}" if owner else ""

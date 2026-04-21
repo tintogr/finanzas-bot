@@ -165,7 +165,9 @@ except ImportError:
         saved_lon: float = None
         saved_city: str = None
         last_summary_date: str = None
-        cards: list = None
+        cards: list = None          # [{last4, bank, type, owner}]
+        banks: list = None          # ["BBVA", "Mercado Pago"]
+        payment_modalities: list = None  # ["Debit", "Credit", "Cash", "Transfer"]
 
 
 # ── Domain constants ───────────────────────────────────────────────────────────
@@ -441,6 +443,8 @@ class NotionDataStore:
             props["Estado"] = {"select": {"name": data["estado"]}}
         if data.get("medio_pago"):
             props["Method"] = {"select": {"name": data["medio_pago"]}}
+        if data.get("payment_method"):
+            props["Payment Method"] = {"rich_text": [{"text": {"content": data["payment_method"][:200]}}]}
 
         emoji = data.get("emoji") or "\U0001f4b8"
         page = await self._create_page("finances", props, emoji=emoji)
@@ -1099,17 +1103,27 @@ class NotionDataStore:
     ) -> tuple[bool, str]:
         """Create an Impaga finance entry. Returns (success, page_id). Deduplicates by provider+period."""
         import re
+        from datetime import date as _date, timezone
         new_digits = set(re.findall(r"\d+", period or ""))
+        today = datetime.now(timezone.utc).date() - timedelta(hours=3).seconds // 86400 * 0 + timedelta(hours=-3).seconds // 86400 * 0
+        today = (_date.today())
         # Check both impaga AND pagada records — avoid recreating an already-paid invoice
         for existing in [await self.get_impaga_facturas(provider=provider),
-                         await self.get_finance_history_by_provider(provider, limit=5)]:
+                         await self.get_finance_history_by_provider(provider, limit=10)]:
             for e in existing:
                 if new_digits and new_digits & set(re.findall(r"\d+", e.name)):
                     return False, "duplicate"
-        from datetime import timezone
+                # Fallback: si hay un registro del mismo proveedor en los últimos 60 días, deduplicar
+                if e.date:
+                    try:
+                        entry_date = e.date if isinstance(e.date, _date) else _date.fromisoformat(str(e.date)[:10])
+                        if (today - entry_date).days <= 60:
+                            return False, "duplicate"
+                    except Exception:
+                        pass
         now = datetime.now(timezone.utc) - timedelta(hours=3)
         entry = await self.create_expense({
-            "name": f"💸 Factura {provider} — {period}",
+            "name": f"Factura {provider} — {period}",
             "in_out": "← EGRESO →",
             "value_ars": amount or 0,
             "categories": [category],
@@ -1687,6 +1701,18 @@ class NotionDataStore:
         except Exception:
             cards = []
 
+        banks_raw = _get_text(props, "Banks")
+        try:
+            banks = json.loads(banks_raw) if banks_raw else []
+        except Exception:
+            banks = []
+
+        modalities_raw = _get_text(props, "Payment Modalities")
+        try:
+            payment_modalities = json.loads(modalities_raw) if modalities_raw else []
+        except Exception:
+            payment_modalities = []
+
         domain_profile_fields = [
             ("actividad_fisica", "Profile Actividad Fisica"),
             ("dieta",            "Profile Dieta"),
@@ -1727,6 +1753,8 @@ class NotionDataStore:
             saved_city=_get_text(props, "City") or None,
             last_summary_date=_get_text(props, "Last Summary Date") or None,
             cards=cards or None,
+            banks=banks or None,
+            payment_modalities=payment_modalities or None,
         )
         return config, page["id"]
 
@@ -1746,6 +1774,8 @@ class NotionDataStore:
             "Activities":        {"rich_text": [{"text": {"content": json.dumps(config.activities or {}, ensure_ascii=False)}}]},
             "Purchase Counts":   {"rich_text": [{"text": {"content": json.dumps(config.purchase_counts or {}, ensure_ascii=False)[:2000]}}]},
             "Cards":             {"rich_text": [{"text": {"content": json.dumps(config.cards or [], ensure_ascii=False)[:2000]}}]},
+            "Banks":             {"rich_text": [{"text": {"content": json.dumps(config.banks or [], ensure_ascii=False)[:2000]}}]},
+            "Payment Modalities":{"rich_text": [{"text": {"content": json.dumps(config.payment_modalities or [], ensure_ascii=False)[:2000]}}]},
             "Resumen Nocturno Enabled": {"checkbox": config.resumen_nocturno_enabled},
         }
         for key, field in [
