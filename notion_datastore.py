@@ -169,6 +169,16 @@ except ImportError:
         banks: list = None          # ["BBVA", "Mercado Pago"]
         payment_modalities: list = None  # ["Debit", "Credit", "Cash", "Transfer"]
 
+    @dataclass
+    class PaymentMethod:
+        id: str = ""
+        name: str = ""
+        modality: str = ""   # Cash, Transfer, Debit, Credit, QR
+        bank: str = None
+        last4: str = None
+        owner: str = None
+        is_default: bool = False
+
 
 # ── Domain constants ───────────────────────────────────────────────────────────
 
@@ -1085,6 +1095,46 @@ class NotionDataStore:
             return r.status_code == 200
         except Exception:
             return False
+
+    async def load_payment_methods(self) -> list:
+        """Load all rows from the Payment Methods DB."""
+        try:
+            pages = await self._query_db("payment_methods", page_size=50)
+            results = []
+            for p in pages:
+                props = p.get("properties", {})
+                results.append(PaymentMethod(
+                    id=p["id"],
+                    name=_get_title(props, "Name"),
+                    modality=_get_select(props, "Modality") or "",
+                    bank=_get_text(props, "Bank") or None,
+                    last4=_get_text(props, "Last4") or None,
+                    owner=_get_text(props, "Owner") or None,
+                    is_default=_get_checkbox(props, "Default"),
+                ))
+            return results
+        except Exception:
+            return []
+
+    async def create_payment_method(self, name: str, modality: str, bank: str = None,
+                                     last4: str = None, owner: str = None, is_default: bool = False) -> str | None:
+        """Create a new payment method row. Returns page_id or None."""
+        try:
+            props = {
+                "Name": {"title": [{"text": {"content": name}}]},
+                "Modality": {"select": {"name": modality}},
+                "Default": {"checkbox": is_default},
+            }
+            if bank:
+                props["Bank"] = {"rich_text": [{"text": {"content": bank}}]}
+            if last4:
+                props["Last4"] = {"rich_text": [{"text": {"content": last4}}]}
+            if owner:
+                props["Owner"] = {"rich_text": [{"text": {"content": owner}}]}
+            page = await self._create_page("payment_methods", props)
+            return page["id"]
+        except Exception:
+            return None
 
     async def ensure_db_text_field(self, db_name: str, field_name: str) -> bool:
         """Add a rich_text field to a Notion DB if it doesn't already exist."""

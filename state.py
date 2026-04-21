@@ -25,7 +25,8 @@ CONFIG_DB_ID         = os.environ.get("NOTION_CONFIG_DB_ID",         "2f81017d-a
 PROJECTS_DB_ID       = os.environ.get("NOTION_PROJECTS_DB_ID",       "0924aff739194c5b8438d03ed82e9e21")
 HEALTH_RECORDS_DB_ID = os.environ.get("NOTION_HEALTH_RECORDS_DB_ID", "5f9cde7223f346e48a22f54dbc0836f6")
 MEDICATIONS_DB_ID    = os.environ.get("NOTION_MEDICATIONS_DB_ID",    "d16f6826e18d4e4c9e6768a9ebd07507")
-FITNESS_DB_ID        = os.environ.get("NOTION_FITNESS_DB_ID",        "c6eb4ddbfe0245bdb5bfcb2b5e33a6e5")
+FITNESS_DB_ID           = os.environ.get("NOTION_FITNESS_DB_ID",           "c6eb4ddbfe0245bdb5bfcb2b5e33a6e5")
+PAYMENT_METHODS_DB_ID   = os.environ.get("NOTION_PAYMENT_METHODS_DB_ID",   "33a84df32b904d9785d3a298d08db439")
 
 WA_TOKEN    = os.environ["WHATSAPP_TOKEN"]
 WA_PHONE_ID = os.environ["WHATSAPP_PHONE_ID"]
@@ -59,9 +60,10 @@ _ds = NotionDataStore(
         "config":         CONFIG_DB_ID,
         "geo_reminders":  GEO_REMINDERS_DB_ID,
         "projects":       PROJECTS_DB_ID,
-        "health_records": HEALTH_RECORDS_DB_ID,
-        "medications":    MEDICATIONS_DB_ID,
-        "fitness":        FITNESS_DB_ID,
+        "health_records":    HEALTH_RECORDS_DB_ID,
+        "medications":       MEDICATIONS_DB_ID,
+        "fitness":           FITNESS_DB_ID,
+        "payment_methods":   PAYMENT_METHODS_DB_ID,
     },
 )
 
@@ -112,6 +114,7 @@ current_location: dict = {
 }
 
 geo_reminders_cache: list[dict] = []
+payment_methods_cache: list = []  # list[PaymentMethod]
 
 last_event_touched: dict[str, dict] = {}
 

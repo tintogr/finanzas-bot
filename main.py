@@ -15,7 +15,7 @@ from state import (
     USER_LAT, USER_LON,
     NOTION_TOKEN, NOTION_DB_ID,
     DIAS_SEMANA, INGRESO_EXACT, EGRESO_EXACT, MAX_HISTORY,
-    user_prefs, current_location, geo_reminders_cache,
+    user_prefs, current_location, geo_reminders_cache, payment_methods_cache,
     last_event_touched, pending_state, message_buffer,
     chat_history, _last_summary_sent,
     now_argentina,
@@ -42,11 +42,9 @@ async def startup_event():
     """Carga config del usuario al arrancar para no esperar al primer mensaje."""
     await load_user_config(MY_NUMBER)
     await load_geo_reminders()
+    await load_payment_methods()
     await _ds.ensure_db_select_field("finances", "Estado", ["Impaga", "Pagada"])
     await _ds.ensure_db_text_field("config", "Last Summary Date")
-    await _ds.ensure_db_text_field("config", "Cards")
-    await _ds.ensure_db_text_field("config", "Banks")
-    await _ds.ensure_db_text_field("config", "Payment Modalities")
     await _ds.ensure_db_text_field("finances", "Payment Method")
     asyncio.create_task(_cron_loop())
 
@@ -393,24 +391,20 @@ async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=N
         prov_lines = [f"  - {k}: {v}" for k, v in providers.items()]
         providers_ctx = "\nProveedores de servicios configurados (usar para resolver nombres):\n" + "\n".join(prov_lines) + "\nSi el gasto menciona un proveedor conocido, usa el nombre canonico (ej: 'electricidad' → 'Electricidad - {nombre proveedor}').\n"
     cards = user_prefs.get("cards") or []
-    banks = user_prefs.get("banks") or []
-    modalities = user_prefs.get("payment_modalities") or []
-    pm_ctx_parts = []
-    if banks:
-        pm_ctx_parts.append(f"Bancos: {', '.join(banks)}")
-    if modalities:
-        pm_ctx_parts.append(f"Modalidades: {', '.join(modalities)}")
-    if cards:
-        card_lines = []
-        for c in cards:
-            label = c.get("label") or f"{c.get('bank','')} {c.get('type','')}".strip()
-            last4 = c.get("last4", "")
-            owner = c.get("owner", "")
-            owner_str = f" (de {owner})" if owner else ""
-            suffix = f" ****{last4}" if last4 else ""
-            card_lines.append(f"  - {label}{suffix}{owner_str}")
-        pm_ctx_parts.append("Tarjetas:\n" + "\n".join(card_lines))
-    cards_ctx = ("\nMedios de pago del usuario:\n" + "\n".join(pm_ctx_parts) + "\n") if pm_ctx_parts else ""
+    pm_lines = []
+    for pm in payment_methods_cache:
+        parts = [f"  - {pm.name} ({pm.modality}"]
+        if pm.bank:
+            parts.append(f", {pm.bank}")
+        if pm.last4:
+            parts.append(f" ****{pm.last4}")
+        if pm.owner:
+            parts.append(f", de {pm.owner}")
+        if pm.is_default:
+            parts.append(", DEFAULT")
+        parts.append(")")
+        pm_lines.append("".join(parts))
+    cards_ctx = ("\nMedios de pago registrados:\n" + "\n".join(pm_lines) + "\n") if pm_lines else ""
     system = f"""Sos Knot, asistente personal por WhatsApp. Hablas en espanol rioplatense, natural y conciso.
 Hoy: {hoy_str(now)}. Calendario: {semana_str(now)}.
 Tasa dolar blue: ${exchange_rate:,.0f}/USD
@@ -418,7 +412,8 @@ Tasa dolar blue: ${exchange_rate:,.0f}/USD
 Tu tarea: registrar gastos e ingresos del usuario.
 - Si el mensaje tiene descripcion Y monto -> usa la tool registrar_gasto directamente.
 - Si hay una imagen (ticket, screenshot de pedido, factura) -> lee TODOS los items, suma los montos vos mismo, y registra el total. No le pidas al usuario que sume.
-- Si el ticket o recibo muestra digitos de tarjeta, deducí el payment_method comparando con los medios de pago configurados (ultimos 4 digitos). Si no hay coincidencia exacta pero se ve el banco, usa el nombre del banco.
+- Si el ticket o recibo muestra digitos de tarjeta, deducí el payment_method comparando con los medios de pago (ultimos 4 digitos → campo Last4). Si no hay coincidencia exacta pero se ve el banco, usá el método DEFAULT de ese banco.
+- Si el usuario menciona un banco sin especificar modalidad, usá el método marcado DEFAULT para ese banco. Si no hay DEFAULT y hay múltiples opciones, usá el campo payment_method como null y el sistema preguntará.
 - Si falta el monto Y no hay imagen de donde sacarlo -> pregunta de forma natural y breve.
 - Si hay ambiguedad (ej: "compre algo" sin monto ni imagen) -> pregunta que fue y cuanto.
 
@@ -569,10 +564,9 @@ Emoji: elegi el mas especifico segun el contexto real."""
             digits = _re.findall(r'\d{4}', pm)
             if digits:
                 last4 = digits[-1]
-                configured_cards = user_prefs.get("cards") or []
                 is_known = any(
-                    (c.get("last4") == last4) or c.get("label", "").lower() in pm.lower()
-                    for c in configured_cards
+                    pm_entry.last4 == last4 or (pm_entry.name and pm_entry.name.lower() in pm.lower())
+                    for pm_entry in payment_methods_cache
                 )
                 if not is_known:
                     pending_state[phone] = {"type": "unknown_card_register", "last4": last4}
@@ -3912,15 +3906,18 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
             existing["owner"] = owner
         else:
             cards.append({"bank": bank, "type": ctype, "last4": last4, "owner": owner})
-        # Add bank to banks list if not there
-        banks_list = user_prefs.get("banks") or []
-        if bank and bank not in banks_list:
-            banks_list.append(bank)
-            user_prefs["banks"] = banks_list
-        user_prefs["cards"] = cards
-        await save_user_config(MY_NUMBER)
+        name = f"{label} ****{last4}" if last4 else label
+        page_id = await _ds.create_payment_method(
+            name=name, modality=ctype, bank=bank, last4=last4, owner=owner
+        )
+        if page_id:
+            from notion_datastore import PaymentMethod as _PM
+            payment_methods_cache.append(_PM(
+                id=page_id, name=name, modality=ctype,
+                bank=bank, last4=last4, owner=owner, is_default=False
+            ))
         owner_str = f" — de {owner}" if owner else ""
-        await send_message(phone, f"✅ Guardé *{label}* (****{last4}){owner_str} en tu config.")
+        await send_message(phone, f"✅ Guardé *{label}* (****{last4}){owner_str} en tus medios de pago.")
         return True
 
     if state_type == "save_location_confirm":
@@ -5039,6 +5036,16 @@ async def handle_deuda_agent(phone: str, text: str) -> str:
             }
         return f"✅ Deuda registrada: *{provider}* — {monto_str}. Te voy a recordar hasta que la marques como pagada.\n\n_Si algo no quedó bien, avisame._"
     return "No pude registrar la deuda. Intenta de nuevo."
+
+async def load_payment_methods():
+    """Carga payment methods de Notion a memoria."""
+    global payment_methods_cache
+    try:
+        payment_methods_cache = await _ds.load_payment_methods()
+        print(f"[PaymentMethods] Cargados {len(payment_methods_cache)} métodos")
+    except Exception as e:
+        print(f"[PaymentMethods] Error cargando: {e}")
+
 
 async def load_geo_reminders():
     """Carga geo-reminders activos de Notion a memoria."""
