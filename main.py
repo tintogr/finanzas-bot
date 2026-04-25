@@ -136,6 +136,58 @@ async def reverse_geocode(lat: float, lon: float) -> str | None:
         pass
     return None
 
+
+def _format_place_name(result: dict, fallback: str = "") -> str:
+    """Construye un nombre limpio desde un resultado de Nominatim con addressdetails=1.
+    Evita el truncamiento crudo de display_name que produce artefactos como "...Neuquén, Municipio"."""
+    addr = result.get("address") or {}
+    if not addr:
+        raw = result.get("display_name", fallback)
+        return raw[:60] if raw else fallback[:60]
+
+    parts: list[str] = []
+    road = addr.get("road") or addr.get("pedestrian") or addr.get("footway")
+    house = addr.get("house_number")
+    if road:
+        parts.append(f"{road} {house}".strip() if house else road)
+
+    area = addr.get("suburb") or addr.get("neighbourhood") or addr.get("city_district")
+    if area:
+        parts.append(area)
+
+    city = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("municipality")
+    if city:
+        clean = city.replace("Municipio de ", "").replace("Municipio ", "")
+        if not parts or clean.lower() not in ", ".join(parts).lower():
+            parts.append(clean)
+
+    state = addr.get("state")
+    if state and not any(state.lower() in p.lower() for p in parts):
+        parts.append(state)
+
+    if not parts:
+        raw = result.get("display_name", fallback)
+        return raw[:60] if raw else fallback[:60]
+    return ", ".join(parts)[:80]
+
+
+async def _save_known_place(name: str | None, lat: float, lon: float, radius: int = 150) -> None:
+    """Upsert de un lugar conocido en user_prefs y persiste en Notion."""
+    if not name:
+        return
+    nombre = name.strip().capitalize()
+    if not nombre:
+        return
+    places = user_prefs.get("known_places", [])
+    places = [p for p in places if p["name"].lower() != nombre.lower()]
+    places.append({"name": nombre, "lat": lat, "lon": lon, "radius": radius})
+    user_prefs["known_places"] = places
+    try:
+        await save_user_config(MY_NUMBER)
+    except Exception:
+        pass
+
+
 async def extract_coords_from_maps_url(url: str) -> tuple[float, float] | None:
     """Extrae coordenadas de un link de Google Maps (maps.app.goo.gl, etc)."""
     import re
@@ -2449,7 +2501,7 @@ EVENTOS RECURRENTES:
                             _gq = f"{data['location']}, {_city}"
                             _gr = await _hg.get(
                                 "https://nominatim.openstreetmap.org/search",
-                                params={"q": _gq, "format": "json", "limit": 1},
+                                params={"q": _gq, "format": "json", "limit": 1, "addressdetails": 1},
                                 headers={"User-Agent": "Knot/1.0"}
                             )
                             if _gr.status_code == 200 and _gr.json():
@@ -2458,7 +2510,7 @@ EVENTOS RECURRENTES:
                                     "event_id": event_id,
                                     "lat": float(_gresult["lat"]),
                                     "lon": float(_gresult["lon"]),
-                                    "place_name": _gresult.get("display_name", data["location"])[:80],
+                                    "place_name": _format_place_name(_gresult, data["location"]),
                                     "raw_location": data["location"],
                                 }
                     except Exception:
@@ -3750,6 +3802,7 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
     if state_type == "geo_reminder_awaiting_location":
         description = state.get("description", "Recordatorio")
         recurrent = state.get("recurrent", False)
+        kp_name = state.get("place_name")
         del pending_state[phone]
         # Intentar extraer link de Maps o coordenadas del texto
         import re
@@ -3763,8 +3816,10 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
                     lat=_lat, lon=_lon, recurrent=recurrent,
                 )
                 if ok:
+                    await _save_known_place(kp_name, _lat, _lon)
                     freq = "Cada vez que" if recurrent else "La proxima vez que"
-                    await send_message(phone, f"Geo-reminder guardado\n_{description}_\nCoordenadas del link: {_lat:.5f}, {_lon:.5f}\n{freq} estes cerca, te aviso.")
+                    saved_kp = f"\n💾 *{kp_name.strip().capitalize()}* guardado como lugar conocido." if kp_name else ""
+                    await send_message(phone, f"Geo-reminder guardado\n_{description}_\nCoordenadas del link: {_lat:.5f}, {_lon:.5f}\n{freq} estes cerca, te aviso.{saved_kp}")
                 else:
                     await send_message(phone, "No pude guardar el geo-reminder.")
                 return True
@@ -3777,8 +3832,10 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
                 lat=_lat, lon=_lon, recurrent=recurrent,
             )
             if ok:
+                await _save_known_place(kp_name, _lat, _lon)
                 freq = "Cada vez que" if recurrent else "La proxima vez que"
-                await send_message(phone, f"Geo-reminder guardado\n_{description}_\nCoordenadas: {_lat:.5f}, {_lon:.5f}\n{freq} estes cerca, te aviso.")
+                saved_kp = f"\n💾 *{kp_name.strip().capitalize()}* guardado como lugar conocido." if kp_name else ""
+                await send_message(phone, f"Geo-reminder guardado\n_{description}_\nCoordenadas: {_lat:.5f}, {_lon:.5f}\n{freq} estes cerca, te aviso.{saved_kp}")
             else:
                 await send_message(phone, "No pude guardar el geo-reminder.")
             return True
@@ -3787,14 +3844,14 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
             async with httpx.AsyncClient(timeout=5) as http:
                 r = await http.get(
                     "https://nominatim.openstreetmap.org/search",
-                    params={"q": text, "format": "json", "limit": 1},
+                    params={"q": text, "format": "json", "limit": 1, "addressdetails": 1},
                     headers={"User-Agent": "Knot/1.0"}
                 )
                 if r.status_code == 200 and r.json():
                     result = r.json()[0]
                     place_lat = float(result["lat"])
                     place_lon = float(result["lon"])
-                    place_name = result.get("display_name", text)[:60]
+                    place_name = _format_place_name(result, text)
                     ok, _ = await create_geo_reminder(
                         description=description,
                         rtype="place",
@@ -3803,8 +3860,10 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
                         recurrent=recurrent,
                     )
                     if ok:
+                        await _save_known_place(kp_name, place_lat, place_lon)
                         freq = "Cada vez que" if recurrent else "La proxima vez que"
-                        await send_message(phone, f"📍 *Geo-reminder guardado*\n_{description}_\nUbicacion: *{place_name}*\n{freq} estes cerca, te aviso.")
+                        saved_kp = f"\n💾 *{kp_name.strip().capitalize()}* guardado como lugar conocido." if kp_name else ""
+                        await send_message(phone, f"📍 *Geo-reminder guardado*\n_{description}_\nUbicacion: *{place_name}*\n{freq} estes cerca, te aviso.{saved_kp}")
                         return True
         except Exception:
             pass
@@ -4285,6 +4344,7 @@ async def enqueue_message(message: dict):
                     state = pending_state.pop(phone)
                     description = state.get("description", "Recordatorio")
                     recurrent = state.get("recurrent", False)
+                    kp_name = state.get("place_name")
                     ok, _ = await create_geo_reminder(
                         description=description,
                         rtype="place",
@@ -4294,8 +4354,10 @@ async def enqueue_message(message: dict):
                     )
                     place_label = loc_name or f"{lat:.4f}, {lon:.4f}"
                     if ok:
+                        await _save_known_place(kp_name, float(lat), float(lon))
                         freq = "Cada vez que" if recurrent else "La proxima vez que"
-                        await send_message(phone, f"📍 *Geo-reminder guardado*\n_{description}_\nUbicacion: *{place_label}*\n{freq} estes cerca, te aviso.")
+                        saved_kp = f"\n💾 *{kp_name.strip().capitalize()}* guardado como lugar conocido." if kp_name else ""
+                        await send_message(phone, f"📍 *Geo-reminder guardado*\n_{description}_\nUbicacion: *{place_label}*\n{freq} estes cerca, te aviso.{saved_kp}")
                     else:
                         await send_message(phone, "No pude guardar el geo-reminder.")
                     return
@@ -4412,8 +4474,10 @@ Responde SOLO JSON valido sin markdown:
                 lat=_lat, lon=_lon, radius=radius, recurrent=recurrent,
             )
             if ok:
+                await _save_known_place(place_name, _lat, _lon)
                 freq = "Cada vez que" if recurrent else "La proxima vez que"
-                return f"Geo-reminder guardado\n_{description}_\nSaque las coordenadas del link: {_lat:.5f}, {_lon:.5f} (radio: {radius}m)\n{freq} estes cerca, te aviso."
+                saved_kp = f"\n💾 *{place_name.strip().capitalize()}* guardado como lugar conocido." if place_name else ""
+                return f"Geo-reminder guardado\n_{description}_\nSaque las coordenadas del link: {_lat:.5f}, {_lon:.5f} (radio: {radius}m)\n{freq} estes cerca, te aviso.{saved_kp}"
             return "No pude guardar el geo-reminder."
     # Detectar coordenadas directamente en el texto original
     _coord = re.search(r'(-\d{2,3}\.\d{4,})[,\s]+(-\d{2,3}\.\d{4,})', text)
@@ -4425,8 +4489,10 @@ Responde SOLO JSON valido sin markdown:
             lat=_lat, lon=_lon, radius=radius, recurrent=recurrent,
         )
         if ok:
+            await _save_known_place(place_name, _lat, _lon)
             freq = "Cada vez que" if recurrent else "La proxima vez que"
-            return f"Geo-reminder guardado\n_{description}_\nCoordenadas: {_lat:.5f}, {_lon:.5f} (radio: {radius}m)\n{freq} estes cerca, te aviso."
+            saved_kp = f"\n💾 *{place_name.strip().capitalize()}* guardado como lugar conocido." if place_name else ""
+            return f"Geo-reminder guardado\n_{description}_\nCoordenadas: {_lat:.5f}, {_lon:.5f} (radio: {radius}m)\n{freq} estes cerca, te aviso.{saved_kp}"
         return "No pude guardar el geo-reminder."
 
     # Si es tipo shop, crear directamente
@@ -4463,14 +4529,14 @@ Responde SOLO JSON valido sin markdown:
             async with httpx.AsyncClient(timeout=5) as http:
                 r = await http.get(
                     "https://nominatim.openstreetmap.org/search",
-                    params={"q": address, "format": "json", "limit": 1},
+                    params={"q": address, "format": "json", "limit": 1, "addressdetails": 1},
                     headers={"User-Agent": "Knot/1.0"}
                 )
                 if r.status_code == 200 and r.json():
                     result = r.json()[0]
                     place_lat = float(result["lat"])
                     place_lon = float(result["lon"])
-                    place_name = result.get("display_name", address)[:60]
+                    geo_label = _format_place_name(result, address)
                     ok, _ = await create_geo_reminder(
                         description=description,
                         rtype="place",
@@ -4480,8 +4546,10 @@ Responde SOLO JSON valido sin markdown:
                         recurrent=recurrent,
                     )
                     if ok:
+                        await _save_known_place(place_name, place_lat, place_lon)
                         freq = "Cada vez que" if recurrent else "La proxima vez que"
-                        return f"📍 *Geo-reminder guardado*\n_{description}_\nAsumi que el lugar es *{place_name}*.\n{freq} estes a menos de {radius}m, te aviso.\n\n¿Es correcto o queres ajustar la ubicacion?"
+                        saved_kp = f"\n💾 *{place_name.strip().capitalize()}* guardado como lugar conocido." if place_name else ""
+                        return f"📍 *Geo-reminder guardado*\n_{description}_\nAsumi que el lugar es *{geo_label}*.\n{freq} estes a menos de {radius}m, te aviso.{saved_kp}\n\n¿Es correcto o queres ajustar la ubicacion?"
         except Exception:
             pass
 
