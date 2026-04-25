@@ -434,8 +434,6 @@ async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=N
     n_imgs = 1 + len(extra_images or []) if image_b64 else len(extra_images or [])
     content.append({"type": "text", "text": text or (f"(ver {n_imgs} imágenes adjuntas)" if n_imgs > 1 else "(ver imagen adjunta)")})
 
-    history = get_history(phone)
-
     profile_gastos = get_domain_profile("gastos")
     profile_gastos_ctx = f"\nPerfil de gastos del usuario: {profile_gastos}\n" if profile_gastos else ""
     providers = user_prefs.get("service_providers") or {}
@@ -480,7 +478,7 @@ Emoji: elegi el mas especifico segun el contexto real."""
     response = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=1000,
         system=system,
-        messages=history + [{"role": "user", "content": content}],
+        messages=[{"role": "user", "content": content}],
         tools=tools
     )
 
