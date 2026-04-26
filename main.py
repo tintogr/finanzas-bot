@@ -348,6 +348,80 @@ async def get_exchange_rate() -> float:
         except Exception:
             return 1000.0
 
+_BUSINESS_TYPE_TO_CATEGORY = {
+    "supermercado": "Supermercado",
+    "farmacia": "Salud",
+    "droguería": "Salud",
+    "drogueria": "Salud",
+    "restaurante": "Salida",
+    "restaurant": "Salida",
+    "bar": "Birra",
+    "café": "Salida",
+    "cafe": "Salida",
+    "panadería": "Vianda",
+    "panaderia": "Vianda",
+    "ferretería": "Depto",
+    "ferreteria": "Depto",
+    "librería": "Compras",
+    "libreria": "Compras",
+    "estación de servicio": "Recurrente",
+    "estacion de servicio": "Recurrente",
+}
+
+def _business_type_to_category(btype: str) -> str | None:
+    return _BUSINESS_TYPE_TO_CATEGORY.get(btype.lower().strip())
+
+
+async def _check_and_confirm_shop(phone: str, page_id: str, shop_name: str, current_cats: list):
+    """Background task: busca tipo de negocio y pregunta al usuario si no es conocido."""
+    business_type = await lookup_business_type(shop_name)
+    if not business_type:
+        return
+    cur_state = pending_state.get(phone, {})
+    if cur_state.get("type") == "undo_window" and cur_state.get("page_id") == page_id:
+        shop_key = shop_name.lower().strip()
+        inferred_cat = _business_type_to_category(business_type)
+        pending_state[phone] = {
+            "type": "confirm_known_shop",
+            "shop_name": shop_name,
+            "shop_key": shop_key,
+            "inferred_type": business_type,
+            "inferred_category": inferred_cat,
+            "current_category": current_cats,
+            "page_id": page_id,
+        }
+        await send_message(phone, f"¿_{shop_name}_ es {business_type}?")
+
+
+async def lookup_business_type(name: str) -> str | None:
+    """Busca en DuckDuckGo + Claude qué tipo de negocio es 'name'. Retorna ej: 'Supermercado'."""
+    abstract = ""
+    try:
+        async with httpx.AsyncClient(timeout=5) as http:
+            r = await http.get(
+                "https://api.duckduckgo.com/",
+                params={"q": f"{name} Argentina", "format": "json", "no_html": "1", "skip_disambig": "1"},
+            )
+            data = r.json()
+            abstract = data.get("AbstractText") or data.get("Answer") or ""
+    except Exception:
+        pass
+
+    context = f'Resultado de búsqueda web: "{abstract}"' if abstract else "No hay resultado de búsqueda disponible."
+    try:
+        resp = await claude_create(
+            model="claude-haiku-4-5-20251001", max_tokens=20,
+            system="Respondé SOLO con el tipo de negocio más específico (ej: Supermercado, Farmacia, Restaurante, Librería, Ferretería, Estación de servicio, etc.) o 'desconocido'. Sin explicaciones.",
+            messages=[{"role": "user", "content": f"¿Qué tipo de negocio es '{name}' en Argentina?\n{context}"}]
+        )
+        result = resp.content[0].text.strip()
+        if result.lower() == "desconocido":
+            return None
+        return result
+    except Exception:
+        return None
+
+
 # ── MODULO GASTOS ──────────────────────────────────────────────────────────────
 
 async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=None, exchange_rate=1000.0, extra_images=None) -> str:
@@ -406,10 +480,15 @@ async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=N
         parts.append(")")
         pm_lines.append("".join(parts))
     cards_ctx = ("\nMedios de pago registrados:\n" + "\n".join(pm_lines) + "\n") if pm_lines else ""
+    known_shops = user_prefs.get("known_shops") or {}
+    known_shops_ctx = ""
+    if known_shops:
+        shops_lines = "\n".join(f"  - {name}: {btype}" for name, btype in known_shops.items())
+        known_shops_ctx = f"\nComercios conocidos del usuario (usar para categorizar correctamente):\n{shops_lines}\n"
     system = f"""Sos Knot, asistente personal por WhatsApp. Hablas en espanol rioplatense, natural y conciso.
 Hoy: {hoy_str(now)}. Calendario: {semana_str(now)}.
 Tasa dolar blue: ${exchange_rate:,.0f}/USD
-{profile_gastos_ctx}{providers_ctx}{cards_ctx}
+{profile_gastos_ctx}{providers_ctx}{cards_ctx}{known_shops_ctx}
 Tu tarea: registrar gastos e ingresos NUEVOS del usuario.
 IMPORTANTE: Si el mensaje habla de corregir, editar, cambiar o actualizar algo ya registrado -> NO uses la tool, respondé que no podés hacer correcciones desde acá.
 - Si el mensaje tiene descripcion Y monto -> usa la tool registrar_gasto directamente.
@@ -428,7 +507,7 @@ Emoji: elegi el mas especifico segun el contexto real."""
     response = await claude_create(
         model="claude-sonnet-4-20250514", max_tokens=1000,
         system=system,
-        messages=history + [{"role": "user", "content": content}],
+        messages=[{"role": "user", "content": content}],
         tools=tools
     )
 
@@ -570,6 +649,24 @@ Emoji: elegi el mas especifico segun el contexto real."""
                 }
                 reply += "\n\n_Si algo no quedó bien, avisame._"
 
+    # Known shop detection: si el EGRESO es de un comercio no reconocido, buscar y confirmar
+    if len(created_entries) == 1:
+        _page_id, _data, _success = created_entries[0]
+        if _success and _page_id and "EGRESO" in (_data.get("in_out") or "").upper():
+            _shop_name = _data.get("name", "")
+            _shop_key = _shop_name.lower().strip()
+            _known_shops = user_prefs.get("known_shops") or {}
+            _cats = _data.get("categoria") or []
+            _is_fuel = _data.get("emoji") == "⛽" or any(k in _shop_key for k in FUEL_KEYWORDS)
+            if (
+                _shop_key not in _known_shops
+                and not _is_fuel
+                and "Recurrente" not in _cats
+                and "Sueldo" not in _cats
+                and pending_state.get(phone, {}).get("type") == "undo_window"
+            ):
+                asyncio.create_task(_check_and_confirm_shop(phone, _page_id, _shop_name, _cats))
+
     # Unknown card detection: si el payment_method tiene dígitos no registrados, preguntar
     # undo_window no bloquea esta detección (es el estado más común post-registro)
     if len(created_entries) == 1:
@@ -618,32 +715,32 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
         return False, "No se pudo interpretar"
     try:
         notes = data.get("notas") or None
-        entry = await _ds.create_expense({
-            "name":         data["name"],
-            "in_out":       data["in_out"],
-            "value_ars":    data["value_ars"],
-            "exchange_rate": exchange_rate,
-            "categories":   data.get("categoria"),
-            "date":         data.get("date"),
-            "time":         data.get("time"),
-            "client":       data.get("client"),
-            "liters":       data.get("litros"),
-            "consumo_kwh":  data.get("consumo_kwh"),
-            "notes":        notes or None,
-            "emoji":        data.get("emoji"),
-            "payment_method": data.get("payment_method") or None,
-        })
-        last_touched[MY_NUMBER] = {"page_id": entry.id, "name": data["name"]}
-        # Increment payment method usage counter
         pm_str = (data.get("payment_method") or "").lower()
+        matched_pm = None
         if pm_str and payment_methods_cache:
-            matched = next((
+            matched_pm = next((
                 pm for pm in payment_methods_cache
                 if (pm.last4 and pm.last4 in pm_str) or (pm.name and pm.name.lower() in pm_str)
             ), None)
-            if matched:
-                asyncio.create_task(_ds.increment_payment_method_uses(matched.id, matched.uses))
-                matched.uses += 1
+        entry = await _ds.create_expense({
+            "name":             data["name"],
+            "in_out":           data["in_out"],
+            "value_ars":        data["value_ars"],
+            "exchange_rate":    exchange_rate,
+            "categories":       data.get("categoria"),
+            "date":             data.get("date"),
+            "time":             data.get("time"),
+            "client":           data.get("client"),
+            "liters":           data.get("litros"),
+            "consumo_kwh":      data.get("consumo_kwh"),
+            "notes":            notes or None,
+            "emoji":            data.get("emoji"),
+            "payment_method_id": matched_pm.id if matched_pm else None,
+        })
+        last_touched[MY_NUMBER] = {"page_id": entry.id, "name": data["name"]}
+        if matched_pm:
+            asyncio.create_task(_ds.increment_payment_method_uses(matched_pm.id, matched_pm.uses))
+            matched_pm.uses += 1
         return True, entry.id
     except Exception as e:
         return False, str(e)
@@ -3426,6 +3523,87 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
         else:
             del pending_state[phone]
             return False
+
+    if state_type == "confirm_known_shop":
+        shop_name  = state.get("shop_name", "")
+        shop_key   = state.get("shop_key", shop_name.lower().strip())
+        inferred   = state.get("inferred_type", "")
+        inferred_cat = state.get("inferred_category")
+        current_cats = state.get("current_category") or []
+        page_id    = state.get("page_id")
+        del pending_state[phone]
+
+        t_lower = text.strip().lower()
+        affirmative = t_lower in ("si", "sí", "dale", "ok", "yes", "s", "correcto", "exacto")
+        negative    = t_lower in ("no", "nel", "nope", "para nada")
+
+        if affirmative:
+            shops = user_prefs.get("known_shops") or {}
+            shops[shop_key] = inferred
+            user_prefs["known_shops"] = shops
+            await save_user_config(MY_NUMBER)
+            if inferred_cat and inferred_cat not in current_cats and page_id:
+                new_cats = [inferred_cat] + [c for c in current_cats if c != inferred_cat]
+                try:
+                    await _ds.update_expense(page_id, {"categories": new_cats})
+                    await send_message(phone, f"Guardado. Actualicé la categoría a *{inferred_cat}*.")
+                except Exception:
+                    await send_message(phone, "Guardado.")
+            else:
+                await send_message(phone, "Guardado.")
+            return True
+
+        if negative:
+            pending_state[phone] = {
+                "type": "confirm_known_shop_manual",
+                "shop_name": shop_name,
+                "shop_key": shop_key,
+                "page_id": page_id,
+                "current_category": current_cats,
+            }
+            await send_message(phone, f"¿Qué tipo de negocio es _{shop_name}_?")
+            return True
+
+        # Texto libre: interpretar como el tipo correcto
+        btype = text.strip().capitalize()
+        shops = user_prefs.get("known_shops") or {}
+        shops[shop_key] = btype
+        user_prefs["known_shops"] = shops
+        await save_user_config(MY_NUMBER)
+        new_cat = _business_type_to_category(btype)
+        if new_cat and new_cat not in current_cats and page_id:
+            new_cats = [new_cat] + [c for c in current_cats if c != new_cat]
+            try:
+                await _ds.update_expense(page_id, {"categories": new_cats})
+                await send_message(phone, f"Guardado como *{btype}*. Categoría → *{new_cat}*.")
+            except Exception:
+                await send_message(phone, f"Guardado como *{btype}*.")
+        else:
+            await send_message(phone, f"Guardado como *{btype}*.")
+        return True
+
+    if state_type == "confirm_known_shop_manual":
+        shop_name  = state.get("shop_name", "")
+        shop_key   = state.get("shop_key", shop_name.lower().strip())
+        page_id    = state.get("page_id")
+        current_cats = state.get("current_category") or []
+        del pending_state[phone]
+        btype = text.strip().capitalize()
+        shops = user_prefs.get("known_shops") or {}
+        shops[shop_key] = btype
+        user_prefs["known_shops"] = shops
+        await save_user_config(MY_NUMBER)
+        new_cat = _business_type_to_category(btype)
+        if new_cat and new_cat not in current_cats and page_id:
+            new_cats = [new_cat] + [c for c in current_cats if c != new_cat]
+            try:
+                await _ds.update_expense(page_id, {"categories": new_cats})
+                await send_message(phone, f"Guardado como *{btype}*. Categoría → *{new_cat}*.")
+            except Exception:
+                await send_message(phone, f"Guardado como *{btype}*.")
+        else:
+            await send_message(phone, f"Guardado como *{btype}*.")
+        return True
 
     if state_type == "litros_followup":
         page_id = state["page_id"]

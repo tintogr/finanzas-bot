@@ -168,6 +168,7 @@ except ImportError:
         cards: list = None          # [{last4, bank, type, owner}]
         banks: list = None          # ["BBVA", "Mercado Pago"]
         payment_modalities: list = None  # ["Debit", "Credit", "Cash", "Transfer"]
+        known_shops: dict = None    # {"la anonima": "Supermercado", "farmacity": "Farmacia"}
 
     @dataclass
     class PaymentMethod:
@@ -451,8 +452,8 @@ class NotionDataStore:
             props["Notes"] = {"rich_text": [{"text": {"content": data["notes"]}}]}
         if data.get("estado"):
             props["Estado"] = {"select": {"name": data["estado"]}}
-        if data.get("payment_method"):
-            props["Payment Method"] = {"rich_text": [{"text": {"content": data["payment_method"][:200]}}]}
+        if data.get("payment_method_id"):
+            props["Method"] = {"relation": [{"id": data["payment_method_id"]}]}
 
         emoji = data.get("emoji") or "\U0001f4b8"
         page = await self._create_page("finances", props, emoji=emoji)
@@ -502,8 +503,8 @@ class NotionDataStore:
             props["Category"] = {"multi_select": [{"name": c} for c in updates["categories"]]}
         if "name" in updates:
             props["Name"] = {"title": [{"text": {"content": updates["name"]}}]}
-        if "payment_method" in updates:
-            props["Payment Method"] = {"rich_text": [{"text": {"content": updates["payment_method"][:200]}}]}
+        if "payment_method_id" in updates:
+            props["Method"] = {"relation": [{"id": updates["payment_method_id"]}]}
         if "notes" in updates:
             props["Notes"] = {"rich_text": [{"text": {"content": updates["notes"]}}]}
         if "liters" in updates:
@@ -1800,6 +1801,12 @@ class NotionDataStore:
         except Exception:
             payment_modalities = []
 
+        known_shops_raw = _get_text(props, "Known Shops")
+        try:
+            known_shops = json.loads(known_shops_raw) if known_shops_raw else {}
+        except Exception:
+            known_shops = {}
+
         domain_profile_fields = [
             ("actividad_fisica", "Profile Actividad Fisica"),
             ("dieta",            "Profile Dieta"),
@@ -1842,6 +1849,7 @@ class NotionDataStore:
             cards=cards or None,
             banks=banks or None,
             payment_modalities=payment_modalities or None,
+            known_shops=known_shops or None,
         )
         return config, page["id"]
 
@@ -1863,6 +1871,7 @@ class NotionDataStore:
             "Cards":             {"rich_text": [{"text": {"content": json.dumps(config.cards or [], ensure_ascii=False)[:2000]}}]},
             "Banks":             {"rich_text": [{"text": {"content": json.dumps(config.banks or [], ensure_ascii=False)[:2000]}}]},
             "Payment Modalities":{"rich_text": [{"text": {"content": json.dumps(config.payment_modalities or [], ensure_ascii=False)[:2000]}}]},
+            "Known Shops":       {"rich_text": [{"text": {"content": json.dumps(config.known_shops or {}, ensure_ascii=False)[:2000]}}]},
             "Resumen Nocturno Enabled": {"checkbox": config.resumen_nocturno_enabled},
         }
         for key, field in [
