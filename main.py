@@ -588,13 +588,24 @@ Emoji: elegi el mas especifico segun el contexto real."""
                 continue
             usd = data["value_ars"] / exchange_rate
             cats = data.get("categoria") or []
-            pm = data.get("payment_method") or ""
+            pm = (data.get("payment_method") or "").strip()
+            # Solo mostrar pm si efectivamente matcheó con un metodo conocido
+            pm_matched = False
+            if pm:
+                pm_lower = pm.lower()
+                pm_matched = any(
+                    (p.last4 and p.last4 in pm_lower)
+                    or (p.name and p.name.lower() in pm_lower)
+                    or (p.bank and p.bank.lower() in pm_lower)
+                    or (p.modality and p.modality.lower() in pm_lower)
+                    for p in payment_methods_cache
+                )
             line = f"✅ *{data['name']}* — ${data['value_ars']:,.0f} ARS"
             if abs(usd - data["value_ars"]) > 1:
                 line += f" (USD {usd:.2f})"
             if cats:
                 line += f" · _{', '.join(cats)}_"
-            if pm:
+            if pm and pm_matched:
                 line += f" · {pm}"
             lines.append(line)
         if pre_text:
@@ -606,7 +617,11 @@ Emoji: elegi el mas especifico segun el contexto real."""
         page_id, data, success = created_entries[0]
         if success and page_id:
             name_lower = data.get("name", "").lower()
-            is_fuel = data.get("emoji") == "⛽" or any(k in name_lower for k in FUEL_KEYWORDS)
+            cats_lower = [c.lower() for c in (data.get("categoria") or [])]
+            # Combustible solo si: emoji ⛽ Y categoría Transporte, O keywords explícitas Y Transporte
+            is_fuel = "transporte" in cats_lower and (
+                data.get("emoji") == "⛽" or any(k in name_lower for k in FUEL_KEYWORDS)
+            )
             if is_fuel and not data.get("litros"):
                 pending_state[phone] = {"type": "litros_followup", "page_id": page_id, "name": data["name"]}
                 reply += "\n\n⛽ Cuantos litros cargaste?"
@@ -656,13 +671,24 @@ Emoji: elegi el mas especifico segun el contexto real."""
                 }
                 reply += "\n\n_Si algo no quedó bien, avisame._"
 
-    # Ask payment method if missing (EGRESO sin medio de pago)
+    # Ask payment method if missing OR if agent invented one not in cache
     if len(created_entries) == 1:
         _page_id, _data, _success = created_entries[0]
+        _pm = (_data.get("payment_method") or "").strip()
+        _pm_matched = False
+        if _pm:
+            _pm_l = _pm.lower()
+            _pm_matched = any(
+                (p.last4 and p.last4 in _pm_l)
+                or (p.name and p.name.lower() in _pm_l)
+                or (p.bank and p.bank.lower() in _pm_l)
+                or (p.modality and p.modality.lower() in _pm_l)
+                for p in payment_methods_cache
+            )
         if (
             _success and _page_id
             and "EGRESO" in (_data.get("in_out") or "").upper()
-            and not (_data.get("payment_method") or "").strip()
+            and not _pm_matched
             and pending_state.get(phone, {}).get("type") == "undo_window"
         ):
             opts = []
@@ -751,7 +777,10 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
         if pm_str and payment_methods_cache:
             matched_pm = next((
                 pm for pm in payment_methods_cache
-                if (pm.last4 and pm.last4 in pm_str) or (pm.name and pm.name.lower() in pm_str)
+                if (pm.last4 and pm.last4 in pm_str)
+                or (pm.name and pm.name.lower() in pm_str)
+                or (pm.bank and pm.bank.lower() in pm_str)
+                or (pm.modality and pm.modality.lower() in pm_str)
             ), None)
         entry = await _ds.create_expense({
             "name":             data["name"],
