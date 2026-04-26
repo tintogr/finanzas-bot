@@ -45,7 +45,6 @@ async def startup_event():
     await load_payment_methods()
     await _ds.ensure_db_select_field("finances", "Estado", ["Impaga", "Pagada"])
     await _ds.ensure_db_text_field("config", "Last Summary Date")
-    await _ds.ensure_db_text_field("finances", "Payment Method")
     asyncio.create_task(_run_once_migrations())
     asyncio.create_task(_cron_loop())
 
@@ -377,10 +376,17 @@ async def _check_and_confirm_shop(phone: str, page_id: str, shop_name: str, curr
     business_type = await lookup_business_type(shop_name)
     if not business_type:
         return
+    shop_key = shop_name.lower().strip()
+    inferred_cat = _business_type_to_category(business_type)
+    # Si la categoría inferida ya coincide con la actual, guardar silenciosamente sin preguntar
+    if inferred_cat and inferred_cat in current_cats:
+        shops = user_prefs.get("known_shops") or {}
+        shops[shop_key] = business_type
+        user_prefs["known_shops"] = shops
+        await save_user_config(MY_NUMBER)
+        return
     cur_state = pending_state.get(phone, {})
     if cur_state.get("type") == "undo_window" and cur_state.get("page_id") == page_id:
-        shop_key = shop_name.lower().strip()
-        inferred_cat = _business_type_to_category(business_type)
         pending_state[phone] = {
             "type": "confirm_known_shop",
             "shop_name": shop_name,
@@ -495,6 +501,7 @@ IMPORTANTE: Si el mensaje habla de corregir, editar, cambiar o actualizar algo y
 - Si hay una imagen (ticket, screenshot de pedido, factura) -> lee TODOS los items, suma los montos vos mismo, y registra el total. No le pidas al usuario que sume.
 - Si el ticket o recibo muestra digitos de tarjeta, deducí el payment_method comparando con los medios de pago (ultimos 4 digitos → campo Last4). Si no hay coincidencia exacta pero se ve el banco, usá el método DEFAULT de ese banco.
 - Si el usuario menciona un banco sin especificar modalidad, usá el método marcado DEFAULT para ese banco. Si no hay DEFAULT y hay múltiples opciones, igual poné el nombre del banco en payment_method (ej: "BBVA") y el sistema preguntará al usuario cuál usar.
+- Si el usuario NO menciona ningún método de pago (ni banco, ni efectivo, ni transferencia, ni dígitos de tarjeta) -> dejá payment_method en null. El sistema le va a preguntar despues. NUNCA inventes "Cash" o "Efectivo" si el usuario no lo dijo explícitamente.
 - Si falta el monto Y no hay imagen de donde sacarlo -> pregunta de forma natural y breve.
 - Si hay ambiguedad (ej: "compre algo" sin monto ni imagen) -> pregunta que fue y cuanto.
 
@@ -648,6 +655,30 @@ Emoji: elegi el mas especifico segun el contexto real."""
                     "expires_at": expires_at,
                 }
                 reply += "\n\n_Si algo no quedó bien, avisame._"
+
+    # Ask payment method if missing (EGRESO sin medio de pago)
+    if len(created_entries) == 1:
+        _page_id, _data, _success = created_entries[0]
+        if (
+            _success and _page_id
+            and "EGRESO" in (_data.get("in_out") or "").upper()
+            and not (_data.get("payment_method") or "").strip()
+            and pending_state.get(phone, {}).get("type") == "undo_window"
+        ):
+            opts = []
+            seen = set()
+            for pm in payment_methods_cache:
+                key = (pm.name or pm.bank or "").lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    opts.append(pm.name or pm.bank)
+            opts_str = ", ".join(opts[:8]) if opts else "Efectivo, BBVA, Mercado Pago, Transferencia"
+            pending_state[phone] = {
+                "type": "ask_payment_method",
+                "page_id": _page_id,
+                "name": _data.get("name", "gasto"),
+            }
+            reply += f"\n\n💳 ¿Con qué pagaste? ({opts_str})"
 
     # Known shop detection: si el EGRESO es de un comercio no reconocido, buscar y confirmar
     if len(created_entries) == 1:
@@ -3523,6 +3554,42 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
         else:
             del pending_state[phone]
             return False
+
+    if state_type == "ask_payment_method":
+        page_id = state.get("page_id")
+        name = state.get("name", "gasto")
+        del pending_state[phone]
+        t = text.strip().lower()
+        if t in ("no", "no se", "no sé", "ns", "skip", "omitir"):
+            await send_message(phone, "Dale, sin método de pago.")
+            return True
+        # Buscar match en payment_methods_cache
+        matched = None
+        for pm in payment_methods_cache:
+            if pm.last4 and pm.last4 in t:
+                matched = pm
+                break
+            if pm.name and pm.name.lower() in t:
+                matched = pm
+                break
+            if pm.bank and pm.bank.lower() in t:
+                matched = pm
+                break
+            if pm.modality and pm.modality.lower() in t:
+                matched = pm
+                break
+        if matched:
+            try:
+                await _ds.update_expense(page_id, {"payment_method_id": matched.id})
+                asyncio.create_task(_ds.increment_payment_method_uses(matched.id, matched.uses))
+                matched.uses += 1
+                label = matched.name or f"{matched.bank} {matched.modality}".strip()
+                await send_message(phone, f"💳 *{name}* pagado con *{label}*.")
+            except Exception:
+                await send_message(phone, "No pude guardar el método de pago.")
+        else:
+            await send_message(phone, f"No reconocí ese método. Probá con: {', '.join((p.name or p.bank or '') for p in payment_methods_cache[:8])}")
+        return True
 
     if state_type == "confirm_known_shop":
         shop_name  = state.get("shop_name", "")
