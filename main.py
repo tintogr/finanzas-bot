@@ -22,6 +22,7 @@ from state import (
     claude_create, hoy_str, semana_str, get_history, add_to_history,
 )
 from wa_utils import send_message, send_interactive_buttons, send_reaction, error_servicio
+import suggestion_gate
 from gcal import (
     get_gcal_access_token, get_event_color, create_evento_gcal,
     fuzzy_match_event, _find_calendar_event, find_similar_calendar_events,
@@ -399,6 +400,40 @@ async def _check_and_confirm_shop(phone: str, page_id: str, shop_name: str, curr
         await send_message(phone, f"¿_{shop_name}_ es {business_type}?")
 
 
+# ═══ Suggestion Gate — buffer de hints + helpers ════════════════════════════
+hint_buffer: dict[str, "suggestion_gate.Hint"] = {}  # phone -> hint pendiente del turn
+finance_query_log: dict[str, list] = {}  # phone -> [datetime, ...] consultas finanzas
+
+
+def emit_hint(phone: str, hint: "suggestion_gate.Hint") -> None:
+    """Un handler llama esto cuando detecta una oportunidad. El gate decide después si emitirla."""
+    # Si ya hay uno bufferado, mantener el primero (no sobreescribir)
+    if phone not in hint_buffer:
+        hint_buffer[phone] = hint
+
+
+async def maybe_fire_hint(phone: str) -> bool:
+    """Llamar al final de process_single_item. Si hay hint válido, lo manda."""
+    hint = hint_buffer.pop(phone, None)
+    if not hint:
+        return False
+    hints_state = user_prefs.get("feature_hints") or {}
+    today_count = suggestion_gate.count_today(hints_state)
+    if not suggestion_gate.should_fire(hint, hints_state, today_count):
+        return False
+    suggestion_gate.record_suggested(hints_state, hint.trigger_id)
+    user_prefs["feature_hints"] = hints_state
+    pending_state[phone] = {
+        "type": "hint_response",
+        "trigger_id": hint.trigger_id,
+        "action_intent": hint.action_intent,
+        "payload": hint.payload,
+    }
+    await send_message(phone, hint.message)
+    asyncio.create_task(save_user_config(MY_NUMBER))
+    return True
+
+
 async def lookup_business_type(name: str) -> str | None:
     """Busca en DuckDuckGo + Claude qué tipo de negocio es 'name'. Retorna ej: 'Supermercado'."""
     abstract = ""
@@ -670,6 +705,17 @@ Emoji: elegi el mas especifico segun el contexto real."""
                     "expires_at": expires_at,
                 }
                 reply += "\n\n_Si algo no quedó bien, avisame._"
+
+    # Trigger #4: primer gasto categoría Transporte → soft-introduce $/L tracking
+    if len(created_entries) == 1:
+        _p, _d, _s = created_entries[0]
+        if _s and "Transporte" in (_d.get("categoria") or []):
+            emit_hint(phone, suggestion_gate.Hint(
+                trigger_id="first_combustible",
+                message="💡 Si la próxima cargas combustible y me decís los litros, te puedo trackear el precio por litro mes a mes en Notion.",
+                action_intent="info_only",
+                payload={},
+            ))
 
     # Ask payment method if missing OR if agent invented one not in cache
     if len(created_entries) == 1:
@@ -1953,6 +1999,18 @@ La idea es que el usuario descubra capacidades de Knot a medida que las necesita
         elif t_name == "consultar_finanzas":
             mes = t_input.get("mes") or now.strftime("%Y-%m")
             t_result = await query_finances(mes) or "No hay registros para " + mes + "."
+            # Trigger #8: 3+ consultas finanzas sin filtro en la última semana
+            log = finance_query_log.setdefault(phone, [])
+            log.append(now)
+            cutoff = now - timedelta(days=7)
+            log[:] = [d for d in log if d > cutoff]
+            if len(log) >= 3:
+                emit_hint(phone, suggestion_gate.Hint(
+                    trigger_id="finance_query_freq",
+                    message="📊 Veo que mirás tus finanzas seguido. ¿Querés que te mande un mini-resumen automático cada lunes? Decime *si* o *no*.",
+                    action_intent="enable_weekly_finance",
+                    payload={},
+                ))
         elif t_name == "corregir_gasto":
             search_term = t_input.get("search_term", "")
             new_value = t_input.get("new_value_ars")
@@ -3601,6 +3659,46 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
             del pending_state[phone]
             return False
 
+    if state_type == "hint_response":
+        trigger_id = state.get("trigger_id", "")
+        action_intent = state.get("action_intent", "")
+        payload = state.get("payload", {})
+        del pending_state[phone]
+
+        t = text.strip().lower()
+        affirmative = t in ("si", "sí", "dale", "ok", "yes", "s", "bueno", "obvio", "perfecto", "genial")
+        negative    = t in ("no", "nel", "nope", "para nada", "ahora no")
+
+        hints_state = user_prefs.get("feature_hints") or {}
+
+        if affirmative:
+            suggestion_gate.record_accepted(hints_state, trigger_id)
+            user_prefs["feature_hints"] = hints_state
+            await save_user_config(MY_NUMBER)
+            # Ejecutar acción según intent
+            if action_intent == "enable_weekly_finance":
+                extras = user_prefs.get("resumen_extras", [])
+                if "Mini-resumen finanzas semanal (lunes)" not in extras:
+                    extras.append("Mini-resumen finanzas semanal (lunes)")
+                    user_prefs["resumen_extras"] = extras
+                    await save_user_config(MY_NUMBER)
+                await send_message(phone, "Listo, los lunes te paso un mini-resumen.")
+            elif action_intent == "info_only":
+                await send_message(phone, "Anotado.")
+            else:
+                await send_message(phone, "Listo, lo activo. Si querés cambiarlo despues, decímelo.")
+            return True
+
+        if negative:
+            suggestion_gate.record_dismissed(hints_state, trigger_id)
+            user_prefs["feature_hints"] = hints_state
+            await save_user_config(MY_NUMBER)
+            await send_message(phone, "Dale, no te molesto con eso.")
+            return True
+
+        # Texto que no es ni si ni no → pasar el mensaje normal y olvidar la oferta
+        return False
+
     if state_type == "ask_payment_method":
         page_id = state.get("page_id")
         name = state.get("name", "gasto")
@@ -5039,6 +5137,12 @@ Responde:
                             {"id": "recipe_save_no",  "title": "No gracias"},
                         ]
                     )
+
+        # Después de la respuesta principal, intentar emitir un hint si aplica
+        try:
+            await maybe_fire_hint(phone)
+        except Exception:
+            pass
 
     except json.JSONDecodeError:
         pass

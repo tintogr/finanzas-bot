@@ -35,6 +35,8 @@ async def load_user_config(wa_number: str):
             user_prefs["purchase_counts"] = cfg.purchase_counts
         if cfg.known_shops:
             user_prefs["known_shops"] = cfg.known_shops
+        if cfg.feature_hints:
+            user_prefs["feature_hints"] = cfg.feature_hints
         if cfg.cards:
             user_prefs["cards"] = cfg.cards
         if cfg.banks:
@@ -94,6 +96,7 @@ async def save_user_config(wa_number: str):
             banks=user_prefs.get("banks", []),
             payment_modalities=user_prefs.get("payment_modalities", []),
             known_shops=user_prefs.get("known_shops", {}),
+            feature_hints=user_prefs.get("feature_hints", {}),
         )
         await _ds.save_config(page_id, cfg)
     except Exception:

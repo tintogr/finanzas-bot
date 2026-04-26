@@ -169,6 +169,7 @@ except ImportError:
         banks: list = None          # ["BBVA", "Mercado Pago"]
         payment_modalities: list = None  # ["Debit", "Credit", "Cash", "Transfer"]
         known_shops: dict = None    # {"la anonima": "Supermercado", "farmacity": "Farmacia"}
+        feature_hints: dict = None  # {trigger_id: {first_suggested_at, accepted, dismissed_count, disabled}}
 
     @dataclass
     class PaymentMethod:
@@ -1817,6 +1818,12 @@ class NotionDataStore:
         except Exception:
             known_shops = {}
 
+        feature_hints_raw = _get_text(props, "Feature Hints")
+        try:
+            feature_hints = json.loads(feature_hints_raw) if feature_hints_raw else {}
+        except Exception:
+            feature_hints = {}
+
         domain_profile_fields = [
             ("actividad_fisica", "Profile Actividad Fisica"),
             ("dieta",            "Profile Dieta"),
@@ -1860,6 +1867,7 @@ class NotionDataStore:
             banks=banks or None,
             payment_modalities=payment_modalities or None,
             known_shops=known_shops or None,
+            feature_hints=feature_hints or None,
         )
         return config, page["id"]
 
@@ -1882,6 +1890,7 @@ class NotionDataStore:
             "Banks":             {"rich_text": [{"text": {"content": json.dumps(config.banks or [], ensure_ascii=False)[:2000]}}]},
             "Payment Modalities":{"rich_text": [{"text": {"content": json.dumps(config.payment_modalities or [], ensure_ascii=False)[:2000]}}]},
             "Known Shops":       {"rich_text": [{"text": {"content": json.dumps(config.known_shops or {}, ensure_ascii=False)[:2000]}}]},
+            "Feature Hints":     {"rich_text": [{"text": {"content": json.dumps(config.feature_hints or {}, ensure_ascii=False)[:2000]}}]},
             "Resumen Nocturno Enabled": {"checkbox": config.resumen_nocturno_enabled},
         }
         for key, field in [
