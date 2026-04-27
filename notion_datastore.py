@@ -89,6 +89,7 @@ except ImportError:
         price: float = None
         notes: str = None
         emoji: str = ""
+        last_watering: date = None
 
     @dataclass
     class MeetingEntry:
@@ -893,6 +894,7 @@ class NotionDataStore:
             price=_get_number(props, "Price"),
             notes=_get_text(props, "Notes") or None,
             emoji=page.get("icon", {}).get("emoji", ""),
+            last_watering=_get_date(props, "Last Watering") or None,
         )
 
     async def create_plant(self, data: dict) -> PlantEntry:
@@ -943,6 +945,9 @@ class NotionDataStore:
             props["Light"] = {"select": {"name": updates["light"]}}
         if "notes" in updates:
             props["Notes"] = {"rich_text": [{"text": {"content": updates["notes"]}}]}
+        if "last_watering" in updates:
+            lw = updates["last_watering"]
+            props["Last Watering"] = {"date": {"start": str(lw) if lw else None}}
 
         page = await self._update_page(plant_id, props)
         return self._parse_plant(page)

@@ -454,12 +454,32 @@ async def _check_daily_hints(now) -> None:
 
     # Trigger #10: planta sin riego ≥14 días (solo si user activo: 2+ riegos registrados)
     try:
-        plants = await _ds.query_plants(limit=50) if hasattr(_ds, "query_plants") else []
-        # TODO: simplificación — chequear riegos via fitness/health o estado de la planta
-        # Solo emitir si tenemos confianza de uso activo. Por ahora, skip si no hay tool clara.
-        # Implementación simple: si tu DB de Plants tiene un campo "Last Watered" lo usamos
-        # En su ausencia, este trigger queda como spec.
-        pass
+        if user_prefs.get("plant_water_count", 0) >= 2:
+            plants = await _ds.query_plants() if hasattr(_ds, "query_plants") else []
+            from datetime import date as _date
+            today = now.date()
+            for plant in plants:
+                lw = getattr(plant, "last_watering", None)
+                if not lw:
+                    continue
+                try:
+                    if isinstance(lw, str):
+                        lw = _date.fromisoformat(lw[:10])
+                    days_since = (today - lw).days
+                    if days_since >= 14:
+                        trigger_id = f"plant_thirsty_{(plant.name or '').lower()[:20]}"
+                        hints_state = user_prefs.get("feature_hints") or {}
+                        if hints_state.get(trigger_id, {}).get("accepted") or hints_state.get(trigger_id, {}).get("dismissed_count", 0) >= 2:
+                            continue
+                        if not any(h.get("trigger_id") == trigger_id for h in queue):
+                            queue.append({
+                                "trigger_id": trigger_id,
+                                "message": f"🌿 *{plant.name}* lleva {days_since} días sin riego registrado. ¿Te recuerdo cada lunes para que me digas si la regaste? Decime *si* o *no*.",
+                                "action_intent": "enable_plant_reminder",
+                                "payload": {"plant_name": plant.name},
+                            })
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -1367,7 +1387,8 @@ async def editar_planta(text: str) -> tuple[bool, str]:
             '"watering": "Cada 2-3 dias|Semanal|Quincenal|Mensual o null", '
             '"location": "Interior|Exterior|Balcon|Terraza o null", '
             '"light": "Sombra|Indirecta|Directa parcial|Pleno sol o null", '
-            '"notes": "nuevas notas o null"}}'
+            '"notes": "nuevas notas o null", '
+            '"watered_today": true si el mensaje indica que la regó (regué, le di agua, regado, ya está regada) hoy, sino false}}'
         )}]
     )
     raw = response.content[0].text.strip()
@@ -1378,7 +1399,14 @@ async def editar_planta(text: str) -> tuple[bool, str]:
     except Exception:
         return False, "No entendi qué planta querés editar"
     search_term = parsed.get("search_term", "")
-    updates = {k: v for k, v in parsed.get("updates", {}).items() if v is not None}
+    raw_updates = parsed.get("updates", {})
+    watered_today = bool(raw_updates.pop("watered_today", False)) if isinstance(raw_updates, dict) else False
+    updates = {k: v for k, v in raw_updates.items() if v is not None}
+    if watered_today:
+        updates["last_watering"] = now_argentina().date().isoformat()
+        # Trackear cantidad de riegos para activar trigger #10
+        cnt = user_prefs.get("plant_water_count", 0) + 1
+        user_prefs["plant_water_count"] = cnt
     if not search_term:
         return False, "No entendi qué planta querés editar"
     results = await _ds.search_plants(search_term)
@@ -1388,7 +1416,9 @@ async def editar_planta(text: str) -> tuple[bool, str]:
     if not updates:
         return False, f"No entendi qué querés cambiar de _{plant.name}_"
     await _ds.update_plant(plant.id, updates)
-    changes = ", ".join(f"{k}: {v}" for k, v in updates.items())
+    if watered_today:
+        return True, f"💧 *{plant.name}* regada hoy."
+    changes = ", ".join(f"{k}: {v}" for k, v in updates.items() if k != "last_watering")
     return True, f"*{plant.name}* actualizada: {changes}"
 
 
@@ -3886,6 +3916,15 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
             elif action_intent == "enable_time_reminder":
                 desc = payload.get("description", "el recordatorio")
                 await send_message(phone, f"Decime el horario en formato HH:MM (ej: 20:00) y los días (todos los días, lunes, etc) para que te recuerde *{desc}*.")
+            elif action_intent == "enable_plant_reminder":
+                plant_name = payload.get("plant_name", "tu planta")
+                extras = user_prefs.get("resumen_extras", [])
+                hint_msg = f"Recordatorio de riego para {plant_name} (lunes)"
+                if hint_msg not in extras:
+                    extras.append(hint_msg)
+                    user_prefs["resumen_extras"] = extras
+                    await save_user_config(MY_NUMBER)
+                await send_message(phone, f"🌿 Listo, los lunes te pregunto si regaste *{plant_name}*.")
             elif action_intent == "add_provider":
                 provider = payload.get("provider", "")
                 if provider:
