@@ -760,6 +760,8 @@ class NotionDataStore:
             props["Category"] = {"select": {"name": updates["category"]}}
         if "notes" in updates:
             props["Notes"] = {"rich_text": [{"text": {"content": updates["notes"]}}]}
+        if "frequency" in updates:
+            props["Frequency"] = {"status": {"name": updates["frequency"]}}
 
         page = await self._update_page(item_id, props)
         return self._parse_shopping(page)

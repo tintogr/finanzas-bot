@@ -438,6 +438,19 @@ async def send_daily_summary(http, access_token: str, now: datetime):
                 ok, page_id = await _ds.create_finance_invoice(provider, amount, period, due_date, inv.get("category", "Recurrente"))
                 if ok:
                     await _ds.create_factura_task(provider, amount, due_date, period, finance_page_id=page_id)
+                    # Trigger #2: proveedor nuevo en Gmail (no estaba en service_providers ni tenía pagos previos)
+                    known_providers = (user_prefs.get("service_providers") or {})
+                    is_in_providers = any(provider.lower() == k.lower() or provider.lower() == v.lower() for k, v in known_providers.items())
+                    if not is_in_providers and not historial:
+                        queue = user_prefs.setdefault("pending_hints_queue", [])
+                        # Evitar duplicados en queue
+                        if not any(h.get("trigger_id") == f"new_provider_{provider.lower()}" for h in queue):
+                            queue.append({
+                                "trigger_id": f"new_provider_{provider.lower()}",
+                                "message": f"📬 Vi una factura de *{provider}* en tu mail — proveedor nuevo. ¿La sumo a tus servicios para reconocerla siempre? Decime *si* o *no*.",
+                                "action_intent": "add_provider",
+                                "payload": {"provider": provider},
+                            })
                 if pago_dudoso and amount and page_id:
                     mismatch_followups.append({
                         "provider": provider, "invoice_amount": amount,

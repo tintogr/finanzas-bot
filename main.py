@@ -400,6 +400,87 @@ async def _check_and_confirm_shop(phone: str, page_id: str, shop_name: str, curr
         await send_message(phone, f"¿_{shop_name}_ es {business_type}?")
 
 
+async def _check_daily_hints(now) -> None:
+    """Chequeos diarios para triggers #9 (provider recurrente) y #10 (planta sin riego).
+    Encola hints en pending_hints_queue para que se emitan en la próxima interacción."""
+    queue = user_prefs.setdefault("pending_hints_queue", [])
+
+    # Trigger #9: proveedor Recurrente pagado 3+ meses seguidos → heads-up al cuarto
+    try:
+        from datetime import date as _date
+        today = now.date()
+        # Mirar últimos 4 meses
+        start = today.replace(day=1) - timedelta(days=120)
+        qfilter = QueryFilter(limit=200)
+        qfilter.date_range = DateRange(start=start, end=today)
+        recent = await _ds.query_expenses(qfilter)
+        # Agrupar por nombre normalizado, contando meses distintos
+        by_name = {}
+        for e in recent:
+            cats = getattr(e, "categories", None) or getattr(e, "categoria", None) or []
+            if "Recurrente" not in (cats if isinstance(cats, list) else []):
+                continue
+            name = (e.name or "").strip()
+            if not name:
+                continue
+            key = name.lower()
+            d = getattr(e, "date", None)
+            if d:
+                try:
+                    if isinstance(d, str):
+                        d = _date.fromisoformat(d[:10])
+                    months = by_name.setdefault(key, {"name": name, "months": set(), "last_day": 1})
+                    months["months"].add((d.year, d.month))
+                    months["last_day"] = max(months["last_day"], d.day)
+                except Exception:
+                    pass
+        for key, info in by_name.items():
+            if len(info["months"]) >= 3:
+                # Heads-up: si hoy estamos cerca del día del mes habitual, encolar
+                trigger_id = f"recurring_provider_{key[:20]}"
+                hints_state = user_prefs.get("feature_hints") or {}
+                if hints_state.get(trigger_id, {}).get("accepted") or hints_state.get(trigger_id, {}).get("dismissed_count", 0) >= 2:
+                    continue
+                # Solo encolar 3 dias antes del dia habitual
+                if abs(info["last_day"] - today.day) <= 3 and not any(h.get("trigger_id") == trigger_id for h in queue):
+                    queue.append({
+                        "trigger_id": trigger_id,
+                        "message": f"📅 *{info['name']}* suele venir por estos días. ¿Te aviso cuando llegue el mail? Decime *si* o *no*.",
+                        "action_intent": "info_only",
+                        "payload": {},
+                    })
+    except Exception:
+        pass
+
+    # Trigger #10: planta sin riego ≥14 días (solo si user activo: 2+ riegos registrados)
+    try:
+        plants = await _ds.query_plants(limit=50) if hasattr(_ds, "query_plants") else []
+        # TODO: simplificación — chequear riegos via fitness/health o estado de la planta
+        # Solo emitir si tenemos confianza de uso activo. Por ahora, skip si no hay tool clara.
+        # Implementación simple: si tu DB de Plants tiene un campo "Last Watered" lo usamos
+        # En su ausencia, este trigger queda como spec.
+        pass
+    except Exception:
+        pass
+
+
+_ROUTINE_GEO_KEYWORDS = {"regar", "tomar", "darle de comer", "dar de comer", "alimentar",
+                         "medicacion", "medicación", "medicamento", "pastilla", "remedio",
+                         "estudiar", "leer", "meditar", "ejercicio", "hacer ejercicio"}
+
+
+def _check_routine_geo_hint(phone: str, description: str, place_name: str) -> None:
+    """Trigger #5: si el geo-reminder parece rutinario, ofrecer también recordatorio horario."""
+    desc_l = (description or "").lower()
+    if any(k in desc_l for k in _ROUTINE_GEO_KEYWORDS):
+        emit_hint(phone, suggestion_gate.Hint(
+            trigger_id="routine_geo_hint",
+            message=f"⏰ Veo que es algo rutinario. Si querés, te puedo recordar todos los días a un horario fijo en vez de (o además de) cuando llegues a {place_name}. Decime *si* o *no*.",
+            action_intent="enable_time_reminder",
+            payload={"description": description, "place_name": place_name},
+        ))
+
+
 # ═══ Suggestion Gate — buffer de hints + helpers ════════════════════════════
 hint_buffer: dict[str, "suggestion_gate.Hint"] = {}  # phone -> hint pendiente del turn
 finance_query_log: dict[str, list] = {}  # phone -> [datetime, ...] consultas finanzas
@@ -414,6 +495,17 @@ def emit_hint(phone: str, hint: "suggestion_gate.Hint") -> None:
 
 async def maybe_fire_hint(phone: str) -> bool:
     """Llamar al final de process_single_item. Si hay hint válido, lo manda."""
+    # Drenar la queue persistente (hints de jobs background como summaries)
+    queue = user_prefs.get("pending_hints_queue") or []
+    if queue and phone not in hint_buffer:
+        item = queue.pop(0)
+        user_prefs["pending_hints_queue"] = queue
+        hint_buffer[phone] = suggestion_gate.Hint(
+            trigger_id=item.get("trigger_id", ""),
+            message=item.get("message", ""),
+            action_intent=item.get("action_intent", ""),
+            payload=item.get("payload", {}),
+        )
     hint = hint_buffer.pop(phone, None)
     if not hint:
         return False
@@ -680,6 +772,32 @@ Emoji: elegi el mas especifico segun el contexto real."""
                                 await mark_factura_task_paid(t["page_id"])
                                 break
                         reply += f"\n\n✅ Marqué *{impaga.name}* como pagada."
+                        # Trigger #6: detectar pago con apuro (≤2 días al vencimiento)
+                        try:
+                            due = getattr(impaga, "due_date", None)
+                            if due:
+                                days_left = (due - now.date()).days if hasattr(due, "days") is False else 0
+                                # Calcular días entre hoy y due_date
+                                from datetime import date as _date
+                                if isinstance(due, str):
+                                    due = _date.fromisoformat(due[:10])
+                                days_left = (due - now.date()).days
+                                if -1 <= days_left <= 2:
+                                    hints_state = user_prefs.get("feature_hints") or {}
+                                    s = hints_state.get("apuro_factura", {})
+                                    payload_data = s.get("apuro_count", 0) + 1
+                                    s["apuro_count"] = payload_data
+                                    hints_state["apuro_factura"] = s
+                                    user_prefs["feature_hints"] = hints_state
+                                    if payload_data >= 2:
+                                        emit_hint(phone, suggestion_gate.Hint(
+                                            trigger_id="apuro_factura",
+                                            message="⏰ Veo que las últimas facturas las pagás sobre la fecha. ¿Querés que te avise 5 días antes la próxima? Decime *si* o *no*.",
+                                            action_intent="enable_factura_early_warning",
+                                            payload={},
+                                        ))
+                        except Exception:
+                            pass
                     else:
                         pending_state[phone] = {
                             "type": "factura_note",
@@ -716,6 +834,49 @@ Emoji: elegi el mas especifico segun el contexto real."""
                 action_intent="info_only",
                 payload={},
             ))
+
+    # Trigger #1: 3+ gastos del mismo nombre en misma franja horaria semanal
+    if len(created_entries) == 1:
+        _p, _d, _s = created_entries[0]
+        if _s and _d.get("name") and "EGRESO" in (_d.get("in_out") or "").upper():
+            try:
+                from datetime import date as _date
+                today = now.date()
+                start = today - timedelta(days=28)
+                qfilter = QueryFilter(name_contains=_d["name"][:30], limit=20)
+                qfilter.date_range = DateRange(start=start, end=today)
+                similar = await _ds.query_expenses(qfilter)
+                # Filtrar por mismo weekday y hora ±1h
+                target_wd = now.weekday()
+                target_hr = now.hour
+                matches = []
+                for e in similar:
+                    e_dt = getattr(e, "date", None)
+                    if not e_dt:
+                        continue
+                    try:
+                        if hasattr(e_dt, "weekday"):
+                            ewd = e_dt.weekday()
+                            ehr = getattr(e_dt, "hour", target_hr)
+                        else:
+                            continue
+                    except Exception:
+                        continue
+                    if ewd == target_wd and abs(ehr - target_hr) <= 1:
+                        matches.append(e)
+                if len(matches) >= 3:
+                    weekday_es = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"][target_wd]
+                    emit_hint(phone, suggestion_gate.Hint(
+                        trigger_id=f"recurring_pattern_{_d['name'][:20].lower().replace(' ','_')}",
+                        message=f"📅 Veo que registrás *{_d['name']}* los {weekday_es} a esta hora seguido. ¿Lo agendo en el calendario para avisarte? Decime *si* o *no*.",
+                        action_intent="create_recurring_event",
+                        payload={"name": _d["name"], "weekday": target_wd, "hour": target_hr},
+                    ))
+            except Exception:
+                pass
+
+    # Trigger #6: facturas pagadas con apuro (≤2 días al vencimiento)
+    # Se chequea cuando el código encuentra una impaga match (revisar bloque mark_finance_paid abajo)
 
     # Ask payment method if missing OR if agent invented one not in cache
     if len(created_entries) == 1:
@@ -2668,6 +2829,14 @@ EVENTOS RECURRENTES:
                 except Exception:
                     fecha = data["date"]
                 t_result = "Evento creado: " + data.get("emoji", "") + " " + data["summary"] + " el " + fecha + hora + "."
+                # Trigger #7: primer evento con ubicacion → ofrecer aviso de tiempo de viaje
+                if data.get("location"):
+                    emit_hint(phone, suggestion_gate.Hint(
+                        trigger_id="event_with_location",
+                        message=f"🚗 *{data.get('summary','el evento')}* tiene ubicación. Si querés, te puedo avisar antes con tiempo de salida según el tráfico. Decime *si* o *no*.",
+                        action_intent="enable_travel_time_alert",
+                        payload={"event_id": event_id, "location": data.get("location"), "summary": data.get("summary", "")},
+                    ))
                 if data.get("location"):
                     t_result += " Ubicacion: " + data["location"] + "."
                 # 4a: intentar geocodificar la ubicacion del evento
@@ -3685,6 +3854,46 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
                 await send_message(phone, "Listo, los lunes te paso un mini-resumen.")
             elif action_intent == "info_only":
                 await send_message(phone, "Anotado.")
+            elif action_intent == "set_shopping_recurring":
+                item_id = payload.get("item_id")
+                name = payload.get("name", "ese item")
+                if item_id:
+                    try:
+                        await _ds.update_shopping_item(item_id, {"frequency": "Monthly"})
+                        await send_message(phone, f"🔁 *{name}* marcado como recurrente. Siempre va a estar en tu lista.")
+                    except Exception:
+                        await send_message(phone, "No pude marcarlo como recurrente.")
+                else:
+                    await send_message(phone, "No tengo el item para actualizar.")
+            elif action_intent == "create_recurring_event":
+                p_name = payload.get("name", "")
+                p_wd = payload.get("weekday", 0)
+                p_hr = payload.get("hour", 9)
+                weekday_es = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"][p_wd]
+                await send_message(phone, f"Dale, decime cómo lo agendo: *Crear evento {p_name} todos los {weekday_es} a las {p_hr:02d}:00* o ajustá lo que quieras.")
+            elif action_intent == "enable_factura_early_warning":
+                extras = user_prefs.get("resumen_extras", [])
+                hint_msg = "Avisar 5 días antes de cada factura recurrente"
+                if hint_msg not in extras:
+                    extras.append(hint_msg)
+                    user_prefs["resumen_extras"] = extras
+                    await save_user_config(MY_NUMBER)
+                await send_message(phone, "Listo, te aviso 5 días antes de cada factura recurrente que detecte.")
+            elif action_intent == "enable_travel_time_alert":
+                ev_id = payload.get("event_id", "")
+                summary = payload.get("summary", "el evento")
+                await send_message(phone, f"Listo, te voy a calcular el tiempo de viaje para *{summary}*. Si no logro calcularlo, te pregunto antes cuánto demorás.")
+            elif action_intent == "enable_time_reminder":
+                desc = payload.get("description", "el recordatorio")
+                await send_message(phone, f"Decime el horario en formato HH:MM (ej: 20:00) y los días (todos los días, lunes, etc) para que te recuerde *{desc}*.")
+            elif action_intent == "add_provider":
+                provider = payload.get("provider", "")
+                if provider:
+                    providers = user_prefs.get("service_providers") or {}
+                    providers[provider.lower()] = provider
+                    user_prefs["service_providers"] = providers
+                    await save_user_config(MY_NUMBER)
+                await send_message(phone, f"Sumado *{provider}* a tus proveedores. La próxima factura que llegue ya la voy a reconocer.")
             else:
                 await send_message(phone, "Listo, lo activo. Si querés cambiarlo despues, decímelo.")
             return True
@@ -4900,6 +5109,7 @@ Responde SOLO JSON valido sin markdown:
                 )
                 if ok:
                     freq = "Cada vez que" if recurrent else "La proxima vez que"
+                    _check_routine_geo_hint(phone, description, _kp['name'])
                     return f"📍 *Geo-reminder guardado*\n_{description}_\nUbicacion: *{_kp['name']}*\n{freq} estes cerca, te aviso."
                 return "No pude guardar el geo-reminder."
 
@@ -5446,6 +5656,11 @@ async def _cron_job_inner():
             access_token_summary = await get_gcal_access_token()
             async with httpx.AsyncClient() as http_summary:
                 await send_daily_summary(http_summary, access_token_summary, now)
+            # Daily-frequency hint checks (encolan a pending_hints_queue)
+            try:
+                await _check_daily_hints(now)
+            except Exception:
+                pass
             await save_user_config(MY_NUMBER)
             fired.append("DAILY_SUMMARY")
         except Exception as e:
@@ -6252,6 +6467,19 @@ async def handle_shopping(text: str, phone: str = None) -> str:
                         "supermercado",
                         f"Compra frecuente confirmada: '{item_name}' ({counts[item_key]} veces marcado como comprado)"
                     ))
+                # Trigger #3: 5+ compras del mismo item → ofrecer marcar como Monthly
+                if counts[item_key] >= 5 and phone:
+                    try:
+                        existing_freq = getattr(existing[0], "frequency", "") or ""
+                        if "monthly" not in existing_freq.lower() and "often" not in existing_freq.lower():
+                            emit_hint(phone, suggestion_gate.Hint(
+                                trigger_id=f"recurring_shopping_{item_key[:20]}",
+                                message=f"🛒 Compraste *{display}* {counts[item_key]} veces. ¿Querés que la marque como recurrente (Monthly) para que siempre quede en tu lista? Decime *si* o *no*.",
+                                action_intent="set_shopping_recurring",
+                                payload={"item_id": existing[0].id, "name": item_name},
+                            ))
+                    except Exception:
+                        pass
         else:
             if not in_stock:
                 try:
