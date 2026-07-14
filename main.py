@@ -1008,6 +1008,7 @@ Tasa dolar blue: ${exchange_rate:,.0f}/USD
 {profile_gastos_ctx}{providers_ctx}{cards_ctx}{known_shops_ctx}
 Tu tarea: registrar gastos e ingresos NUEVOS del usuario.
 El usuario es {user_prefs.get("greeting_name") or "el titular de la cuenta"}.
+HISTORIAL: tenés los mensajes anteriores de la conversación. Usalos para COMPLETAR datos que el usuario fue dando de a poco (ej: antes dijo "supermercado", ahora dice "42000" → es UN gasto: supermercado $42.000, registralo). Pero NUNCA vuelvas a registrar un gasto que ya confirmaste antes (los que en el historial ya tienen un "✅"); esos ya están hechos.
 COMPROBANTES DE TRANSFERENCIA (CRITICO para la direccion in_out):
 - Un comprobante de transferencia/pago tiene un REMITENTE (De / Origen / Titular que envia / "Desde") y un DESTINATARIO (Para / Destino / "A").
 - Si el REMITENTE es el usuario (su nombre, CUIT/CUIL o cuenta) -> es un EGRESO: el usuario ESTA PAGANDO. NO es un ingreso.
@@ -1033,7 +1034,7 @@ Emoji: elegi el mas especifico segun el contexto real."""
     response = await claude_create(
         model=SONNET_MODEL, max_tokens=1000,
         system=system,
-        messages=[{"role": "user", "content": content}],
+        messages=get_history(phone) + [{"role": "user", "content": content}],
         tools=tools
     )
 
