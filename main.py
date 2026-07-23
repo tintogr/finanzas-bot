@@ -1339,6 +1339,7 @@ Emoji: elegi el mas especifico segun el contexto real."""
                 _existing["page_id"] = _page_id
                 _existing["name"] = _data.get("name", "gasto")
                 _existing["is_usd"] = _is_usd
+                _existing["created_at"] = now_argentina().replace(tzinfo=None).isoformat()
             elif _existing.get("type") == "factura_confirm":
                 # Hay una confirmación de factura pendiente más importante — no pisar con método de pago
                 pass
@@ -1349,6 +1350,7 @@ Emoji: elegi el mas especifico segun el contexto real."""
                     "name": _data.get("name", "gasto"),
                     "is_usd": _is_usd,
                     "expenses": [_new_entry],
+                    "created_at": now_argentina().replace(tzinfo=None).isoformat(),
                 }
             if _is_usd:
                 reply += f"\n\n💵 ¿Lo pagaste en dólares cash o transferencia?"
@@ -4501,10 +4503,32 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
 
     if state_type == "ask_payment_method":
         t = text.strip().lower()
+        # Expirar preguntas viejas (>1h): un mensaje de días después NO es respuesta
+        # a un "¿con qué pagaste?" olvidado — procesarlo como mensaje normal.
+        _created = state.get("created_at")
+        if _created:
+            try:
+                _age = (now_argentina().replace(tzinfo=None) - datetime.fromisoformat(_created)).total_seconds()
+                if _age > 3600:
+                    del pending_state[phone]
+                    return False
+            except Exception:
+                pass
         if t in ("no", "no se", "no sé", "ns", "skip", "omitir", "ninguno", "dejalo"):
             del pending_state[phone]
             await send_message(phone, "Dale, sin método de pago.")
             return True
+
+        # Si el mensaje parece un gasto NUEVO completo (monto + descripción), NO es
+        # una respuesta al método de pago, aunque contenga palabras como "efectivo"
+        # (ese método pertenece al gasto nuevo). Procesarlo como mensaje normal.
+        import re as _re
+        _digits = _re.findall(r"\d{3,}", t)
+        _is_last4_answer = any(pm.last4 and pm.last4 in _digits for pm in payment_methods_cache)
+        _amountish = bool(_digits) or bool(_re.search(r"\d+\s*(mil|lucas)", t))
+        if _amountish and not _is_last4_answer and len(t.split()) >= 3:
+            del pending_state[phone]
+            return False
 
         # Determinar a qué gasto aplica esta respuesta
         # Si el usuario menciona un nombre de gasto explícitamente (ej: "las sillas con X"), usar ese
