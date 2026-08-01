@@ -4503,17 +4503,6 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
 
     if state_type == "ask_payment_method":
         t = text.strip().lower()
-        # Expirar preguntas viejas (>1h): un mensaje de días después NO es respuesta
-        # a un "¿con qué pagaste?" olvidado — procesarlo como mensaje normal.
-        _created = state.get("created_at")
-        if _created:
-            try:
-                _age = (now_argentina().replace(tzinfo=None) - datetime.fromisoformat(_created)).total_seconds()
-                if _age > 3600:
-                    del pending_state[phone]
-                    return False
-            except Exception:
-                pass
         if t in ("no", "no se", "no sé", "ns", "skip", "omitir", "ninguno", "dejalo"):
             del pending_state[phone]
             await send_message(phone, "Dale, sin método de pago.")
