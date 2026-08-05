@@ -1,5 +1,7 @@
 # Knot — estado del proyecto
 
+> 📓 Para el detalle completo de todo lo que se cambió y por qué, ver [`docs/BITACORA.md`](docs/BITACORA.md).
+
 Bot personal de WhatsApp (Python / FastAPI) desplegado en **Render** (auto-deploy al pushear a `main`).
 El dueño es **Martin** (arquitecto, no programador — todo el código lo genera Claude).
 
