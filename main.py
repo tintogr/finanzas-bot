@@ -1054,6 +1054,7 @@ Emoji: elegi el mas especifico segun el contexto real."""
 
     all_tool_results = []
     created_entries = []
+    dup_names = []
     for tool_block in tool_blocks:
         data = dict(tool_block.input)
         final_cats, cat_note = await check_and_apply_category(data.get("name", ""), data.get("categoria", []))
@@ -1083,6 +1084,10 @@ Emoji: elegi el mas especifico segun el contexto real."""
                 asyncio.create_task(update_domain_profile_bg("social", event_desc))
             if any(c in cats for c in ("Depto", "Plantas")):
                 asyncio.create_task(update_domain_profile_bg("hogar", event_desc))
+        elif result_i == "DUPLICATE":
+            # Ya se registró hace minutos: no lo duplicamos ni lo contamos como error.
+            tr = "Ese gasto ya estaba registrado hace unos minutos. No se creo de nuevo."
+            dup_names.append(data.get("name") or "ese gasto")
         else:
             tr = f"Error al guardar en Notion: {result_i[:200]}"
             created_entries.append((None, data, False))
@@ -1096,7 +1101,10 @@ Emoji: elegi el mas especifico segun el contexto real."""
     # Texto libre que Claude puso ANTES de llamar la tool (ej: aclaración, pregunta)
     pre_text = next((b.text for b in response.content if hasattr(b, "text") and b.text), "").strip()
 
-    if not created_entries:
+    if dup_names and not created_entries:
+        _dups = ", ".join(f"*{n}*" for n in dup_names)
+        reply = f"Eso ya lo tenía registrado recién ({_dups}), así que no lo dupliqué."
+    elif not created_entries:
         reply = pre_text or "No encontré nada para registrar."
     elif all(not ok for _, _, ok in created_entries):
         reply = "No pude registrar el gasto en Notion."
@@ -1418,9 +1426,28 @@ Emoji: elegi el mas especifico segun el contexto real."""
     return reply
 
 
+# Gastos creados hace poco: (nombre, monto, fecha) -> timestamp. Evita que el agente
+# vuelva a registrar desde el historial un gasto que ya confirmó con ✅.
+_recent_creations: dict = {}
+DUP_WINDOW_MIN = 10
+
+
 async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, str]:
     if not data.get("value_ars") or not data.get("in_out"):
         return False, "No se pudo interpretar"
+
+    _now = now_argentina()
+    for _k, _ts in list(_recent_creations.items()):
+        if (_now - _ts).total_seconds() > DUP_WINDOW_MIN * 60:
+            del _recent_creations[_k]
+    _dup_key = (
+        (data.get("name") or "").strip().lower(),
+        round(float(data["value_ars"]), 2),
+        data.get("date"),
+    )
+    if _dup_key in _recent_creations:
+        return False, "DUPLICATE"
+
     try:
         notes = data.get("notas") or None
         pm_str = (data.get("payment_method") or "").lower()
@@ -1447,7 +1474,11 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
             "notes":            notes or None,
             "emoji":            data.get("emoji"),
             "payment_method_id": matched_pm.id if matched_pm else None,
+            # Un gasto que el usuario reporta ya lo pagó. Las deudas/facturas pendientes
+            # nacen Impaga por otro camino (create_finance_invoice).
+            "estado":           "Pagada" if "EGRESO" in (data.get("in_out") or "").upper() else None,
         })
+        _recent_creations[_dup_key] = _now
         last_touched[MY_NUMBER] = {"page_id": entry.id, "name": data["name"]}
         if matched_pm:
             asyncio.create_task(_ds.increment_payment_method_uses(matched_pm.id, matched_pm.uses))
