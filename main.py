@@ -4515,7 +4515,7 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
         _digits = _re.findall(r"\d{3,}", t)
         _is_last4_answer = any(pm.last4 and pm.last4 in _digits for pm in payment_methods_cache)
         _amountish = bool(_digits) or bool(_re.search(r"\d+\s*(mil|lucas)", t))
-        if _amountish and not _is_last4_answer and len(t.split()) >= 3:
+        if _amountish and not _is_last4_answer and len(t.split()) >= 2:
             del pending_state[phone]
             return False
 
