@@ -1518,6 +1518,7 @@ Responde:
   "new_categoria": ["categoria"] o null,
   "new_name": "nuevo nombre" o null,
   "new_notes": "nueva nota" o null,
+  "new_estado": "Pagada" si el usuario dice que ya lo pago / esta saldado, "Impaga" si dice que esta pendiente, impago o sin pagar, null si no habla del estado,
   "new_emoji": emoji nuevo (un solo caracter) o null. Ej: si dice 'ponele uno de supermercado' -> '🛒', 'cerveza' -> '🍺', 'comida' -> '🍽️'}}"""}]
     )
     raw = response.content[0].text.strip()
@@ -1546,6 +1547,8 @@ Responde:
         updates["name"] = intent["new_name"]
     if intent.get("new_notes") is not None:
         updates["notes"] = intent["new_notes"]
+    if intent.get("new_estado") in ("Pagada", "Impaga"):
+        updates["estado"] = intent["new_estado"]
     if intent.get("new_emoji"):
         updates["emoji"] = intent["new_emoji"]
     if not updates:
@@ -1583,6 +1586,8 @@ Responde:
             changes_preview.append(f"nombre → _{intent['new_name']}_")
         if intent.get("new_notes") is not None:
             changes_preview.append(f"nota → _{intent['new_notes']}_")
+        if updates.get("estado"):
+            changes_preview.append(f"estado → *{updates['estado']}*")
         names_preview = "\n".join(f"  • {e.name} (${e.value_ars:,.0f})" for e in entries_to_update)
         pending_state[phone] = {
             "type": "bulk_correction_confirm",
@@ -1618,6 +1623,8 @@ Responde:
         changes.append(f"Nombre -> _{intent['new_name']}_")
     if intent.get("new_notes") is not None:
         changes.append(f"Nota -> _{intent['new_notes']}_")
+    if updates.get("estado"):
+        changes.append(f"Estado -> *{updates['estado']}*")
 
     names = list({e.name for e in entries_to_update[:updated]})
     if updated > 1:
@@ -1992,7 +1999,7 @@ async def classify(text: str, has_image: bool, image_b64: str = None, image_type
 
 GASTO: registrar un pago, compra o ingreso NUEVO. El usuario describe algo que acaba de pagar o comprar ahora. NUNCA cuando usa "corregir", "cambiar", "editar", "actualizar", "la descripcion", "las notas", "el nombre" de algo ya registrado.
 DEUDA: registrar algo que el usuario TODAVIA NO PAGO pero debe pagar. "le debo X a Y", "me deben X", "tengo que pagar X". Diferente a GASTO que es un pago ya realizado.
-CORREGIR_GASTO: modificar cualquier campo de un gasto ya registrado — monto, categoria, nombre, descripcion, notas. Ejemplos: "el gasto de X era Y", "cambia la categoria de X", "corrige la descripcion de los 3 de anthropic", "en realidad eran extra usage", "la nota estaba mal". Si el usuario habla de algo que YA registró y quiere cambiarlo → CORREGIR_GASTO.
+CORREGIR_GASTO: modificar cualquier campo de un gasto ya registrado — monto, categoria, nombre, descripcion, notas, o su ESTADO (pagada/impaga). Ejemplos: "el gasto de X era Y", "cambia la categoria de X", "corrige la descripcion de los 3 de anthropic", "en realidad eran extra usage", "la nota estaba mal", "el alquiler esta impago", "marca las expensas como pagadas", "poné que X ya lo pagué". Si el usuario habla de algo que YA registró y quiere cambiarlo → CORREGIR_GASTO.
 ELIMINAR_GASTO: eliminar o borrar un gasto de Notion.
 PLANTA: adquirir o registrar una planta nueva.
 EDITAR_PLANTA: modificar datos de una planta existente (estado, riego, ubicacion, notas).
