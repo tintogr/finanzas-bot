@@ -944,6 +944,36 @@ async def _find_invoice_candidates(name_lower: str) -> list:
 
 # ── MODULO GASTOS ──────────────────────────────────────────────────────────────
 
+# Gastos creados hace poco: (nombre, monto, fecha) -> timestamp. Sirve para dos cosas:
+# frenar duplicados en create_notion_entry y avisarle al agente qué ya está hecho.
+_recent_creations: dict = {}
+DUP_WINDOW_MIN = 10
+
+
+def _prune_recent_creations(now=None):
+    now = now or now_argentina()
+    for _k, _ts in list(_recent_creations.items()):
+        if (now - _ts).total_seconds() > DUP_WINDOW_MIN * 60:
+            del _recent_creations[_k]
+
+
+def _recent_creations_context() -> str:
+    """Lista explícita de lo ya registrado. El historial con ✅ no alcanzaba: el agente
+    igual re-ejecutaba el registro anterior en vez de atender el mensaje nuevo."""
+    _prune_recent_creations()
+    if not _recent_creations:
+        return ""
+    lines = "\n".join(
+        f"  - {name} — ${amount:,.0f} — {date_str}"
+        for (name, amount, date_str) in _recent_creations
+    )
+    return (
+        "\nYA REGISTRADOS hace minutos (NO los registres de nuevo por ningun motivo):\n"
+        + lines
+        + "\nSi el mensaje del usuario menciona un gasto DISTINTO a esos, registra ESE gasto nuevo.\n"
+    )
+
+
 async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=None, exchange_rate=1000.0, extra_images=None) -> str:
     now = now_argentina()
     tools = [{
@@ -1005,8 +1035,9 @@ async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=N
     system = f"""Sos Knot, asistente personal por WhatsApp. Hablas en espanol rioplatense, natural y conciso.
 Hoy: {hoy_str(now)}. Calendario: {semana_str(now)}.
 Tasa dolar blue: ${exchange_rate:,.0f}/USD
-{profile_gastos_ctx}{providers_ctx}{cards_ctx}{known_shops_ctx}
+{profile_gastos_ctx}{providers_ctx}{cards_ctx}{known_shops_ctx}{_recent_creations_context()}
 Tu tarea: registrar gastos e ingresos NUEVOS del usuario.
+REGLA #1: lo que tenes que registrar es lo que dice el ULTIMO mensaje del usuario. El historial es solo contexto de apoyo. Si el ultimo mensaje describe un gasto, registra ESE — nunca vuelvas a ejecutar el registro de un mensaje anterior.
 El usuario es {user_prefs.get("greeting_name") or "el titular de la cuenta"}.
 HISTORIAL: tenés los mensajes anteriores de la conversación. Usalos para COMPLETAR datos que el usuario fue dando de a poco (ej: antes dijo "supermercado", ahora dice "42000" → es UN gasto: supermercado $42.000, registralo). Pero NUNCA vuelvas a registrar un gasto que ya confirmaste antes (los que en el historial ya tienen un "✅"); esos ya están hechos.
 COMPROBANTES DE TRANSFERENCIA (CRITICO para la direccion in_out):
@@ -1103,7 +1134,10 @@ Emoji: elegi el mas especifico segun el contexto real."""
 
     if dup_names and not created_entries:
         _dups = ", ".join(f"*{n}*" for n in dup_names)
-        reply = f"Eso ya lo tenía registrado recién ({_dups}), así que no lo dupliqué."
+        reply = (
+            f"Eso ya lo tenía registrado recién ({_dups}), así que no lo dupliqué.\n\n"
+            "⚠️ Si me estabas pasando *otro* gasto, no lo registré — repetímelo."
+        )
     elif not created_entries:
         reply = pre_text or "No encontré nada para registrar."
     elif all(not ok for _, _, ok in created_entries):
@@ -1426,20 +1460,12 @@ Emoji: elegi el mas especifico segun el contexto real."""
     return reply
 
 
-# Gastos creados hace poco: (nombre, monto, fecha) -> timestamp. Evita que el agente
-# vuelva a registrar desde el historial un gasto que ya confirmó con ✅.
-_recent_creations: dict = {}
-DUP_WINDOW_MIN = 10
-
-
 async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, str]:
     if not data.get("value_ars") or not data.get("in_out"):
         return False, "No se pudo interpretar"
 
     _now = now_argentina()
-    for _k, _ts in list(_recent_creations.items()):
-        if (_now - _ts).total_seconds() > DUP_WINDOW_MIN * 60:
-            del _recent_creations[_k]
+    _prune_recent_creations(_now)
     _dup_key = (
         (data.get("name") or "").strip().lower(),
         round(float(data["value_ars"]), 2),
