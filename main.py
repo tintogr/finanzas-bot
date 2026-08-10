@@ -1447,6 +1447,16 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
     )
     if _dup_key in _recent_creations:
         return False, "DUPLICATE"
+    # El cache en memoria muere en cada reinicio de Render (y cada deploy es un
+    # reinicio), asi que confirmamos contra Notion, que sí sobrevive.
+    try:
+        if await _ds.find_recent_duplicate(
+            data.get("name") or "", float(data["value_ars"]), data.get("date"), DUP_WINDOW_MIN
+        ):
+            _recent_creations[_dup_key] = _now
+            return False, "DUPLICATE"
+    except Exception:
+        pass
 
     try:
         notes = data.get("notas") or None

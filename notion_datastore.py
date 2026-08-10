@@ -705,6 +705,39 @@ class NotionDataStore:
             estado=_get_select(props, "Estado") or None,
         )
 
+    async def find_recent_duplicate(
+        self, name: str, value_ars: float, date_str: str, within_minutes: int = 10
+    ) -> bool:
+        """True si ya existe un gasto identico (nombre + monto + fecha) creado hace
+        pocos minutos. Se apoya en created_time de Notion, asi sobrevive a reinicios
+        del proceso (a diferencia de un cache en memoria)."""
+        if not name or not date_str:
+            return False
+        from datetime import timezone
+        filter_obj = {"and": [
+            {"property": "Name", "title": {"equals": name}},
+            {"property": "Date", "date": {"equals": date_str}},
+        ]}
+        try:
+            pages = await self._query_db("finances", filter_obj=filter_obj, page_size=5)
+        except Exception:
+            return False
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
+        for p in pages:
+            amount = _get_number(p.get("properties", {}), "Value (ars)") or 0
+            if abs(amount - float(value_ars)) > 0.01:
+                continue
+            created = p.get("created_time")
+            if not created:
+                continue
+            try:
+                created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if created_dt >= cutoff:
+                return True
+        return False
+
     async def create_expense(self, data: dict) -> EntryResult:
         """
         Create an expense or income entry.
