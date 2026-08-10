@@ -4157,6 +4157,35 @@ REGLAS:
     return reply
 
 # ── PENDING STATE HANDLER ──────────────────────────────────────────────────────
+async def _classify_yes_no_answer(question: str, text: str) -> str:
+    """Desambigua con Haiku si un mensaje responde SI/NO a una pregunta pendiente
+    o si es otro tema (OTRO) que hay que re-rutear. Ante cualquier error, OTRO."""
+    try:
+        resp = await claude_create(
+            model=HAIKU_MODEL, max_tokens=5,
+            system=(
+                "Knot le hizo una pregunta de si/no al usuario y el usuario respondio algo.\n"
+                f"Pregunta de Knot: {question}\n\n"
+                "Responde SOLO una palabra:\n"
+                "- SI si el usuario confirma o afirma.\n"
+                "- NO si el usuario niega, o si corrige/aclara que la premisa de la pregunta esta equivocada.\n"
+                "- OTRO solo si el mensaje no tiene NADA que ver con la pregunta (otro gasto distinto, otra orden, otra consulta).\n"
+                "Importante: una aclaracion sobre la MISMA factura o el MISMO pago (ej: 'esa es de otro mes', "
+                "'no, esa ya la pague', 'la que pague es la de agosto') NO es OTRO: es NO.\n"
+                "Respuesta (SI, NO u OTRO):"
+            ),
+            messages=[{"role": "user", "content": text.strip()}]
+        )
+        out = resp.content[0].text.strip().upper()
+    except Exception:
+        return "OTRO"
+    if out.startswith("SI"):
+        return "SI"
+    if out.startswith("NO"):
+        return "NO"
+    return "OTRO"
+
+
 async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
     state_type = state.get("type")
 
@@ -5185,12 +5214,12 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
         _affirm_task = t_lower in ("si", "sí", "dale", "ok", "yes", "correcto", "s", "sip")
         _deny_task   = t_lower in ("no", "nope", "nel", "nah")
         if not _affirm_task and not _deny_task:
-            import re as _re
-            _has_amount = bool(_re.search(r'\d{4,}|\d+\s*(mil|usd|ars|pesos)', t_lower))
-            _many_words = len(text.strip().split()) >= 4
-            if _has_amount or _many_words:
+            _ans = await _classify_yes_no_answer(f"Ya pagaste {task_name}?", text)
+            if _ans == "OTRO":
                 del pending_state[phone]
                 return False
+            _affirm_task = _ans == "SI"
+            _deny_task = _ans == "NO"
         del pending_state[phone]
         if _affirm_task:
             ok = await mark_factura_task_paid(task_page_id)
@@ -5212,14 +5241,16 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
         t_lower = t_stripped.lower()
         _affirm = t_stripped == "mismatch_yes" or t_lower in ("si", "sí", "yes", "dale", "ok", "sip", "claro", "obvio")
         _deny   = t_stripped == "mismatch_no"  or t_lower in ("no", "nope", "nel", "nah")
-        # Si no es ni confirmación ni negación clara → parece un gasto u otro mensaje nuevo
+        # Si no es ni confirmación ni negación clara → desambiguar antes de abandonar el hilo
         if not _affirm and not _deny:
-            import re as _re
-            _has_amount = bool(_re.search(r'\d{4,}|\d+\s*(mil|usd|ars|pesos)', t_lower))
-            _many_words = len(t_stripped.split()) >= 4
-            if _has_amount or _many_words:
+            _ans = await _classify_yes_no_answer(
+                f"La factura de {provider} ya esta pagada?", t_stripped
+            )
+            if _ans == "OTRO":
                 del pending_state[phone]
                 return False
+            _affirm = _ans == "SI"
+            _deny = _ans == "NO"
         del pending_state[phone]
         if _affirm:
             # Pedir nota explicativa y marcar como pagada
@@ -5294,12 +5325,18 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
         # Para diff_moderate y diff_large: si no es sí/no y parece nuevo gasto → abandonar y reprocesar
         # Para multiple_invoices: espera texto libre ("la de junio", etc.) → NO abandonar
         if situation in ("diff_moderate", "diff_large") and not affirm and not deny:
-            import re as _re
-            _has_amount = bool(_re.search(r'\d{4,}|\d+\s*(mil|usd|ars|pesos)', t_lower))
-            _many_words = len(text.strip().split()) >= 4
-            if _has_amount or _many_words:
+            _prov = state.get("provider_name", "la factura")
+            _q = (
+                f"El pago que registraste corresponde a la factura de {_prov}?"
+                if situation == "diff_moderate"
+                else f"El pago que registraste fue un pago parcial de la factura de {_prov}?"
+            )
+            _ans = await _classify_yes_no_answer(_q, text)
+            if _ans == "OTRO":
                 del pending_state[phone]
                 return False
+            affirm = _ans == "SI"
+            deny = _ans == "NO"
         del pending_state[phone]
 
         if situation == "diff_moderate":
