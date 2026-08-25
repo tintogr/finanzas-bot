@@ -2281,12 +2281,11 @@ async def search_google_contact(name: str) -> str:
             if r.status_code != 200:
                 print(f"[Contacts] HTTP {r.status_code}: {r.text[:300]}")
             if r.status_code in (401, 403):
-                # El refresh token de Google se emitio para Calendar/Gmail; si no incluye
-                # el scope de People API, Contacts responde 403 y no se arregla solo.
-                return ("Google Contacts rechaza el acceso: al token de Google le falta el permiso "
-                        "de contactos (People API). Decile al usuario que hay que volver a autorizar "
-                        "Google incluyendo ese permiso — no es una falla momentanea, no le sugieras "
-                        "reintentar.")
+                # El refresh token de Google se emitio para Calendar/Gmail; sin el scope de
+                # People API esto responde 403 siempre, asi que no tiene sentido reintentar.
+                return ("Sin acceso a los contactos del usuario (el token de Google no incluye ese "
+                        "permiso). No es momentaneo: no le sugieras reintentar ni digas que hay un "
+                        "error de API. Si necesitas un dato de una persona, pediselo directamente.")
             if r.status_code != 200:
                 return f"Error consultando Contacts: {r.text[:100]}"
             connections = r.json().get("connections", [])
@@ -2643,7 +2642,11 @@ Tenes acceso a informacion real del usuario a traves de herramientas:
 
 Antes de responder cualquier pregunta, pensa que fuentes son relevantes y consulta todas las que hagan falta.
 
-UBICACION DE UN EVENTO: si el usuario pregunta donde es algo que esta en su agenda ("donde es?", "donde queda", "en que direccion"), consulta PRIMERO consultar_calendario: los eventos traen su ubicacion en el campo 📍. Recien si el evento no tiene ubicacion, proba buscar_contacto.
+UBICACION DE UN EVENTO ("donde es?", "donde queda", "en que direccion"):
+1. Mira consultar_calendario: los eventos traen su ubicacion en el campo 📍.
+2. Si esa ubicacion es solo una ciudad o un pueblo ("Allen", "Neuquen") o una referencia personal ("lo de Mati"), NO es una direccion util: revisa consultar_lugares_conocidos por si esa referencia ya esta guardada.
+3. Si no la tenes, decilo derecho y pedile la direccion al usuario, ofreciendole guardarla con guardar_lugar_conocido para la proxima y calcularle un horario de salida estimado. Ejemplo: "Lo tengo como en Allen, pero no tengo la direccion de lo de Mati. Si me la pasas la guardo y te digo a que hora conviene salir."
+NUNCA adivines la direccion de un evento hurgando en buscar_contacto, y nunca inventes una. Preguntar es la respuesta correcta.
 
 RAZONAMIENTO IMPORTANTE para preguntas sobre pagos de servicios:
 1. Busca la factura en Gmail para saber el monto exacto que deberia haberse pagado
