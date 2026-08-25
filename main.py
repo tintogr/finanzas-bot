@@ -3419,7 +3419,9 @@ EVENTOS RECURRENTES:
                 if data.get("location"):
                     emit_hint(phone, suggestion_gate.Hint(
                         trigger_id="event_with_location",
-                        message=f"🚗 *{data.get('summary','el evento')}* tiene ubicación. Si querés, te puedo avisar antes con tiempo de salida según el tráfico. Decime *si* o *no*.",
+                        message=(f"🚗 Lo anoté en *{data.get('location')}*. ¿Querés que te arme la ruta "
+                                 f"hasta ahí? Decime *si* o *no* (y si me pasás la dirección exacta, "
+                                 f"la ruta sale más precisa)."),
                         action_intent="enable_travel_time_alert",
                         payload={"event_id": event_id, "location": data.get("location"), "summary": data.get("summary", "")},
                     ))
@@ -4581,9 +4583,24 @@ async def handle_pending_state(phone: str, text: str, state: dict) -> bool:
                     await save_user_config(MY_NUMBER)
                 await send_message(phone, "Listo, te aviso 5 días antes de cada factura recurrente que detecte.")
             elif action_intent == "enable_travel_time_alert":
-                ev_id = payload.get("event_id", "")
-                summary = payload.get("summary", "el evento")
-                await send_message(phone, f"Listo, te voy a calcular el tiempo de viaje para *{summary}*. Si no logro calcularlo, te pregunto antes cuánto demorás.")
+                summary  = payload.get("summary", "el evento")
+                location = payload.get("location", "")
+                if not location:
+                    await send_message(phone, f"No tengo una ubicación cargada para *{summary}*. Pasame la dirección y te armo la ruta.")
+                else:
+                    # Un link de Maps no necesita API key ni facturación: la app le muestra
+                    # el tiempo de viaje real con el tráfico del momento.
+                    from urllib.parse import quote_plus
+                    url = f"https://www.google.com/maps/dir/?api=1&destination={quote_plus(location)}"
+                    _lat, _lon = get_current_location()
+                    if _lat is not None and _lon is not None:
+                        url += f"&origin={_lat},{_lon}"
+                    await send_message(
+                        phone,
+                        f"🗺️ Ruta hasta *{location}* para _{summary}_:\n{url}\n\n"
+                        f"Ahí te muestra la demora con el tráfico del momento. "
+                        f"Si me pasás la dirección exacta, la guardo y la próxima te armo la ruta directo."
+                    )
             elif action_intent == "enable_time_reminder":
                 desc = payload.get("description", "el recordatorio")
                 await send_message(phone, f"Decime el horario en formato HH:MM (ej: 20:00) y los días (todos los días, lunes, etc) para que te recuerde *{desc}*.")
