@@ -1705,13 +1705,25 @@ class NotionDataStore:
     async def mark_finance_paid(
         self, page_id: str, paid_amount: float = None, payment_method: str = None, notes: str = None
     ) -> bool:
-        """Mark a finance entry as Pagada, optionally updating amount, method, notes."""
+        """Mark a finance entry as Pagada, optionally updating amount, method, notes.
+        Devuelve True solo si Notion aceptó el cambio: el que llama NO debe anunciar
+        que la marcó sin chequear esto."""
         try:
             props = {"Estado": {"select": {"name": "Pagada"}}}
             if paid_amount is not None:
                 props["Value (ars)"] = {"number": float(paid_amount)}
             if payment_method:
-                props["Method"] = {"select": {"name": payment_method}}
+                # "Method" es una RELACION a la DB de metodos de pago. Mandarlo como
+                # select hacia que Notion rechazara el update entero con un 400, el
+                # except se lo comia y la factura quedaba Impaga mientras Knot
+                # anunciaba que la habia marcado pagada.
+                pm_id = await self._resolve_payment_method_id(payment_method)
+                if pm_id:
+                    props["Method"] = {"relation": [{"id": pm_id}]}
+                else:
+                    props["Payment Method (legacy)"] = {
+                        "rich_text": [{"text": {"content": str(payment_method)[:200]}}]
+                    }
             if notes:
                 page_r = await self._http.get(
                     f"{NOTION_API}/pages/{page_id}", headers=self._headers_cache
@@ -1723,8 +1735,26 @@ class NotionDataStore:
                 props["Notes"] = {"rich_text": [{"text": {"content": new_notes[:2000]}}]}
             await self._update_page(page_id, props)
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[mark_finance_paid] no se pudo marcar {page_id}: {str(e)[:250]}")
             return False
+
+    async def _resolve_payment_method_id(self, text: str) -> str | None:
+        """Mapea un metodo de pago escrito ('BBVA Debit') al id de su pagina."""
+        t = (text or "").strip().lower()
+        if not t:
+            return None
+        cache = getattr(self, "_pm_cache", None)
+        if cache is None:
+            cache = await self.load_payment_methods()
+            self._pm_cache = cache
+        for pm in cache:
+            if pm.name and pm.name.lower() == t:
+                return pm.id
+        for pm in cache:
+            if (pm.last4 and pm.last4 in t) or (pm.name and pm.name.lower() in t):
+                return pm.id
+        return None
 
     async def create_factura_task(
         self, provider: str, amount: float, due_date: str, period: str, finance_page_id: str = None

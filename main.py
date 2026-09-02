@@ -915,14 +915,18 @@ async def _remove_invoice_confirmation(conf_id: str) -> None:
     user_prefs["pending_invoice_confirmations"] = [c for c in confs if c.get("id") != conf_id]
     await save_user_config(MY_NUMBER)
 
-async def _auto_mark_invoice_paid(impaga, paid_amount: float, payment_method: str | None = None) -> None:
-    """Marca la factura como pagada y su task asociada."""
-    await _ds.mark_finance_paid(impaga.id, paid_amount, payment_method)
+async def _auto_mark_invoice_paid(impaga, paid_amount: float, payment_method: str | None = None) -> bool:
+    """Marca la factura como pagada y su task asociada. Devuelve si Notion lo aceptó:
+    anunciar el cambio sin mirar esto es como quedaban facturas Impagas 'marcadas'."""
+    ok = await _ds.mark_finance_paid(impaga.id, paid_amount, payment_method)
+    if not ok:
+        return False
     tasks = await get_pending_factura_tasks()
     for t in tasks:
         if t.get("finance_page_id") == impaga.id:
             await mark_factura_task_paid(t["page_id"])
             break
+    return True
 
 async def _find_invoice_candidates(name_lower: str) -> list:
     """Busca facturas impagas que matcheen el proveedor por palabras clave."""
@@ -1199,8 +1203,12 @@ Emoji: elegi el mas especifico segun el contexto real."""
 
                     if diff_pct <= 0.10:
                         # Auto-marca sin preguntar
-                        await _auto_mark_invoice_paid(impaga, paid_amount, payment_method)
-                        reply += f"\n\n✅ Marqué *{impaga.name}* como pagada."
+                        _marcada = await _auto_mark_invoice_paid(impaga, paid_amount, payment_method)
+                        if _marcada:
+                            reply += f"\n\n✅ Marqué *{impaga.name}* como pagada."
+                        else:
+                            reply += (f"\n\n⚠️ No pude marcar *{impaga.name}* como pagada en Notion. "
+                                      f"Quedó pendiente: marcala a mano.")
                         # Trigger #6: pago con apuro (≤2 días al vencimiento)
                         try:
                             due = getattr(impaga, "due_date", None)
@@ -1256,8 +1264,10 @@ Emoji: elegi el mas especifico segun el contexto real."""
                     if len(valid_candidatos) == 1:
                         # Después del filtro quedó una sola → marcar directamente
                         impaga = valid_candidatos[0]
-                        await _auto_mark_invoice_paid(impaga, paid_amount, payment_method)
-                        reply += f"\n\n✅ *{impaga.name}* marcada como pagada."
+                        if await _auto_mark_invoice_paid(impaga, paid_amount, payment_method):
+                            reply += f"\n\n✅ *{impaga.name}* marcada como pagada."
+                        else:
+                            reply += f"\n\n⚠️ No pude marcar *{impaga.name}* como pagada en Notion."
                     else:
                         options = "\n".join(f"• {c.name} (${c.value_ars:,.0f})" for c in valid_candidatos[:3])
                         conf_id = await _add_invoice_confirmation(
@@ -5482,12 +5492,13 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
             provider_name = state.get("provider_name", "la factura")
             finance_page_id = state.get("finance_page_id")
             if affirm:
-                await _auto_mark_invoice_paid(
+                _ok_marca = await _auto_mark_invoice_paid(
                     type("_", (), {"id": finance_page_id, "value_ars": paid_amount})(),
                     paid_amount, payment_method
                 )
                 await _remove_invoice_confirmation(conf_id)
-                await send_message(phone, f"✅ *{provider_name}* marcada como pagada.")
+                await send_message(phone, f"✅ *{provider_name}* marcada como pagada." if _ok_marca
+                                   else f"⚠️ No pude marcar *{provider_name}* como pagada en Notion.")
             else:
                 await _remove_invoice_confirmation(conf_id)
                 await send_message(phone, f"Ok, la dejo pendiente.")
@@ -5539,13 +5550,14 @@ Aplica la correccion y devolve la lista corregida como array JSON simple:
                 # "sí" sin especificar → asumir la de monto más cercano
                 matched = min(candidates, key=lambda c: abs((c["amount"] or 0) - paid_amount))
             if matched:
-                await _auto_mark_invoice_paid(
+                _ok_marca = await _auto_mark_invoice_paid(
                     type("_", (), {"id": matched["id"], "value_ars": matched["amount"]})(),
                     paid_amount, payment_method
                 )
                 await _remove_invoice_confirmation(conf_id)
                 otros = [c for c in candidates if c["id"] != matched["id"]]
-                msg = f"✅ *{matched['name']}* marcada como pagada."
+                msg = (f"✅ *{matched['name']}* marcada como pagada." if _ok_marca
+                       else f"⚠️ No pude marcar *{matched['name']}* como pagada en Notion.")
                 if otros:
                     msg += " Todavía tenés pendiente: " + ", ".join(f"*{c['name']}*" for c in otros) + "."
                 await send_message(phone, msg)
