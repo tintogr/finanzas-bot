@@ -1522,6 +1522,19 @@ async def create_notion_entry(data: dict, exchange_rate: float) -> tuple[bool, s
         return True, entry.id
     except Exception as e:
         return False, str(e)
+def _history_context(phone: str | None, turns: int = 6) -> str:
+    """Contexto reciente para los extractores de corregir/eliminar. Sin esto resuelven
+    referencias como "la de agosto" contra cualquier entrada que contenga esa palabra."""
+    hist = get_history(phone) if phone else []
+    if not hist:
+        return ""
+    lineas = "\n".join(
+        f"{'Usuario' if m['role'] == 'user' else 'Knot'}: {str(m['content'])[:200]}"
+        for m in hist[-turns:]
+    )
+    return f"Contexto reciente de la conversacion:\n{lineas}\n\n"
+
+
 async def check_and_apply_category(name: str, predicted_cats: list[str]) -> tuple[list[str], str | None]:
     name_lower = name.lower()
     for keyword, saved_cats in category_overrides.items():
@@ -1543,9 +1556,16 @@ async def corregir_gasto(text: str, phone: str = None) -> tuple[bool, str]:
     now = now_argentina()
     response = await claude_create(
         model=SONNET_MODEL, max_tokens=300,
-        system="Extrae que gasto corregir y que cambiar. Si el mensaje no menciona un nombre concreto, usa null en search_term. Responde SOLO JSON.",
+        system=("Extrae que gasto corregir y que cambiar. Si el mensaje no menciona un nombre concreto, "
+                "usa null en search_term. Responde SOLO JSON.\n"
+                "El contexto reciente te dice sobre que se esta hablando: usalo para resolver "
+                "referencias como 'la de agosto' o 'esa'. Si el usuario se refiere a una FACTURA que "
+                "Knot marco como pagada, y no a un gasto que acaba de registrar, poné search_term en "
+                "null: no toques el gasto nuevo.\n"
+                "new_estado describe el estado que debe quedar en la entrada que estas corrigiendo. "
+                "No lo deduzcas de una frase sobre OTRA entrada."),
         messages=[{"role": "user", "content": f"""Hoy: {now.strftime("%Y-%m-%d")}
-Mensaje: {text}
+{_history_context(phone)}Mensaje: {text}
 Responde:
 {{"search_term": "nombre del gasto o null si no se menciona uno concreto",
   "all_matching": true si hay que corregir TODOS los que coinciden (ej: 'los 3 de anthropic', 'todos los de hoy'), false si es uno solo,
@@ -1671,20 +1691,34 @@ Responde:
 
 async def eliminar_gasto(text: str, phone: str = None) -> tuple[bool, str]:
     response = await claude_create(
-        model=SONNET_MODEL, max_tokens=100,
-        system="Extrae el nombre de la entrada de Notion a eliminar. Responde SOLO JSON.",
-        messages=[{"role": "user", "content": f'Mensaje: {text}\nResponde: {{"search_term": "nombre de la entrada a eliminar"}}'}]
+        model=SONNET_MODEL, max_tokens=150,
+        system=(
+            "Decidis si el mensaje pide BORRAR una entrada de Notion. Responde SOLO JSON.\n"
+            "search_term = nombre de la entrada a eliminar.\n"
+            "search_term DEBE ser null si el mensaje no es una orden de baja: reclamos o quejas "
+            "sobre algo ya ocurrido ('borraste la de agosto', 'me eliminaste X'), preguntas, "
+            "o correcciones de datos. Un verbo en pasado es un reclamo, no una orden.\n"
+            "Ante la duda, null."
+        ),
+        messages=[{"role": "user", "content": f'{_history_context(phone)}Mensaje: {text}\nResponde: {{"search_term": "nombre o null"}}'}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.strip("`").lstrip("json").strip()
-    search_term = json.loads(raw).get("search_term", "")
+    search_term = json.loads(raw).get("search_term") or ""
     if not search_term:
-        return False, "No entendi que entrada queres eliminar"
+        return False, ("No estoy seguro de qué querés borrar, así que no toqué nada. "
+                       "Si te borré o cambié algo que no correspondía, decime cuál es y lo revisamos.")
 
-    results = await _ds.query_expenses(QueryFilter(name_contains=search_term, limit=1))
+    # limit=1 agarraba la primera coincidencia de substring: "agosto" matcheaba
+    # "Sesiones psicóloga - julio y agosto" y ofrecia borrarla. Mejor mostrar y preguntar.
+    results = await _ds.query_expenses(QueryFilter(name_contains=search_term, limit=5))
     if not results:
         return False, f"No encontre ninguna entrada llamada _{search_term}_"
+    if len(results) > 1:
+        listado = "\n".join(f"  • {e.name} — ${e.value_ars:,.0f}" for e in results)
+        return False, (f"Hay varias que coinciden con _{search_term}_:\n{listado}\n\n"
+                       "¿Cuál borro? Pasame el nombre completo.")
     entry = results[0]
     if phone:
         expires_at = (now_argentina() + timedelta(minutes=5)).replace(tzinfo=None).isoformat()
@@ -1692,7 +1726,7 @@ async def eliminar_gasto(text: str, phone: str = None) -> tuple[bool, str]:
             "type": "confirm_delete", "action": "expense",
             "page_id": entry.id, "name": entry.name, "expires_at": expires_at,
         }
-        await send_interactive_buttons(phone, f"¿Eliminás *{entry.name}*?", [
+        await send_interactive_buttons(phone, f"¿Eliminás *{entry.name}* — ${entry.value_ars:,.0f}?", [
             {"id": "confirm_delete_yes", "title": "Sí, eliminalo"},
             {"id": "confirm_delete_no", "title": "No, cancelar"},
         ])
