@@ -928,6 +928,60 @@ async def _auto_mark_invoice_paid(impaga, paid_amount: float, payment_method: st
             break
     return True
 
+_MESES_FACTURA = {
+    "ene": 1, "enero": 1, "jan": 1,
+    "feb": 2, "febrero": 2,
+    "mar": 3, "marzo": 3,
+    "abr": 4, "abril": 4, "apr": 4,
+    "may": 5, "mayo": 5,
+    "jun": 6, "junio": 6,
+    "jul": 7, "julio": 7,
+    "ago": 8, "agosto": 8, "aug": 8,
+    "sep": 9, "set": 9, "septiembre": 9,
+    "oct": 10, "octubre": 10,
+    "nov": 11, "noviembre": 11,
+    "dic": 12, "diciembre": 12, "dec": 12,
+}
+
+
+def _invoice_period(factura) -> tuple[int, int, str] | None:
+    """(año, mes, origen) de una factura. origen es 'nombre' cuando el periodo esta
+    escrito en el titulo ('— Ago 2026') y 'fecha' cuando hay que sacarlo del Date."""
+    import re as _re
+    nombre = (getattr(factura, "name", "") or "").lower()
+    m = _re.search(r"([a-záéíóú]{3,10})\.?\s+(\d{4})", nombre)
+    if m:
+        mes = _MESES_FACTURA.get(m.group(1)[:3])
+        if mes:
+            return int(m.group(2)), mes, "nombre"
+    fecha = getattr(factura, "date", None)
+    if isinstance(fecha, str) and len(fecha) >= 7:
+        try:
+            return int(fecha[:4]), int(fecha[5:7]), "fecha"
+        except ValueError:
+            return None
+    if hasattr(fecha, "year"):
+        return fecha.year, fecha.month, "fecha"
+    return None
+
+
+def _periodo_coincide(factura, periodo: str | None) -> bool:
+    """True si no hay con que comparar, o si el pago es del mismo periodo que la
+    factura. Cuando el mes esta en el titulo se exige coincidencia exacta; si hay que
+    deducirlo del Date se tolera un mes, porque esa fecha es cuando llego el mail."""
+    if not periodo:
+        return True
+    try:
+        anio_p, mes_p = int(periodo[:4]), int(periodo[5:7])
+    except (ValueError, IndexError):
+        return True
+    inv = _invoice_period(factura)
+    if not inv:
+        return True
+    dist = abs((anio_p * 12 + mes_p) - (inv[0] * 12 + inv[1]))
+    return dist == 0 if inv[2] == "nombre" else dist <= 1
+
+
 async def _find_invoice_candidates(name_lower: str) -> list:
     """Busca facturas impagas que matcheen el proveedor por palabras clave."""
     provider_words = [w for w in name_lower.split() if len(w) > 3]
@@ -996,7 +1050,8 @@ async def handle_gasto_agent(phone: str, text: str, image_b64=None, image_type=N
                 "notas":          {"type": ["string", "null"]},
                 "client":         {"type": "array", "items": {"type": "string"}},
                 "emoji":          {"type": "string"},
-                "payment_method": {"type": ["string", "null"], "description": "Medio de pago: banco o tarjeta. Deducilo del ticket si menciona digitos de tarjeta. Null si no se puede determinar."}
+                "payment_method": {"type": ["string", "null"], "description": "Medio de pago: banco o tarjeta. Deducilo del ticket si menciona digitos de tarjeta. Null si no se puede determinar."},
+                "periodo_factura": {"type": ["string", "null"], "description": "Solo para pagos de servicios: el periodo de la factura en formato YYYY-MM. Deducilo del comprobante (fecha de emision de la factura, periodo facturado, o el mes anterior al vencimiento). Null si no es un servicio o no se puede determinar."}
             },
             "required": ["name", "in_out", "value_ars", "categoria", "date", "emoji"]
         }
@@ -1194,14 +1249,36 @@ Emoji: elegi el mas especifico segun el contexto real."""
             elif data.get("value_ars", 0) > 1000 and "EGRESO" in data.get("in_out", "").upper():
                 paid_amount = data.get("value_ars", 0)
                 payment_method = data.get("payment_method")
+                periodo_pago = data.get("periodo_factura")
                 candidatos = await _find_invoice_candidates(name_lower)
+                # Si el comprobante dice de que periodo es, descartar las facturas de
+                # otro mes: si no, se marcaba pagada la unica impaga que hubiera,
+                # aunque el pago fuera de otro periodo.
+                if periodo_pago and len(candidatos) > 1:
+                    _mismo_periodo = [c for c in candidatos if _periodo_coincide(c, periodo_pago)]
+                    if _mismo_periodo:
+                        candidatos = _mismo_periodo
 
                 if len(candidatos) == 1:
                     impaga = candidatos[0]
                     inv_amount = impaga.value_ars or 0
                     diff_pct = abs(paid_amount - inv_amount) / max(inv_amount, 1) if inv_amount else 1
 
-                    if diff_pct <= 0.10:
+                    if diff_pct <= 0.10 and not _periodo_coincide(impaga, periodo_pago):
+                        # Monto parecido pero de otro mes: casi seguro es una boleta
+                        # distinta que todavia no esta cargada. Preguntar antes de tocar.
+                        conf_id = await _add_invoice_confirmation(
+                            "diff_moderate", impaga.name, [impaga.id], page_id, paid_amount, inv_amount
+                        )
+                        pending_state[phone] = {
+                            "type": "factura_confirm", "situation": "diff_moderate",
+                            "conf_id": conf_id, "finance_page_id": impaga.id,
+                            "paid_amount": paid_amount, "payment_method": payment_method,
+                            "provider_name": impaga.name,
+                        }
+                        reply += (f"\n\n🤔 Tengo impaga *{impaga.name}* por ${inv_amount:,.0f}, pero este "
+                                  f"pago parece de otro período. ¿Corresponde a esa factura? (sí/no)")
+                    elif diff_pct <= 0.10:
                         # Auto-marca sin preguntar
                         _marcada = await _auto_mark_invoice_paid(impaga, paid_amount, payment_method)
                         if _marcada:
