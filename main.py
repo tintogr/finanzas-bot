@@ -6361,11 +6361,19 @@ async def process_single_item(phone: str, item: dict):
         elif tipo == "RECORDATORIO":
             parsed_list = await parse_recordatorio(text)
             created = []
+            sin_fecha = []
             for parsed in parsed_list:
+                if not parsed.get("fire_at"):
+                    sin_fecha.append(parsed.get("summary") or "eso")
+                    continue
                 success, _err = await create_recordatorio(parsed)
                 if success:
                     created.append(parsed)
-            if len(created) == 1:
+            if sin_fecha and not created:
+                _que = ", ".join(f"*{s}*" for s in sin_fecha)
+                await _reply(f"No encontré {_que} en tu agenda ni me dijiste cuándo. "
+                             f"¿Para cuándo te lo recuerdo?")
+            elif len(created) == 1:
                 await _reply(format_recordatorio(created[0]))
             elif len(created) > 1:
                 lines = ["🔔 Recordatorios configurados:"]
@@ -6517,13 +6525,29 @@ async def health():
 async def parse_recordatorio(text: str) -> list:
     """Devuelve siempre una lista de dicts, aunque sea un solo recordatorio."""
     now = now_argentina()
+    # Sin la agenda, "hacerme acordar del keynote" no tiene con que resolver cuando es
+    # el keynote y el modelo terminaba inventando una hora (hoy al mediodia).
+    try:
+        agenda = await query_calendar(days_ahead=60, days_back=1)
+    except Exception:
+        agenda = None
+    agenda_ctx = f"Agenda del usuario:\n{agenda}\n\n" if agenda else ""
     response = await claude_create(
         model=SONNET_MODEL, max_tokens=500,
-        system="Extrae info del/los recordatorio/s. Responde SOLO JSON valido sin markdown. Siempre devuelve un array, aunque sea uno solo.",
+        system=(
+            "Extrae info del/los recordatorio/s. Responde SOLO JSON valido sin markdown. "
+            "Siempre devuelve un array, aunque sea uno solo.\n"
+            "Si el mensaje se refiere a algo que esta en la agenda ('acordame del keynote'), "
+            "buscalo ahi y calcula fire_at a partir de ESE evento: 1 hora antes si tiene "
+            "horario, o las 09:00 de ese dia si es de dia completo.\n"
+            "Si el mensaje NO dice cuando y tampoco encontras el evento en la agenda, poné "
+            "fire_at en null. NO inventes una fecha ni uses la hora actual como relleno: es "
+            "preferible preguntarle al usuario."
+        ),
         messages=[{"role": "user", "content": f"""Ahora son las {now.strftime("%Y-%m-%d %H:%M")} en Argentina.
-Mensaje: {text}
+{agenda_ctx}Mensaje: {text}
 Responde SIEMPRE como array JSON (aunque sea un solo recordatorio):
-[{{"summary": "descripcion", "fire_at": "YYYY-MM-DDTHH:MM", "emoji": "emoji"}}]"""}]
+[{{"summary": "descripcion", "fire_at": "YYYY-MM-DDTHH:MM o null", "emoji": "emoji"}}]"""}]
     )
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -6537,7 +6561,9 @@ async def create_recordatorio(data: dict) -> tuple[bool, str]:
     access_token = await get_gcal_access_token()
     if not access_token:
         return False, "Calendar no configurado"
-    fire_at = data["fire_at"]
+    fire_at = data.get("fire_at")
+    if not fire_at:
+        return False, "Sin fecha para el recordatorio"
     start_dt = datetime.strptime(fire_at, "%Y-%m-%dT%H:%M")
     end_dt = start_dt + timedelta(minutes=1)
     summary_raw = data.get("summary", "Recordatorio")
